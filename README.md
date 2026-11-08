@@ -45,7 +45,13 @@ cargo test
 
 ## Sound and Save Data
 
-Sound and progress saving are web-only for now. Native builds are silent and do not persist progress.
+Sound is web-only for now: native builds are silent. Progress (high score, unlocked sectors, theme, language) is saved on every platform: in the browser storage on the web, and in a `progress.json` file on native builds:
+
+- Windows: `%APPDATA%\Kinetix\progress.json`
+- macOS: `$HOME/Library/Application Support/Kinetix/progress.json`
+- Linux and others: `$XDG_DATA_HOME/kinetix/progress.json`, or `$HOME/.local/share/kinetix/progress.json` when `XDG_DATA_HOME` is unset
+
+A missing file starts from the defaults. A file that cannot be read (corrupt, or written by a newer version) is kept as `progress.json.bak` before the first save of the session, and the game starts from the defaults. If no user data directory can be resolved, progress is not saved. Delete the file to reset your progress.
 
 ## Licenses
 

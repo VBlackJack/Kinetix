@@ -23,9 +23,6 @@ use kinetix_core::level_code::LEVEL_CODE_MAX_LEN;
 extern "C" {
     fn kinetix_synth_sfx(kind: u32, param: u32);
     fn kinetix_set_music(enabled: u32, intensity: u32);
-    fn kinetix_save_state(high_score: u32, unlocked: u32, theme: u32, lang: u32);
-    fn kinetix_load_packed() -> u32;
-    fn kinetix_load_highscore() -> u32;
     fn kinetix_share_level(code_ptr: *const u8, code_len: u32, msg_ptr: *const u8, msg_len: u32);
     fn kinetix_prompt_level(
         msg_ptr: *const u8,
@@ -105,36 +102,6 @@ impl SoundBank {
     pub fn play_portal(&self) {
         self.emit(8, 0);
     }
-}
-
-#[allow(unused_variables)]
-pub fn save_progress(high_score: u64, unlocked: usize, theme: usize, lang_fr: bool) {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        kinetix_save_state(
-            high_score.min(u32::MAX as u64) as u32,
-            unlocked as u32,
-            theme as u32,
-            u32::from(lang_fr),
-        );
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn load_progress() -> (u64, usize, usize, bool) {
-    unsafe {
-        let hs = kinetix_load_highscore() as u64;
-        let packed = kinetix_load_packed();
-        let unlocked = (packed & 0xFF) as usize;
-        let theme = ((packed >> 8) & 0xFF) as usize;
-        let lang_fr = ((packed >> 16) & 0xFF) != 0;
-        (hs, unlocked, theme, lang_fr)
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn load_progress() -> (u64, usize, usize, bool) {
-    (0, 0, 0, false)
 }
 
 /// Shows the level code to the player (web: clipboard + prompt dialog titled with `message`).

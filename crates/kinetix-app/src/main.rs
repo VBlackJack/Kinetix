@@ -15,18 +15,20 @@
  */
 
 mod audio;
+mod persistence;
 mod tuning;
 mod vfx;
 
 use audio::{
-    load_progress, pointer_lock_active, prompt_level_code, save_progress, set_document_lang,
-    set_pointer_bounds, set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
+    pointer_lock_active, prompt_level_code, set_document_lang, set_pointer_bounds,
+    set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
 use kinetix_core::physics::{BrickKind, GameEvent, GameWorld, SessionStatus};
 use macroquad::prelude::*;
+use persistence::{load_progress, save_progress};
 use std::collections::BTreeSet;
 use tuning::*;
 use vfx::{
