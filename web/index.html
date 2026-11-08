@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<!--
+  Copyright 2026 Julien Bombled
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KINETIX</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #060512;
+    }
+    canvas {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      background: #060512;
+      position: absolute;
+      z-index: 0;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas" tabindex="1"></canvas>
+  <script src="gl.js"></script>
+  <script>
+    const glCanvas = document.getElementById("glcanvas");
+    let lockWanted = false;
+    let audioCtx = null;
+    let musicEnabled = 1;
+    let musicIntensity = 0;
+    let musicStep = 0;
+
+    // Build views at call time: wasm_memory.buffer is replaced on memory growth.
+    function readUtf8(ptr, len) {
+      return new TextDecoder().decode(new Uint8Array(wasm_memory.buffer, ptr, len));
+    }
+
+    function ensureAudio() {
+      if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx) audioCtx = new Ctx();
+      }
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume();
+      }
+      return audioCtx;
+    }
+
+    function playSweep(type, fStart, fEnd, duration, gainVal) {
+      const ctx = ensureAudio();
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(fStart, now);
+      osc.frequency.exponentialRampToValueAtTime(Math.max(20, fEnd), now + duration);
+      gain.gain.setValueAtTime(gainVal, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration);
+    }
+
+    // Dynamic Synthwave Bass & Lead Sequencer
+    const bassNotes = [55.0, 55.0, 65.41, 55.0, 73.42, 65.41, 82.41, 73.42];
+    const leadNotes = [220.0, 261.63, 329.63, 440.0, 392.0, 329.63, 293.66, 329.63];
+    setInterval(() => {
+      if (!musicEnabled || !audioCtx || audioCtx.state !== "running") return;
+      const idx = musicStep % bassNotes.length;
+      musicStep++;
+      const tempoMult = musicIntensity === 3 ? 1.25 : 1.0;
+      const fBass = bassNotes[idx] * tempoMult;
+      playSweep("sawtooth", fBass, fBass * 0.98, 0.14, musicIntensity === 0 ? 0.04 : 0.07);
+      if (musicIntensity >= 2 && (musicStep % 2 === 0)) {
+        const fLead = leadNotes[idx] * (musicIntensity === 3 ? 1.5 : 1.0);
+        playSweep("triangle", fLead, fLead * 1.01, 0.11, 0.05);
+      }
+    }, 180);
+
+    miniquad_add_plugin({
+      register_plugin: function (importObject) {
+        importObject.env.kinetix_synth_sfx = function (kind, param) {
+          switch (kind) {
+            case 1:
+              playSweep("triangle", 240, 440, 0.08, 0.25);
+              break;
+            case 2:
+              playSweep("sine", 180, 130, 0.06, 0.18);
+              break;
+            case 3:
+              const step = Math.min(param || 1, 16);
+              const f0 = 310 * Math.pow(1.059463, step);
+              playSweep("square", f0, f0 * 1.45, 0.09, 0.20);
+              break;
+            case 4:
+              playSweep("sawtooth", 120, 28, 0.35, 0.38);
+              break;
+            case 5:
+              playSweep("triangle", 440, 880, 0.18, 0.28);
+              break;
+            case 6:
+              playSweep("sawtooth", 980, 210, 0.075, 0.20);
+              break;
+            case 7:
+              playSweep("square", 860, 290, 0.16, 0.26);
+              break;
+            case 8:
+              playSweep("sine", 320, 960, 0.22, 0.28);
+              break;
+          }
+        };
+        importObject.env.kinetix_set_music = function (enabled, intensity) {
+          musicEnabled = enabled;
+          musicIntensity = intensity;
+        };
+        importObject.env.kinetix_save_state = function (hs, unlocked, theme, langFr) {
+          try {
+            localStorage.setItem("kinetix_hs", String(hs));
+            localStorage.setItem("kinetix_unlocked", String(unlocked));
+            localStorage.setItem("kinetix_theme", String(theme));
+            localStorage.setItem("kinetix_lang", String(langFr));
+          } catch (_) {}
+        };
+        importObject.env.kinetix_load_highscore = function () {
+          try {
+            return parseInt(localStorage.getItem("kinetix_hs") || "0", 10) || 0;
+          } catch (_) {
+            return 0;
+          }
+        };
+        importObject.env.kinetix_load_packed = function () {
+          try {
+            const u = (parseInt(localStorage.getItem("kinetix_unlocked") || "0", 10) || 0) & 0xFF;
+            const t = (parseInt(localStorage.getItem("kinetix_theme") || "0", 10) || 0) & 0xFF;
+            const l = (parseInt(localStorage.getItem("kinetix_lang") || "1", 10) || 0) & 0xFF;
+            return u | (t << 8) | (l << 16);
+          } catch (_) {
+            return (1 << 16);
+          }
+        };
+        importObject.env.kinetix_share_level = function (codePtr, codeLen, msgPtr, msgLen) {
+          try {
+            const code = readUtf8(codePtr, codeLen);
+            const message = readUtf8(msgPtr, msgLen);
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(code).catch(() => {});
+            }
+            window.prompt(message, code);
+          } catch (_) {}
+        };
+        importObject.env.kinetix_prompt_level = function (msgPtr, msgLen, bufPtr, maxLen) {
+          try {
+            const message = readUtf8(msgPtr, msgLen);
+            const input = window.prompt(message, "");
+            if (!input) return 0;
+            const encoded = new TextEncoder().encode(input.trim());
+            if (encoded.length === 0) return 0;
+            if (encoded.length > maxLen) return maxLen + 1;
+            new Uint8Array(wasm_memory.buffer, bufPtr, encoded.length).set(encoded);
+            return encoded.length;
+          } catch (_) {
+            return 0;
+          }
+        };
+        importObject.env.kinetix_set_lang = function (langFr) {
+          document.documentElement.lang = langFr ? "fr" : "en";
+        };
+        importObject.env.kinetix_pointer_lock_active = function () {
+          return document.pointerLockElement === glCanvas ? 1 : 0;
+        };
+        importObject.env.kinetix_set_pointer_bounds = function (left, right) {
+          boundsLeft = Number.isFinite(left) ? left : null;
+          boundsRight = Number.isFinite(right) ? right : null;
+        };
+        importObject.env.kinetix_set_pointer_lock = function (enabled) {
+          lockWanted = enabled !== 0;
+          if (lockWanted) {
+            requestLock();
+          } else if (document.pointerLockElement === glCanvas) {
+            document.exitPointerLock();
+          }
+        };
+      },
+      on_init: function () {}
+    });
+
+    // Pointer lock is requested only when the game asks for it (kinetix_set_pointer_lock).
+    window.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    function requestLock() {
+      if (!glCanvas.requestPointerLock) return;
+      try {
+        const result = glCanvas.requestPointerLock();
+        if (result && typeof result.catch === "function") result.catch(() => {});
+      } catch (_) {}
+    }
+
+    // requestPointerLock needs a user gesture: retry synchronously from the gesture handlers.
+    function requestLockInGesture() {
+      if (lockWanted && document.pointerLockElement !== glCanvas) requestLock();
+    }
+
+    glCanvas.addEventListener("mousedown", () => {
+      ensureAudio();
+      requestLockInGesture();
+    });
+
+    window.addEventListener("keydown", requestLockInGesture, true);
+
+    // A refused request is harmless: the next gesture retries.
+    document.addEventListener("pointerlockerror", () => {});
+
+    // Horizontal extent of the arena on screen (CSS px relative to the canvas), set by the game.
+    let boundsLeft = null;
+    let boundsRight = null;
+
+    function clampVirtualX(x) {
+      const rect = glCanvas.getBoundingClientRect();
+      let lo = rect.left;
+      let hi = rect.right;
+      if (boundsLeft !== null && boundsRight !== null && boundsRight >= boundsLeft) {
+        lo = Math.max(lo, rect.left + boundsLeft);
+        hi = Math.min(hi, rect.left + boundsRight);
+      }
+      return Math.max(lo, Math.min(hi, x));
+    }
+
+    // Seed the virtual X from the last real mouse X (clamped to the arena) when the lock is obtained,
+    // so the paddle does not jump. A lost lock needs no handling: the next mousedown or keydown re-requests it.
+    document.addEventListener("pointerlockchange", () => {
+      if (document.pointerLockElement === glCanvas) {
+        if (!lockWanted) {
+          // The game withdrew the lock before the browser granted it.
+          document.exitPointerLock();
+          return;
+        }
+        virtualMouseX = clampVirtualX(virtualMouseX);
+      }
+    });
+
+    // While locked, accumulate a virtual X position and keep the last real Y.
+    let virtualMouseX = window.innerWidth * 0.5;
+    let lastClientY = window.innerHeight * 0.5;
+    window.addEventListener("mousemove", (e) => {
+      if (e._kinetixSynthetic) return;
+      if (document.pointerLockElement === glCanvas) {
+        e.stopImmediatePropagation();
+        virtualMouseX = clampVirtualX(virtualMouseX + e.movementX);
+        const synth = new MouseEvent("mousemove", {
+          clientX: virtualMouseX,
+          clientY: lastClientY,
+          bubbles: true
+        });
+        synth._kinetixSynthetic = true;
+        glCanvas.dispatchEvent(synth);
+      } else {
+        virtualMouseX = e.clientX;
+        lastClientY = e.clientY;
+      }
+    }, true);
+
+    // Under lock, real button events carry a frozen clientX: replace them with flagged synthetic ones
+    // at the virtual position so the game never snaps the paddle back.
+    ["mousedown", "mouseup"].forEach((type) => {
+      window.addEventListener(type, (e) => {
+        if (e._kinetixSynthetic) return;
+        if (document.pointerLockElement !== glCanvas) return;
+        if (type === "mousedown") ensureAudio();
+        e.stopImmediatePropagation();
+        const synth = new MouseEvent(type, {
+          clientX: virtualMouseX,
+          clientY: lastClientY,
+          button: e.button,
+          buttons: e.buttons,
+          bubbles: true
+        });
+        synth._kinetixSynthetic = true;
+        glCanvas.dispatchEvent(synth);
+      }, true);
+    });
+
+    // macroquad re-applies its own cursor grab state every frame, which makes
+    // miniquad call document.exitPointerLock() while the game is not using
+    // macroquad's grab. Ignore those calls while the game wants the lock.
+    const nativeExitPointerLock = document.exitPointerLock.bind(document);
+    document.exitPointerLock = function () {
+      if (!lockWanted) nativeExitPointerLock();
+    };
+
+    load("kinetix-app.wasm?v=" + Date.now());
+  </script>
+</body>
+</html>

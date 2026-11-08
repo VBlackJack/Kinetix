@@ -1,0 +1,47 @@
+{
+  "arena": {
+    "width": 1920.0,
+    "height": 1080.0,
+    "wall_top": 74.0,
+    "wall_side": 48.0,
+    "paddle_y": 1020.0
+  },
+  "paddle": {
+    "default_width": 154.0,
+    "min_width": 92.0,
+    "max_width": 290.0,
+    "height": 16.0,
+    "width_step": 42.0,
+    "max_bounce_angle_deg": 68.0,
+    "laser_cooldown_sec": 0.16,
+    "laser_speed": 1350.0
+  },
+  "ball": {
+    "default_radius": 9.0,
+    "mega_radius": 16.0,
+    "default_speed": 760.0,
+    "min_speed": 520.0,
+    "max_speed": 1320.0,
+    "speed_step_on_hit": 4.5,
+    "substeps": 6
+  },
+  "gameplay": {
+    "initial_lives": 3,
+    "powerup_drop_chance": 0.16,
+    "powerup_fall_speed": 215.0,
+    "powerup_radius": 31.0,
+    "combo_timeout_sec": 2.5,
+    "base_brick_score": 100,
+    "explosion_radius": 135.0,
+    "lightning_targets": 4,
+    "vortex_pull_strength": 1.75,
+    "vortex_max_energy": 100.0,
+    "vortex_drain_rate": 38.0,
+    "vortex_recharge_rate": 24.0,
+    "sudden_death_time_sec": 45.0,
+    "boss_base_hp": 18,
+    "boss_speed": 310.0,
+    "boss_fire_interval_sec": 2.2,
+    "boss_hazard_speed": 480.0
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "app": {
+    "title": "KINETIX",
+    "subtitle": "Casse-Briques Moderne Haute Vélocité"
+  },
+  "menu": {
+    "play": "CLIQUEZ OU APPUYEZ SUR [ENTRÉE / ESPACE] POUR LANCER LA CAMPAGNE",
+    "campaigns": "CHOIX DU MONDE ([GAUCHE / DROITE] ou [1-3])",
+    "sector_select": "SECTEUR DE DÉPART ([HAUT / BAS]) :",
+    "editor_btn": "[F4] ARCHITECTE DE NIVEAU (ÉDITEUR)",
+    "theme_btn": "[F1] MOTEUR DE RENDU",
+    "lang_btn": "[F2] LANGUE",
+    "music_btn": "[B] MUSIQUE DYNAMIQUE",
+    "sfx_btn": "[M] EFFETS SONORES",
+    "unlocked": "DÉBLOQUÉ",
+    "locked": "VERROUILLÉ",
+    "best_score": "RECORD ABSOLU"
+  },
+  "campaigns": {
+    "c1": "MONDE 1 : GRILLE D'IGNITION (Secteurs 1-5)",
+    "c2": "MONDE 2 : DISTORSION QUANTIQUE (Secteurs 6-10)",
+    "c3": "MONDE 3 : FORGE OMEGA (Secteurs 11-15)"
+  },
+  "hud": {
+    "score": "SCORE",
+    "high_score": "RECORD",
+    "lives": "VIES",
+    "level": "SECTEUR",
+    "combo": "COMBO",
+    "vortex": "VORTEX",
+    "boss": "NOYAU OMEGA",
+    "theme": "RENDU",
+    "lang": "LANGUE",
+    "fps": "IPS",
+    "balls": "BALLES",
+    "synergy": "BONUS ACTIFS"
+  },
+  "controls": {
+    "launch_hint": "CLIC GAUCHE / ESPACE : Lancer  |  CLIC DROIT / MAJ : Vortex  |  [TAB] Menu Titre",
+    "laser_hint": "CLIC GAUCHE / ESPACE : Lasers  |  CLIC DROIT / MAJ : Vortex  |  [TAB] Menu Titre",
+    "theme_hint": "[F1] Rendu",
+    "lang_hint": "[F2] EN/FR",
+    "level_hint": "[F3] Secteur suiv.",
+    "editor_hint": "[F4] Éditeur",
+    "mute_hint": "[M] Sons  [B] Musique",
+    "pause_hint": "[P / ÉCHAP] Pause",
+    "restart_hint": "[R] Recommencer"
+  },
+  "editor": {
+    "banner": "ARCHITECTE DE SECTEUR (MODE ÉDITEUR)",
+    "instructions": "CLIC G: Poser | CLIC D: Gommer | [1-6] Std [E] Expl [H] Acier [T] Portail [G] Fantôme [V] Mobile | [X] Exporter [I] Importer [C] Vider [F4] Jouer",
+    "exported": "CODE DU NIVEAU EXPORTÉ !",
+    "imported": "NIVEAU PERSONNALISÉ IMPORTÉ !",
+    "share_prompt": "Code du niveau (à copier pour le partager) :",
+    "paste_prompt": "Collez un code de niveau (KTX1:...) :",
+    "import_invalid": "CODE DE NIVEAU INVALIDE",
+    "import_too_long": "CODE DE NIVEAU TROP LONG"
+  },
+  "status": {
+    "paused": "SYSTÈME EN PAUSE",
+    "paused_sub": "P pour reprendre, ou TAB pour le Menu Titre",
+    "victory": "SECTEUR NETTOYÉ !",
+    "victory_sub": "Cliquez ou appuyez sur ESPACE pour continuer",
+    "game_over": "ÉCHEC CRITIQUE - FIN DE PARTIE",
+    "game_over_sub": "Cliquez ou appuyez sur R pour relancer (TAB Menu)",
+    "sudden_death": "FOUDRE SURVOLTÉE ACTIVE",
+    "portal_warp": "TÉLÉPORTATION !"
+  },
+  "powerups": {
+    "fireball": "BOULE DE FEU (Transperce & Brûle)",
+    "megaball": "MÉGA-BALLE (Impact Massif)",
+    "multiball": "MULTI-BALLES (Division x3)",
+    "expand": "EXTENSION DU PADDLE",
+    "shrink": "RÉDUCTION DU PADDLE",
+    "magnet": "AIMANT MAGNÉTIQUE",
+    "laser": "CANONS PLASMA",
+    "lightning": "FOUDRE EN CHAÎNE",
+    "slow": "RALENTISSEUR CHRONO",
+    "fast": "SURVITESSE",
+    "extra_life": "VIE SUPPLÉMENTAIRE (+1)",
+    "shield": "BOUCLIER ÉNERGÉTIQUE (Barrière)",
+    "badge": {
+      "fireball": "FEU",
+      "megaball": "MÉGA",
+      "multiball": "x3 BAL",
+      "expand": "+LARGE",
+      "shrink": "RÉDUIT!",
+      "magnet": "AIMANT",
+      "laser": "LASER",
+      "lightning": "FOUDRE",
+      "slow": "LENT",
+      "fast": "RAPIDE!",
+      "extra_life": "+1 VIE",
+      "shield": "GARDE"
+    }
+  },
+  "themes": {
+    "cyber_neon": "1/8 Cyber-Neon (Lueur Synthwave)",
+    "industrial_forge": "2/8 Forge Industrielle (Métal Lourd DX-2)",
+    "retro_arcade": "3/8 Classique 98 (Arcade Biseautée)",
+    "hologram_matrix": "4/8 Matrice Hologramme (Fil de Fer)",
+    "crystal_prism": "5/8 Prisme Cristallin (Gemmes Taillées)",
+    "solar_magma": "6/8 Magma Solaire (Noyau Volcanique)",
+    "arctic_cryo": "7/8 Cryo Arctique (Verre Givré)",
+    "synth_sunset": "8/8 Soleil Synth (Horizon Outrun)"
+  }
+}

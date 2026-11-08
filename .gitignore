@@ -1,0 +1,12 @@
+/target
+/dist
+/local
+/CLAUDE.md
+/.claude
+/AGENTS.md
+/GEMINI.md
+/.codex
+/.gemini
+/.agent
+*.pdb
+*.DS_Store

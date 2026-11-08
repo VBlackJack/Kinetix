@@ -1,0 +1,107 @@
+{
+  "app": {
+    "title": "KINETIX",
+    "subtitle": "Modern High-Velocity Brick Breaker"
+  },
+  "menu": {
+    "play": "CLICK OR PRESS [ENTER / SPACE] TO LAUNCH CAMPAIGN",
+    "campaigns": "SELECT CAMPAIGN WORLD ([LEFT / RIGHT] or [1-3])",
+    "sector_select": "START SECTOR ([UP / DOWN]):",
+    "editor_btn": "[F4] LEVEL ARCHITECT (EDITOR)",
+    "theme_btn": "[F1] VISUAL RENDERER",
+    "lang_btn": "[F2] LANGUAGE",
+    "music_btn": "[B] DYNAMIC SYNTHTRACK",
+    "sfx_btn": "[M] SFX AUDIO",
+    "unlocked": "UNLOCKED",
+    "locked": "LOCKED",
+    "best_score": "HIGH SCORE"
+  },
+  "campaigns": {
+    "c1": "WORLD 1: IGNITION GRID (Sectors 1-5)",
+    "c2": "WORLD 2: QUANTUM WARP (Sectors 6-10)",
+    "c3": "WORLD 3: OMEGA FORGE (Sectors 11-15)"
+  },
+  "hud": {
+    "score": "SCORE",
+    "high_score": "BEST",
+    "lives": "LIVES",
+    "level": "SECTOR",
+    "combo": "COMBO",
+    "vortex": "VORTEX",
+    "boss": "OMEGA CORE",
+    "theme": "RENDERER",
+    "lang": "LANG",
+    "fps": "FPS",
+    "balls": "BALLS",
+    "synergy": "ACTIVE POWER-UPS"
+  },
+  "controls": {
+    "launch_hint": "LEFT CLICK / SPACE: Launch  |  HOLD RIGHT CLICK / SHIFT: Gravity Vortex  |  [TAB] Title Menu",
+    "laser_hint": "LEFT CLICK / SPACE: Lasers  |  HOLD RIGHT CLICK / SHIFT: Gravity Vortex  |  [TAB] Title Menu",
+    "theme_hint": "[F1] Theme",
+    "lang_hint": "[F2] EN/FR",
+    "level_hint": "[F3] Next Sector",
+    "editor_hint": "[F4] Editor",
+    "mute_hint": "[M] SFX  [B] Music",
+    "pause_hint": "[P / ESC] Pause",
+    "restart_hint": "[R] Restart"
+  },
+  "editor": {
+    "banner": "SECTOR ARCHITECT (EDITOR MODE)",
+    "instructions": "L-CLICK: Paint | R-CLICK: Erase | [1-6] Std [E] Expl [H] Steel [T] Portal [G] Ghost [V] Moving | [X] Export [I] Import [C] Clear [F4] Play",
+    "exported": "LEVEL CODE COPIED TO CLIPBOARD / PROMPT!",
+    "imported": "CUSTOM LEVEL LOADED FROM CODE!",
+    "share_prompt": "Level code (copy to share):",
+    "paste_prompt": "Paste a level code (KTX1:...):",
+    "import_invalid": "INVALID LEVEL CODE",
+    "import_too_long": "LEVEL CODE TOO LONG"
+  },
+  "status": {
+    "paused": "SYSTEM PAUSED",
+    "paused_sub": "Press P to resume, or TAB for Title Menu",
+    "victory": "SECTOR CLEARED!",
+    "victory_sub": "Click or press SPACE for next sector",
+    "game_over": "CRITICAL FAILURE - GAME OVER",
+    "game_over_sub": "Click or press R to reboot sector (TAB for Menu)",
+    "sudden_death": "OVERDRIVE LIGHTNING ACTIVE",
+    "portal_warp": "PORTAL WARP!"
+  },
+  "powerups": {
+    "fireball": "FIREBALL (Pierces & Burns)",
+    "megaball": "MEGA-BALL (Massive Impact)",
+    "multiball": "MULTI-BALL (Split x3)",
+    "expand": "EXPAND PADDLE",
+    "shrink": "SHRINK PADDLE",
+    "magnet": "MAGNETIC GRIP",
+    "laser": "PLASMA LASERS",
+    "lightning": "CHAIN LIGHTNING",
+    "slow": "CHRONO DAMPENER",
+    "fast": "OVERDRIVE SPEED",
+    "extra_life": "EXTRA CORE (+1 LIFE)",
+    "shield": "ENERGY SHIELD (Bottom Barrier)",
+    "badge": {
+      "fireball": "FIRE",
+      "megaball": "MEGA",
+      "multiball": "x3 BALL",
+      "expand": "+WIDE",
+      "shrink": "SHRINK!",
+      "magnet": "MAGNET",
+      "laser": "LASER",
+      "lightning": "BOLT",
+      "slow": "SLOW",
+      "fast": "FAST!",
+      "extra_life": "+1 LIFE",
+      "shield": "SHIELD"
+    }
+  },
+  "themes": {
+    "cyber_neon": "1/8 Cyber-Neon (Synthwave Glow)",
+    "industrial_forge": "2/8 Industrial Forge (DX-2 Heavy Metal)",
+    "retro_arcade": "3/8 Classic 98 (Beveled Arcade)",
+    "hologram_matrix": "4/8 Hologram Matrix (Wireframe Data)",
+    "crystal_prism": "5/8 Crystal Prism (Faceted Gems)",
+    "solar_magma": "6/8 Solar Magma (Volcanic Core)",
+    "arctic_cryo": "7/8 Arctic Cryo (Frosted Glass)",
+    "synth_sunset": "8/8 Synth Sunset (Outrun Horizon)"
+  }
+}

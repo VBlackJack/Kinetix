@@ -1,0 +1,211 @@
+{
+  "levels": [
+    {
+      "id": 1,
+      "world": 1,
+      "name": "DX-IGNITION",
+      "boss": false,
+      "rows": [
+        "111222333222111",
+        "1002E23332E2001",
+        "444444555444444",
+        "00333E666E33300",
+        "222200111002222",
+        "5500550E0550055"
+      ]
+    },
+    {
+      "id": 2,
+      "world": 1,
+      "name": "REACTOR CORE",
+      "boss": false,
+      "rows": [
+        "##11122222111##",
+        "#333E44E44E333#",
+        "220055EEE550022",
+        "220055EEE550022",
+        "#444E33E33E444#",
+        "##11166666111##"
+      ]
+    },
+    {
+      "id": 3,
+      "world": 1,
+      "name": "OVERDRIVE MATRIX",
+      "boss": false,
+      "rows": [
+        "6E601E102E203E3",
+        "666011102220333",
+        "0000###0###0000",
+        "444E555E444E555",
+        "1234561E1654321",
+        "111111111111111"
+      ]
+    },
+    {
+      "id": 4,
+      "world": 1,
+      "name": "PRISM FORTRESS",
+      "boss": false,
+      "rows": [
+        "###555EEE555###",
+        "#220044E440022#",
+        "3300660E0660033",
+        "3300660E0660033",
+        "#220044E440022#",
+        "###111222111###"
+      ]
+    },
+    {
+      "id": 5,
+      "world": 1,
+      "name": "IGNITION WARDEN [BOSS]",
+      "boss": true,
+      "rows": [
+        "000000000000000",
+        "000000000000000",
+        "000000000000000",
+        "##222E000E222##",
+        "111100###001111"
+      ]
+    },
+    {
+      "id": 6,
+      "world": 2,
+      "name": "PORTAL NEXUS",
+      "boss": false,
+      "rows": [
+        "T00555EEE55500T",
+        "111222000222111",
+        "00#444GGG444#00",
+        "333000EEE000333",
+        "T0022211122200T",
+        "111000###000111"
+      ]
+    },
+    {
+      "id": 7,
+      "world": 2,
+      "name": "PHANTOM CARRIER",
+      "boss": false,
+      "rows": [
+        "GGGGGGEEEGGGGGG",
+        "00MMM00000MMM00",
+        "222E333T333E222",
+        "00MMM00000MMM00",
+        "GGGG444T444GGGG",
+        "111222333222111"
+      ]
+    },
+    {
+      "id": 8,
+      "world": 2,
+      "name": "CONVEYOR BELT",
+      "boss": false,
+      "rows": [
+        "MMMMM0EEE0MMMMM",
+        "000000###000000",
+        "T0555E666E5550T",
+        "000000###000000",
+        "MMMMM0EEE0MMMMM",
+        "222333444333222"
+      ]
+    },
+    {
+      "id": 9,
+      "world": 2,
+      "name": "EVENT HORIZON",
+      "boss": false,
+      "rows": [
+        "#T#666EEE666#T#",
+        "GGG0055E5500GGG",
+        "00MMM0TTT0MMM00",
+        "444E3330333E444",
+        "GGG0022E2200GGG",
+        "1111111E1111111"
+      ]
+    },
+    {
+      "id": 10,
+      "world": 2,
+      "name": "CHRONO ARCHON [BOSS]",
+      "boss": true,
+      "rows": [
+        "000000000000000",
+        "000000000000000",
+        "000000000000000",
+        "T00GGGEEEGGG00T",
+        "##MMM0###0MMM##"
+      ]
+    },
+    {
+      "id": 11,
+      "world": 3,
+      "name": "ANVIL FOUNDRY",
+      "boss": false,
+      "rows": [
+        "###666EEE666###",
+        "MMM555#T#555MMM",
+        "666E4440444E666",
+        "GGG333#T#333GGG",
+        "MMM222EEE222MMM",
+        "111555666555111"
+      ]
+    },
+    {
+      "id": 12,
+      "world": 3,
+      "name": "TESLA COIL",
+      "boss": false,
+      "rows": [
+        "T0E0T0E0E0T0E0T",
+        "666666###666666",
+        "00MMMMMEMMMMM00",
+        "GGGGGG###GGGGGG",
+        "555E444T444E555",
+        "222333444333222"
+      ]
+    },
+    {
+      "id": 13,
+      "world": 3,
+      "name": "SPECTRAL VAULT",
+      "boss": false,
+      "rows": [
+        "#####T###T#####",
+        "#GGGGGGGGGGGGG#",
+        "#G666E555E666G#",
+        "#G555EEEE5555G#",
+        "#GGGGGGGGGGGGG#",
+        "##MMM22222MMM##"
+      ]
+    },
+    {
+      "id": 14,
+      "world": 3,
+      "name": "SINGULARITY RING",
+      "boss": false,
+      "rows": [
+        "66E660TTT066E66",
+        "600060MMM060006",
+        "E0T0E0GGG0E0T0E",
+        "600060MMM060006",
+        "66E660###066E66",
+        "555555EEE555555"
+      ]
+    },
+    {
+      "id": 15,
+      "world": 3,
+      "name": "OMEGA EMPEROR [FINAL BOSS]",
+      "boss": true,
+      "rows": [
+        "000000000000000",
+        "000000000000000",
+        "000000000000000",
+        "T0MMM6EEE6MMM0T",
+        "##GGG5###5GGG##"
+      ]
+    }
+  ]
+}
