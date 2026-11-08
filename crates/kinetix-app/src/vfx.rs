@@ -18,6 +18,12 @@ use kinetix_core::physics::PowerUpKind;
 use macroquad::prelude::*;
 use miniquad::{BlendFactor, BlendState, Equation, UniformDesc, UniformType};
 
+/// Badge label font size range: the label shrinks from the max down to the min to fit its banner.
+pub const BADGE_FONT_SIZE_MAX: u16 = 16;
+pub const BADGE_FONT_SIZE_MIN: u16 = 11;
+/// Total horizontal margin kept free inside the badge banner.
+const BADGE_TEXT_PADDING: f32 = 8.0;
+
 pub fn additive_material() -> Material {
     let vertex_shader = "#version 100
     attribute vec3 position;
@@ -158,15 +164,66 @@ pub fn nebula_material() -> Material {
     .expect("Failed to compile nebula shader")
 }
 
+/// Segments used to approximate each rounded corner.
+const CORNER_SEGMENTS: usize = 6;
+/// Start angle (radians, screen space with y pointing down) of the outer quadrant of each corner:
+/// top-left, top-right, bottom-right, bottom-left.
+const CORNER_START_ANGLES: [f32; 4] = [
+    std::f32::consts::PI,
+    std::f32::consts::PI * 1.5,
+    0.0,
+    std::f32::consts::FRAC_PI_2,
+];
+
+/// Points of a quarter-circle arc around `(cx, cy)`, from `start_angle` over a quarter turn.
+/// Returns `segments + 1` points.
+pub fn corner_arc_points(cx: f32, cy: f32, r: f32, start_angle: f32, segments: usize) -> Vec<Vec2> {
+    let step = std::f32::consts::FRAC_PI_2 / segments as f32;
+    (0..=segments)
+        .map(|i| {
+            let a = start_angle + step * i as f32;
+            vec2(cx + r * a.cos(), cy + r * a.sin())
+        })
+        .collect()
+}
+
+/// Rounded rectangle made of three non-overlapping rectangles and four quarter-disc fans, so
+/// translucent colours are blended exactly once everywhere.
 pub fn draw_rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32, col: Color) {
     let r = r.min(w * 0.5).min(h * 0.5);
     draw_rectangle(x + r, y, w - 2.0 * r, h, col);
     draw_rectangle(x, y + r, r, h - 2.0 * r, col);
     draw_rectangle(x + w - r, y + r, r, h - 2.0 * r, col);
-    draw_circle(x + r, y + r, r, col);
-    draw_circle(x + w - r, y + r, r, col);
-    draw_circle(x + r, y + h - r, r, col);
-    draw_circle(x + w - r, y + h - r, r, col);
+    let centers = [
+        (x + r, y + r),
+        (x + w - r, y + r),
+        (x + w - r, y + h - r),
+        (x + r, y + h - r),
+    ];
+    for ((cx, cy), start) in centers.into_iter().zip(CORNER_START_ANGLES) {
+        let arc = corner_arc_points(cx, cy, r, start, CORNER_SEGMENTS);
+        let center = vec2(cx, cy);
+        for pair in arc.windows(2) {
+            draw_triangle(center, pair[0], pair[1], col);
+        }
+    }
+}
+
+/// Removes the oldest elements so that at most `max` remain.
+pub fn cap_oldest<T>(v: &mut Vec<T>, max: usize) {
+    if v.len() > max {
+        let excess = v.len() - max;
+        v.drain(..excess);
+    }
+}
+
+/// Largest font size in `min..=max` whose measured width fits `limit`; `min` when none fits.
+pub fn fit_font_size(measure: impl Fn(u16) -> f32, max: u16, min: u16, limit: f32) -> u16 {
+    let mut size = max;
+    while size > min && measure(size) > limit {
+        size -= 1;
+    }
+    size
 }
 
 pub fn draw_modern_capsule_brick(
@@ -794,7 +851,13 @@ pub fn draw_powerup_capsule(
     let banner_y = by + h - banner_h - 2.5;
     draw_rounded_rect(bx + 3.0, banner_y, w - 6.0, banner_h, 7.0, rim_col);
 
-    let font_size = 16u16;
+    let banner_w = w - 6.0;
+    let font_size = fit_font_size(
+        |size| measure_text(badge_label, font, size, 1.0).width,
+        BADGE_FONT_SIZE_MAX,
+        BADGE_FONT_SIZE_MIN,
+        banner_w - BADGE_TEXT_PADDING,
+    );
     let dims = measure_text(badge_label, font, font_size, 1.0);
     let tx = x - dims.width * 0.5;
     let ty = banner_y + banner_h - 4.5;
@@ -821,4 +884,52 @@ pub fn draw_powerup_capsule(
             ..Default::default()
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPS: f32 = 1e-3;
+
+    #[test]
+    fn corner_arcs_stay_in_the_outer_quadrant() {
+        let (cx, cy, r) = (100.0, 50.0, 10.0);
+        // Outward direction (sign of dx, sign of dy) for TL, TR, BR, BL.
+        let signs = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        for (start, (sx, sy)) in CORNER_START_ANGLES.into_iter().zip(signs) {
+            let pts = corner_arc_points(cx, cy, r, start, CORNER_SEGMENTS);
+            assert_eq!(pts.len(), CORNER_SEGMENTS + 1);
+            for p in pts {
+                assert!(((p.x - cx).hypot(p.y - cy) - r).abs() < EPS);
+                assert!((p.x - cx) * sx >= -EPS && (p.y - cy) * sy >= -EPS);
+            }
+        }
+    }
+
+    #[test]
+    fn corner_arc_endpoints_touch_the_straight_edges() {
+        let pts = corner_arc_points(0.0, 0.0, 5.0, CORNER_START_ANGLES[0], CORNER_SEGMENTS);
+        let first = pts[0];
+        let last = pts[CORNER_SEGMENTS];
+        assert!((first.x + 5.0).abs() < EPS && first.y.abs() < EPS);
+        assert!(last.x.abs() < EPS && (last.y + 5.0).abs() < EPS);
+    }
+
+    #[test]
+    fn cap_oldest_drops_the_front() {
+        let mut v: Vec<u32> = (0..10).collect();
+        cap_oldest(&mut v, 4);
+        assert_eq!(v, vec![6, 7, 8, 9]);
+        cap_oldest(&mut v, 10);
+        assert_eq!(v.len(), 4);
+    }
+
+    #[test]
+    fn fit_font_size_shrinks_to_the_limit() {
+        let measure = |size: u16| size as f32 * 10.0;
+        assert_eq!(fit_font_size(measure, 16, 11, 200.0), 16);
+        assert_eq!(fit_font_size(measure, 16, 11, 135.0), 13);
+        assert_eq!(fit_font_size(measure, 16, 11, 1.0), 11);
+    }
 }

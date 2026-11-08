@@ -42,6 +42,22 @@
     "boss_base_hp": 18,
     "boss_speed": 310.0,
     "boss_fire_interval_sec": 2.2,
-    "boss_hazard_speed": 480.0
+    "boss_hazard_speed": 480.0,
+    "sudden_death_strike_interval_sec": 2.2,
+    "portal_cooldown_sec": 0.45,
+    "powerup_spawn_cooldown_sec": 1.65,
+    "powerup_min_spawn_distance": 280.0,
+    "powerup_wall_margin": 76.0,
+    "powerup_toast_sec": 3.0,
+    "slow_factor": 0.78,
+    "fast_factor": 1.22,
+    "shield_hits": 3,
+    "boss_hp_per_tier": 8,
+    "boss_speed_per_tier": 0.2,
+    "boss_kill_score_mult": 50,
+    "combo_step": 4,
+    "combo_max_mult": 8,
+    "multiball_spread_rad": 0.38,
+    "powerup_score_mult": 2
   }
 }

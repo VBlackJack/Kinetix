@@ -379,7 +379,7 @@ fn boss_hazard_shrinks_paddle_without_score_or_toast() {
     w.step_boss_and_hazards(TINY_DT, &mut events);
     assert!(w.paddle_width < before);
     assert_eq!(w.score, score);
-    assert!(w.last_powerup_key.is_none());
+    assert!(w.last_powerup.is_none());
     assert!(w.hazards.is_empty());
 }
 
@@ -422,4 +422,141 @@ fn built_in_levels_keep_their_grid_layout() {
     assert!((first.w - 95.6).abs() < EPS);
     let second = &w.bricks[1];
     assert!((second.x - (208.0 + 95.6 + BRICK_GAP)).abs() < EPS);
+}
+
+/// Brick whose centre lies at (`cx`, `cy`).
+fn brick_centered(cx: f32, cy: f32, kind: BrickKind) -> Brick {
+    brick(cx - 50.0, cy - BRICK_HEIGHT * 0.5, kind)
+}
+
+#[test]
+fn explosion_chain_does_not_skip_bricks_in_range() {
+    // Order matters: with a recursive scan, detonating B swap-removes Q and moves L below the
+    // outer cursor, so L (in range of the first blast) used to survive.
+    let mut w = empty_world(960.0, 600.0, 0.0, -1.0);
+    let y = 313.0;
+    w.bricks.push(brick_centered(1220.0, y, standard(1, 1, 0))); // Q: in range of B only
+    w.bricks
+        .push(brick_centered(1100.0, y, BrickKind::Explosive)); // B: in range of A
+    w.bricks.push(brick_centered(880.0, y, standard(1, 1, 0))); // L: in range of A only
+    let mut events = Vec::new();
+    w.trigger_explosion(1000.0, y, &mut events);
+    assert!(w.bricks.is_empty(), "left {} bricks", w.bricks.len());
+    let blasts = events
+        .iter()
+        .filter(|e| matches!(e, GameEvent::Explosion { .. }))
+        .count();
+    assert_eq!(blasts, 2);
+}
+
+#[test]
+fn fireball_destroying_explosive_brick_explodes_once() {
+    let mut w = empty_world(550.0, 313.0, 0.0, -1.0);
+    w.balls[0].fireball = true;
+    w.bricks.push(brick(500.0, 300.0, BrickKind::Explosive));
+    let events = step(&mut w, 1);
+    assert!(w.bricks.is_empty());
+    let blasts = events
+        .iter()
+        .filter(|e| matches!(e, GameEvent::Explosion { .. }))
+        .count();
+    assert_eq!(blasts, 1);
+}
+
+#[test]
+fn brick_hit_reports_points_only_when_destroyed() {
+    let mut w = empty_world(960.0, 600.0, 0.0, -1.0);
+    w.bricks.push(brick(500.0, 300.0, standard(2, 2, 0)));
+    let mut events = Vec::new();
+    assert!(!w.damage_brick(0, false, &mut events));
+    assert!(matches!(
+        events.last(),
+        Some(GameEvent::BrickHit {
+            destroyed: false,
+            points: 0,
+            ..
+        })
+    ));
+    let before = w.score;
+    assert!(w.damage_brick(0, false, &mut events));
+    let Some(GameEvent::BrickHit {
+        destroyed, points, ..
+    }) = events.last()
+    else {
+        panic!("expected a BrickHit");
+    };
+    assert!(*destroyed);
+    assert!(*points > 0);
+    assert_eq!(w.score - before, *points);
+}
+
+#[test]
+fn boss_kill_points_use_the_configured_multiplier() {
+    let mut w = empty_world(0.0, 0.0, 0.0, 0.0);
+    let (bx, by) = (800.0, 400.0);
+    w.boss = Some(BossEntity {
+        x: bx,
+        y: by,
+        w: 100.0,
+        h: 40.0,
+        vx: 0.0,
+        hp: 1,
+        max_hp: 1,
+        fire_timer: 1000.0,
+        hit_flash: 0.0,
+    });
+    w.balls[0].x = bx + 50.0;
+    w.balls[0].y = by + 40.0 + w.balls[0].radius - 1.0;
+    w.balls[0].vy = -1.0;
+    let expected = w.config.gameplay.base_brick_score * w.config.gameplay.boss_kill_score_mult;
+    let events = step(&mut w, 1);
+    assert!(w.boss.is_none());
+    assert!(events.iter().any(|e| matches!(
+        e,
+        GameEvent::BrickHit { destroyed: true, points, .. } if *points == expected
+    )));
+    assert_eq!(w.score, expected);
+}
+
+#[test]
+fn shield_hits_reset_when_a_level_loads() {
+    let mut w = world();
+    w.apply_powerup(PowerUpKind::Shield);
+    assert_eq!(w.shield_hits, w.config.gameplay.shield_hits);
+    w.load_level(1, &levels());
+    assert_eq!(w.shield_hits, 0);
+
+    w.shield_hits = 2;
+    w.load_from_rows(&["1".to_string()], false, 1);
+    assert_eq!(w.shield_hits, 0);
+}
+
+#[test]
+fn apply_powerup_records_the_kind() {
+    let mut w = world();
+    assert!(w.last_powerup.is_none());
+    w.apply_powerup(PowerUpKind::Magnet);
+    assert_eq!(w.last_powerup, Some(PowerUpKind::Magnet));
+    assert!((w.last_powerup_timer - w.config.gameplay.powerup_toast_sec).abs() < EPS);
+}
+
+#[test]
+fn reseed_is_deterministic_and_seed_dependent() {
+    let draws = |seed: u64| {
+        let mut w = world();
+        w.reseed(seed);
+        (0..8).map(|_| w.next_rand_f32()).collect::<Vec<f32>>()
+    };
+    assert_eq!(draws(42), draws(42));
+    assert_ne!(draws(42), draws(43));
+    assert_ne!(draws(0), draws(1));
+    let mut w = world();
+    w.reseed(0);
+    assert_ne!(w.rng_state, 0);
+}
+
+#[test]
+fn new_worlds_share_the_default_sequence() {
+    let (mut a, mut b) = (world(), world());
+    assert_eq!(a.next_rand_f32(), b.next_rand_f32());
 }

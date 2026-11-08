@@ -42,10 +42,30 @@
 </head>
 <body>
   <canvas id="glcanvas" tabindex="1"></canvas>
-  <script src="gl.js"></script>
+  <script src="gl.js?v=__KINETIX_BUILD__"></script>
   <script>
     const glCanvas = document.getElementById("glcanvas");
     let lockWanted = false;
+    // A lock requested inside a gesture because of the resume mask is kept for this long while the
+    // game has not yet set lockWanted (it does so one frame later).
+    const SPECULATIVE_LOCK_MS = 250;
+    let speculativeUntil = 0;
+    let speculativeTimer = null;
+    function lockIsWanted() {
+      return lockWanted || performance.now() < speculativeUntil;
+    }
+    // Bitmask of inputs the game will treat as "resume" (see kinetix_set_resume_mask).
+    const RESUME_BIT_CLICK = 1;
+    const RESUME_KEY_BITS = {
+      Space: 2,
+      Enter: 4,
+      KeyP: 8,
+      KeyR: 16,
+      F3: 32,
+      F4: 64,
+      Tab: 128
+    };
+    let resumeMask = 0;
     let audioCtx = null;
     let musicEnabled = 1;
     let musicIntensity = 0;
@@ -155,10 +175,13 @@
           try {
             const u = (parseInt(localStorage.getItem("kinetix_unlocked") || "0", 10) || 0) & 0xFF;
             const t = (parseInt(localStorage.getItem("kinetix_theme") || "0", 10) || 0) & 0xFF;
-            const l = (parseInt(localStorage.getItem("kinetix_lang") || "1", 10) || 0) & 0xFF;
+            const storedLang = localStorage.getItem("kinetix_lang");
+            const l = storedLang === null
+              ? (/^fr/i.test(navigator.language || "") ? 1 : 0)
+              : ((parseInt(storedLang, 10) || 0) & 0xFF);
             return u | (t << 8) | (l << 16);
           } catch (_) {
-            return (1 << 16);
+            return 0;
           }
         };
         importObject.env.kinetix_share_level = function (codePtr, codeLen, msgPtr, msgLen) {
@@ -195,11 +218,20 @@
           boundsLeft = Number.isFinite(left) ? left : null;
           boundsRight = Number.isFinite(right) ? right : null;
         };
+        importObject.env.kinetix_set_resume_mask = function (mask) {
+          resumeMask = mask >>> 0;
+        };
         importObject.env.kinetix_set_pointer_lock = function (enabled) {
           lockWanted = enabled !== 0;
           if (lockWanted) {
             requestLock();
-          } else if (document.pointerLockElement === glCanvas) {
+          } else {
+            // The game withdrew the lock: no speculative grace, exit immediately.
+            speculativeUntil = 0;
+            clearTimeout(speculativeTimer);
+            speculativeTimer = null;
+          }
+          if (!lockWanted && document.pointerLockElement === glCanvas) {
             document.exitPointerLock();
           }
         };
@@ -218,17 +250,34 @@
       } catch (_) {}
     }
 
-    // requestPointerLock needs a user gesture: retry synchronously from the gesture handlers.
-    function requestLockInGesture() {
-      if (lockWanted && document.pointerLockElement !== glCanvas) requestLock();
+    // requestPointerLock needs a user gesture (Firefox honours it only synchronously inside the
+    // input handler), while the game asks one frame later. So also request the lock when the input
+    // matches a resume bit; a wrong guess is undone by the pointerlockchange handler.
+    function requestLockInGesture(resumeBit) {
+      if (document.pointerLockElement === glCanvas) return;
+      if (lockWanted) {
+        requestLock();
+      } else if ((resumeMask & resumeBit) !== 0) {
+        // Speculative request: keep it alive until the game confirms (lockWanted) or the window ends.
+        speculativeUntil = performance.now() + SPECULATIVE_LOCK_MS;
+        clearTimeout(speculativeTimer);
+        speculativeTimer = setTimeout(() => {
+          speculativeTimer = null;
+          speculativeUntil = 0;
+          if (!lockWanted && document.pointerLockElement === glCanvas) nativeExitPointerLock();
+        }, SPECULATIVE_LOCK_MS);
+        requestLock();
+      }
     }
 
-    glCanvas.addEventListener("mousedown", () => {
+    glCanvas.addEventListener("mousedown", (e) => {
       ensureAudio();
-      requestLockInGesture();
+      requestLockInGesture(e.button === 0 ? RESUME_BIT_CLICK : 0);
     });
 
-    window.addEventListener("keydown", requestLockInGesture, true);
+    window.addEventListener("keydown", (e) => {
+      requestLockInGesture(RESUME_KEY_BITS[e.code] || 0);
+    }, true);
 
     // A refused request is harmless: the next gesture retries.
     document.addEventListener("pointerlockerror", () => {});
@@ -252,7 +301,7 @@
     // so the paddle does not jump. A lost lock needs no handling: the next mousedown or keydown re-requests it.
     document.addEventListener("pointerlockchange", () => {
       if (document.pointerLockElement === glCanvas) {
-        if (!lockWanted) {
+        if (!lockIsWanted()) {
           // The game withdrew the lock before the browser granted it.
           document.exitPointerLock();
           return;
@@ -307,10 +356,10 @@
     // macroquad's grab. Ignore those calls while the game wants the lock.
     const nativeExitPointerLock = document.exitPointerLock.bind(document);
     document.exitPointerLock = function () {
-      if (!lockWanted) nativeExitPointerLock();
+      if (!lockIsWanted()) nativeExitPointerLock();
     };
 
-    load("kinetix-app.wasm?v=" + Date.now());
+    load("kinetix-app.wasm?v=__KINETIX_BUILD__");
   </script>
 </body>
 </html>

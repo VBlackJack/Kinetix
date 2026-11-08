@@ -85,6 +85,44 @@ mod tests {
         assert_eq!(levels.levels.len(), 15);
     }
 
+    fn flatten_keys(
+        prefix: &str,
+        value: &serde_json::Value,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    flatten_keys(&key, v, out);
+                }
+            }
+            _ => {
+                out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn locales_have_identical_key_sets() {
+        let parse = |raw: &str| {
+            let root: serde_json::Value = serde_json::from_str(raw).expect("valid locale");
+            let mut keys = std::collections::BTreeSet::new();
+            flatten_keys("", &root, &mut keys);
+            keys
+        };
+        let en = parse(include_str!("../../../assets/locales/en.json"));
+        let fr = parse(include_str!("../../../assets/locales/fr.json"));
+        let only_en: Vec<_> = en.difference(&fr).collect();
+        let only_fr: Vec<_> = fr.difference(&en).collect();
+        assert!(only_en.is_empty(), "keys missing from fr.json: {only_en:?}");
+        assert!(only_fr.is_empty(), "keys missing from en.json: {only_fr:?}");
+    }
+
     const UI_FONT: &[u8] = include_bytes!("../../../assets/fonts/ui_font.ttf");
     const FRENCH_ACCENTS: &str = "éèêëàâçôûùîïÉÈÊÀÂÇÔÛÙÎÏ";
 

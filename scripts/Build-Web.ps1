@@ -27,6 +27,9 @@ $MiniquadPackage = "miniquad"
 $ImportPrefix = "kinetix_"
 $ServePort = 8080
 $WasmSectionImport = 2
+$BuildPlaceholder = "__KINETIX_BUILD__"
+$BuildPlaceholderExpected = 2
+$BuildIdLength = 12
 
 function Get-Leb128 {
     param([byte[]]$Bytes, [ref]$Offset)
@@ -132,7 +135,7 @@ if ($SkipBuild) {
     Write-Host "[1/3] Skipping compilation (-SkipBuild)" -ForegroundColor Yellow
 } else {
     Write-Host "[1/3] Compiling KINETIX to WebAssembly ($WasmTarget)..." -ForegroundColor Cyan
-    cargo build --release --target $WasmTarget -p $AppPackage
+    cargo build --locked --release --target $WasmTarget -p $AppPackage
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 }
 
@@ -141,9 +144,18 @@ Test-KinetixImportGuard -WasmPath $WasmPath -HtmlPath "web\index.html"
 
 $DistDir = Join-Path $PWD "dist"
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
-Copy-Item "web\index.html" -Destination (Join-Path $DistDir "index.html") -Force
 Copy-Item (Get-MiniquadGlJs) -Destination (Join-Path $DistDir "gl.js") -Force
 Copy-Item $WasmPath -Destination (Join-Path $DistDir "$AppPackage.wasm") -Force
+
+# Cache busting: stamp the dist copy of index.html with a hash of the wasm (source stays untouched).
+$BuildId = (Get-FileHash -LiteralPath (Join-Path $DistDir "$AppPackage.wasm") -Algorithm SHA256).Hash.Substring(0, $BuildIdLength)
+$HtmlText = [System.IO.File]::ReadAllText((Join-Path $PWD "web\index.html"))
+$PlaceholderCount = ([regex]::Matches($HtmlText, [regex]::Escape($BuildPlaceholder))).Count
+if ($PlaceholderCount -ne $BuildPlaceholderExpected) {
+    throw "Expected $BuildPlaceholderExpected '$BuildPlaceholder' placeholders in web/index.html, found $PlaceholderCount"
+}
+[System.IO.File]::WriteAllText((Join-Path $DistDir "index.html"), $HtmlText.Replace($BuildPlaceholder, $BuildId), [System.Text.UTF8Encoding]::new($false))
+Write-Host "Cache-busting build id: $BuildId"
 
 Write-Host "[3/3] Web bundle ready in dist/ (index.html + gl.js + $AppPackage.wasm)" -ForegroundColor Green
 

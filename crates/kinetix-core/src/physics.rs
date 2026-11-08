@@ -39,6 +39,72 @@ const MOVING_BRICK_SPEED: f32 = 180.0;
 const MOVING_BRICK_WALL_EXTRA_MARGIN: f32 = 2.0;
 const BRICK_GRID_SIDE_MARGIN: f32 = 160.0;
 const HAZARD_EXPLOSION_RADIUS: f32 = 55.0;
+/// Seed used by `GameWorld::new`, keeping fresh worlds deterministic until `reseed` is called.
+const DEFAULT_SEED: u64 = 0x853C_49E6_748F_EA9B;
+/// Fallback xorshift state when a scrambled seed would be zero (an all-zero state never advances).
+const NONZERO_STATE_FALLBACK: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Maximum number of simultaneously falling capsules. The separation logic in `step_capsules`
+/// handles exactly two capsules, so this must stay at 2.
+const MAX_CAPSULES: usize = 2;
+/// Horizontal distance under which two falling capsules push each other apart.
+const CAPSULE_SEPARATION_DX: f32 = 210.0;
+/// Vertical distance under which two falling capsules push each other apart.
+const CAPSULE_SEPARATION_DY: f32 = 160.0;
+/// Horizontal speed of the capsule separation push.
+const CAPSULE_SEPARATION_SPEED: f32 = 140.0;
+/// Maximum horizontal offset used by the vortex pull on capsules.
+const CAPSULE_VORTEX_MAX_OFFSET: f32 = 220.0;
+/// Gain applied to the vortex pull on capsules.
+const CAPSULE_VORTEX_GAIN: f32 = 1.8;
+/// Horizontal range over which the vortex pulls balls toward the paddle.
+const BALL_VORTEX_RANGE: f32 = 360.0;
+/// Fraction of the capsule radius that counts toward a catch, horizontally.
+const CAPSULE_CATCH_X_FACTOR: f32 = 0.85;
+/// Fraction of the capsule radius that counts toward a catch, vertically.
+const CAPSULE_CATCH_Y_FACTOR: f32 = 0.72;
+/// Maximum paddle-offset ratio when releasing a stuck ball.
+const LAUNCH_RATIO_CLAMP: f32 = 0.85;
+/// Maximum paddle-offset ratio for a paddle bounce.
+const BOUNCE_RATIO_CLAMP: f32 = 0.95;
+/// Initial ball direction (x component) before launch.
+const INITIAL_DIR_X: f32 = 0.35;
+/// Initial ball direction (y component) before launch.
+const INITIAL_DIR_Y: f32 = -0.93;
+/// Distance below the arena at which a ball is considered lost.
+const OUT_OF_ARENA_MARGIN: f32 = 20.0;
+/// Brick hit-flash decay rate per second.
+const BRICK_FLASH_DECAY: f32 = 5.0;
+/// Boss hit-flash decay rate per second.
+const BOSS_FLASH_DECAY: f32 = 4.5;
+/// Minimum vortex energy required to activate the vortex.
+const VORTEX_MIN_ENERGY: f32 = 5.0;
+/// Vortex energy at or below which an active vortex shuts off.
+const VORTEX_CUTOFF_ENERGY: f32 = 0.5;
+/// Colour index of the boss hit event.
+const BOSS_HIT_COLOR_IDX: usize = 1;
+/// Colour index of portal and indestructible hit events.
+const SOLID_HIT_COLOR_IDX: usize = 0;
+/// Colour index of ghost hit events.
+const GHOST_HIT_COLOR_IDX: usize = 2;
+/// Colour index used for explosive brick score events.
+const EXPLOSIVE_COLOR_IDX: usize = 5;
+/// Hit points of a freshly loaded moving brick.
+const MOVING_BRICK_HP: u8 = 2;
+/// Colour index of moving bricks.
+const MOVING_BRICK_COLOR_IDX: usize = 3;
+/// First level-file digit that loads as a two-hit standard brick.
+const TOUGH_BRICK_DIGIT: usize = 5;
+/// Hit points of a two-hit standard brick.
+const TOUGH_BRICK_HP: u8 = 2;
+/// Number of distinct brick colours cycled by level-file digits.
+const BRICK_COLOR_COUNT: usize = 6;
+/// Laser bolt origin offset from the paddle centre, as a fraction of the paddle width.
+const LASER_OFFSET_RATIO: f32 = 0.36;
+/// Boss turret positions as fractions of the boss width.
+const BOSS_LEFT_TURRET_RATIO: f32 = 0.25;
+const BOSS_RIGHT_TURRET_RATIO: f32 = 0.75;
+/// Boss damage dealt by a mega or fire ball.
+const BOSS_POWER_DAMAGE: u32 = 2;
 
 /// Single definition of the brick grid, shared by level loading, editor painting and export.
 #[derive(Debug, Clone, Copy)]
@@ -237,23 +303,6 @@ impl PowerUpKind {
         ]
     }
 
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Self::Fireball => "F",
-            Self::MegaBall => "M",
-            Self::MultiBall => "x3",
-            Self::Expand => "<>",
-            Self::Shrink => "><",
-            Self::Magnet => "U",
-            Self::Laser => "||",
-            Self::Lightning => "Z",
-            Self::Slow => "-",
-            Self::Fast => "+",
-            Self::ExtraLife => "+1",
-            Self::Shield => "==",
-        }
-    }
-
     pub fn i18n_key(self) -> &'static str {
         match self {
             Self::Fireball => "powerups.fireball",
@@ -289,23 +338,6 @@ impl PowerUpKind {
             Self::Fast => "powerups.badge.fast",
             Self::ExtraLife => "powerups.badge.extra_life",
             Self::Shield => "powerups.badge.shield",
-        }
-    }
-
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::Fireball => "FIRE",
-            Self::MegaBall => "MEGA",
-            Self::MultiBall => "x3",
-            Self::Expand => "WIDE",
-            Self::Shrink => "MINI",
-            Self::Magnet => "GRIP",
-            Self::Laser => "GUN",
-            Self::Lightning => "BOLT",
-            Self::Slow => "SLOW",
-            Self::Fast => "FAST",
-            Self::ExtraLife => "+1UP",
-            Self::Shield => "WALL",
         }
     }
 }
@@ -368,6 +400,8 @@ pub enum GameEvent {
         y: f32,
         color_idx: usize,
         destroyed: bool,
+        /// Score awarded by this hit: 0 unless the brick was destroyed.
+        points: u64,
     },
     Explosion {
         x: f32,
@@ -436,7 +470,7 @@ pub struct GameWorld {
     pub combo: u32,
     pub combo_timer: f32,
     pub current_level_idx: usize,
-    pub last_powerup_key: Option<&'static str>,
+    pub last_powerup: Option<PowerUpKind>,
     pub last_powerup_timer: f32,
     pub powerup_spawn_cooldown: f32,
     rng_state: u64,
@@ -470,15 +504,25 @@ impl GameWorld {
             combo: 0,
             combo_timer: 0.0,
             current_level_idx: 0,
-            last_powerup_key: None,
+            last_powerup: None,
             last_powerup_timer: 0.0,
             powerup_spawn_cooldown: 0.0,
             status: SessionStatus::Playing,
             config,
-            rng_state: 0x853C_49E6_748F_EA9B,
+            rng_state: DEFAULT_SEED,
         };
         world.load_level(0, levels);
         world
+    }
+
+    /// Reseeds the random generator. The seed is scrambled with splitmix64 so that nearby seeds
+    /// yield unrelated sequences, and the resulting state is never zero.
+    pub fn reseed(&mut self, seed: u64) {
+        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        self.rng_state = if z == 0 { NONZERO_STATE_FALLBACK } else { z };
     }
 
     fn next_rand_f32(&mut self) -> f32 {
@@ -499,7 +543,7 @@ impl GameWorld {
         }
         self.current_level_idx = idx % levels.len();
         self.max_unlocked_level = self.max_unlocked_level.max(self.current_level_idx);
-        let level = levels[self.current_level_idx].clone();
+        let level = &levels[self.current_level_idx];
         self.load_from_rows(&level.rows, level.boss, level.world);
     }
 
@@ -511,17 +555,20 @@ impl GameWorld {
         self.level_elapsed = 0.0;
         self.sudden_death_timer = 0.0;
         self.powerup_spawn_cooldown = 0.0;
+        self.shield_hits = 0;
         self.status = SessionStatus::Playing;
 
         if has_boss {
             let tier_mult = world_tier.max(1) as u32;
-            let hp = self.config.gameplay.boss_base_hp + (tier_mult - 1) * 8;
+            let hp = self.config.gameplay.boss_base_hp
+                + (tier_mult - 1) * self.config.gameplay.boss_hp_per_tier;
             self.boss = Some(BossEntity {
                 x: (self.config.arena.width - BOSS_WIDTH) * 0.5,
                 y: BOSS_Y,
                 w: BOSS_WIDTH,
                 h: BOSS_HEIGHT,
-                vx: self.config.gameplay.boss_speed * (1.0 + (tier_mult as f32 - 1.0) * 0.2),
+                vx: self.config.gameplay.boss_speed
+                    * (1.0 + (tier_mult as f32 - 1.0) * self.config.gameplay.boss_speed_per_tier),
                 hp,
                 max_hp: hp,
                 fire_timer: self.config.gameplay.boss_fire_interval_sec,
@@ -546,8 +593,8 @@ impl GameWorld {
                     'G' => (BrickKind::Ghost { revealed: false }, 0.0),
                     'M' => (
                         BrickKind::Moving {
-                            hp: 2,
-                            color_idx: 3,
+                            hp: MOVING_BRICK_HP,
+                            color_idx: MOVING_BRICK_COLOR_IDX,
                         },
                         if r_idx % 2 == 0 {
                             MOVING_BRICK_SPEED
@@ -557,12 +604,16 @@ impl GameWorld {
                     ),
                     d if d.is_ascii_digit() => {
                         let digit = d.to_digit(10).unwrap_or(1) as usize;
-                        let hp = if digit >= 5 { 2 } else { 1 };
+                        let hp = if digit >= TOUGH_BRICK_DIGIT {
+                            TOUGH_BRICK_HP
+                        } else {
+                            1
+                        };
                         (
                             BrickKind::Standard {
                                 hp,
                                 max_hp: hp,
-                                color_idx: (digit.saturating_sub(1)) % 6,
+                                color_idx: (digit.saturating_sub(1)) % BRICK_COLOR_COUNT,
                             },
                             0.0,
                         )
@@ -605,8 +656,8 @@ impl GameWorld {
                 - self.config.paddle.height * 0.5
                 - self.config.ball.default_radius
                 - 1.0,
-            vx: 0.35,
-            vy: -0.93,
+            vx: INITIAL_DIR_X,
+            vy: INITIAL_DIR_Y,
             speed: self.config.ball.default_speed,
             radius: self.config.ball.default_radius,
             stuck_offset: Some(0.0),
@@ -661,7 +712,7 @@ impl GameWorld {
     }
 
     pub fn set_vortex(&mut self, active: bool) {
-        self.vortex_active = active && self.vortex_energy > 5.0;
+        self.vortex_active = active && self.vortex_energy > VORTEX_MIN_ENERGY;
     }
 
     pub fn launch_or_fire(&mut self, events: &mut Vec<GameEvent>) {
@@ -671,7 +722,8 @@ impl GameWorld {
         let mut released_any = false;
         for ball in &mut self.balls {
             if let Some(offset) = ball.stuck_offset.take() {
-                let ratio = (offset / (self.paddle_width * 0.5)).clamp(-0.85, 0.85);
+                let ratio = (offset / (self.paddle_width * 0.5))
+                    .clamp(-LAUNCH_RATIO_CLAMP, LAUNCH_RATIO_CLAMP);
                 let angle = ratio * self.config.paddle.max_bounce_angle_deg.to_radians();
                 ball.vx = angle.sin();
                 ball.vy = -angle.cos();
@@ -680,8 +732,8 @@ impl GameWorld {
         }
         if !released_any && self.laser_active && self.laser_cooldown <= 0.0 {
             self.laser_cooldown = self.config.paddle.laser_cooldown_sec;
-            let left_x = self.paddle_x - self.paddle_width * 0.36;
-            let right_x = self.paddle_x + self.paddle_width * 0.36;
+            let left_x = self.paddle_x - self.paddle_width * LASER_OFFSET_RATIO;
+            let right_x = self.paddle_x + self.paddle_width * LASER_OFFSET_RATIO;
             let y = self.config.arena.paddle_y - self.config.paddle.height * 0.5;
             self.lasers.push(LaserBolt { x: left_x, y });
             self.lasers.push(LaserBolt { x: right_x, y });
@@ -699,7 +751,8 @@ impl GameWorld {
             self.level_elapsed += dt;
             if self.level_elapsed >= self.config.gameplay.sudden_death_time_sec {
                 self.sudden_death_timer += dt;
-                if self.sudden_death_timer >= 2.2 {
+                if self.sudden_death_timer >= self.config.gameplay.sudden_death_strike_interval_sec
+                {
                     self.sudden_death_timer = 0.0;
                     if let Some((idx, b)) = self
                         .bricks
@@ -721,7 +774,7 @@ impl GameWorld {
         if self.vortex_active {
             self.vortex_energy =
                 (self.vortex_energy - self.config.gameplay.vortex_drain_rate * dt).max(0.0);
-            if self.vortex_energy <= 0.5 {
+            if self.vortex_energy <= VORTEX_CUTOFF_ENERGY {
                 self.vortex_active = false;
             }
         } else {
@@ -751,7 +804,7 @@ impl GameWorld {
         let max_bx = self.config.arena.width - self.config.arena.wall_side - moving_margin;
         for brick in &mut self.bricks {
             if brick.hit_flash > 0.0 {
-                brick.hit_flash = (brick.hit_flash - dt * 5.0).max(0.0);
+                brick.hit_flash = (brick.hit_flash - dt * BRICK_FLASH_DECAY).max(0.0);
             }
             if brick.vx.abs() > 0.1 {
                 brick.x += brick.vx * dt;
@@ -777,7 +830,7 @@ impl GameWorld {
         self.step_capsules(dt, events);
 
         self.balls
-            .retain(|b| b.y - b.radius <= self.config.arena.height + 20.0);
+            .retain(|b| b.y - b.radius <= self.config.arena.height + OUT_OF_ARENA_MARGIN);
         if self.balls.is_empty() {
             self.lives = self.lives.saturating_sub(1);
             self.combo = 0;
@@ -804,7 +857,7 @@ impl GameWorld {
 
         if let Some(boss) = &mut self.boss {
             if boss.hit_flash > 0.0 {
-                boss.hit_flash = (boss.hit_flash - dt * 4.5).max(0.0);
+                boss.hit_flash = (boss.hit_flash - dt * BOSS_FLASH_DECAY).max(0.0);
             }
             boss.x += boss.vx * dt;
             if boss.x < wall_left {
@@ -819,8 +872,8 @@ impl GameWorld {
             if boss.fire_timer <= 0.0 {
                 boss.fire_timer = self.config.gameplay.boss_fire_interval_sec;
                 let hy = boss.y + boss.h;
-                let left_turret = boss.x + boss.w * 0.25;
-                let right_turret = boss.x + boss.w * 0.75;
+                let left_turret = boss.x + boss.w * BOSS_LEFT_TURRET_RATIO;
+                let right_turret = boss.x + boss.w * BOSS_RIGHT_TURRET_RATIO;
                 self.hazards.push(HazardProjectile {
                     x: left_turret,
                     y: hy,
@@ -897,7 +950,9 @@ impl GameWorld {
             }
 
             if self.vortex_active {
-                let dx_to_paddle = (self.paddle_x - ball.x).clamp(-360.0, 360.0) / 360.0;
+                let dx_to_paddle = (self.paddle_x - ball.x)
+                    .clamp(-BALL_VORTEX_RANGE, BALL_VORTEX_RANGE)
+                    / BALL_VORTEX_RANGE;
                 ball.vx += dx_to_paddle * self.config.gameplay.vortex_pull_strength * dt;
                 let norm = (ball.vx * ball.vx + ball.vy * ball.vy).sqrt().max(0.001);
                 ball.vx /= norm;
@@ -959,7 +1014,8 @@ impl GameWorld {
                 && ball.y + ball.radius >= p_top
                 && ball.y - ball.radius <= p_bottom
             {
-                let rel = ((ball.x - self.paddle_x) / paddle_half_w).clamp(-0.95, 0.95);
+                let rel = ((ball.x - self.paddle_x) / paddle_half_w)
+                    .clamp(-BOUNCE_RATIO_CLAMP, BOUNCE_RATIO_CLAMP);
                 let angle = rel * max_angle;
                 ball.vx = angle.sin();
                 ball.vy = -angle.cos();
@@ -978,21 +1034,32 @@ impl GameWorld {
                 if let Some(contact) = rect_contact(&ball, boss.x, boss.y, boss.w, boss.h) {
                     if bounce_off(&mut ball, &contact) && ball.boss_hit_cooldown <= 0.0 {
                         ball.boss_hit_cooldown = BOSS_HIT_COOLDOWN_SEC;
-                        let dmg = if ball.mega || ball.fireball { 2 } else { 1 };
+                        let dmg = if ball.mega || ball.fireball {
+                            BOSS_POWER_DAMAGE
+                        } else {
+                            1
+                        };
                         boss.hp = boss.hp.saturating_sub(dmg);
                         boss.hit_flash = 1.0;
                         let bx = boss.x + boss.w * 0.5;
                         let by = boss.y + boss.h * 0.5;
                         let destroyed = boss.hp == 0;
+                        let points = if destroyed {
+                            self.config.gameplay.base_brick_score
+                                * self.config.gameplay.boss_kill_score_mult
+                        } else {
+                            0
+                        };
                         events.push(GameEvent::BrickHit {
                             x: ball.x,
                             y: ball.y,
-                            color_idx: 1,
+                            color_idx: BOSS_HIT_COLOR_IDX,
                             destroyed,
+                            points,
                         });
                         if destroyed {
                             self.boss = None;
-                            self.score += self.config.gameplay.base_brick_score * 50;
+                            self.score += points;
                             self.high_score = self.high_score.max(self.score);
                             pending_explosions.push((bx, by));
                         }
@@ -1026,7 +1093,7 @@ impl GameWorld {
                             let from = self.bricks[idx].center();
                             ball.x = tx;
                             ball.y = ty;
-                            ball.portal_cooldown = 0.45;
+                            ball.portal_cooldown = self.config.gameplay.portal_cooldown_sec;
                             self.bricks[idx].hit_flash = 1.0;
                             events.push(GameEvent::PortalWarp { from, to: (tx, ty) });
                         }
@@ -1057,8 +1124,10 @@ impl GameWorld {
                             .min(self.config.ball.max_speed);
 
                         let center = self.bricks[idx].center();
+                        let was_explosive = matches!(self.bricks[idx].kind, BrickKind::Explosive);
                         let destroyed = self.damage_brick(idx, ball.mega || ball.fireball, events);
-                        if destroyed && ball.fireball {
+                        // An explosive brick already detonates inside `damage_brick`.
+                        if destroyed && ball.fireball && !was_explosive {
                             pending_explosions.push(center);
                         }
                         if self.lightning_active {
@@ -1085,6 +1154,21 @@ impl GameWorld {
         instant_kill: bool,
         events: &mut Vec<GameEvent>,
     ) -> bool {
+        let mut chain = Vec::new();
+        let destroyed = self.damage_brick_inner(idx, instant_kill, events, &mut chain);
+        self.resolve_explosions(chain, events);
+        destroyed
+    }
+
+    /// Damages one brick. An explosive brick does not detonate here: its centre is pushed onto
+    /// `chain` so that the caller resolves every explosion iteratively, without recursion.
+    fn damage_brick_inner(
+        &mut self,
+        idx: usize,
+        instant_kill: bool,
+        events: &mut Vec<GameEvent>,
+        chain: &mut Vec<(f32, f32)>,
+    ) -> bool {
         if idx >= self.bricks.len() {
             return false;
         }
@@ -1095,21 +1179,22 @@ impl GameWorld {
                 events.push(GameEvent::BrickHit {
                     x: center.0,
                     y: center.1,
-                    color_idx: 0,
+                    color_idx: SOLID_HIT_COLOR_IDX,
                     destroyed: false,
+                    points: 0,
                 });
                 false
             }
             BrickKind::Explosive => {
                 self.bricks.swap_remove(idx);
-                self.register_brick_score(center.0, center.1, 5, events);
-                self.trigger_explosion(center.0, center.1, events);
+                self.register_brick_score(center.0, center.1, EXPLOSIVE_COLOR_IDX, events);
+                chain.push(center);
                 true
             }
             BrickKind::Ghost { revealed } => {
                 if instant_kill || revealed {
                     self.bricks.swap_remove(idx);
-                    self.register_brick_score(center.0, center.1, 2, events);
+                    self.register_brick_score(center.0, center.1, GHOST_HIT_COLOR_IDX, events);
                     true
                 } else {
                     self.bricks[idx].kind = BrickKind::Ghost { revealed: true };
@@ -1117,8 +1202,9 @@ impl GameWorld {
                     events.push(GameEvent::BrickHit {
                         x: center.0,
                         y: center.1,
-                        color_idx: 2,
+                        color_idx: GHOST_HIT_COLOR_IDX,
                         destroyed: false,
+                        points: 0,
                     });
                     false
                 }
@@ -1137,6 +1223,7 @@ impl GameWorld {
                         y: center.1,
                         color_idx,
                         destroyed: false,
+                        points: 0,
                     });
                     false
                 }
@@ -1163,6 +1250,7 @@ impl GameWorld {
                         y: center.1,
                         color_idx,
                         destroyed: false,
+                        points: 0,
                     });
                     false
                 }
@@ -1177,10 +1265,12 @@ impl GameWorld {
         color_idx: usize,
         events: &mut Vec<GameEvent>,
     ) {
+        let gp = &self.config.gameplay;
         self.combo += 1;
-        self.combo_timer = self.config.gameplay.combo_timeout_sec;
-        let mult = (1 + self.combo / 4).min(8) as u64;
-        self.score += self.config.gameplay.base_brick_score * mult;
+        self.combo_timer = gp.combo_timeout_sec;
+        let mult = u64::from((1 + self.combo / gp.combo_step.max(1)).min(gp.combo_max_mult));
+        let points = gp.base_brick_score * mult;
+        self.score += points;
         self.high_score = self.high_score.max(self.score);
 
         events.push(GameEvent::BrickHit {
@@ -1188,21 +1278,23 @@ impl GameWorld {
             y,
             color_idx,
             destroyed: true,
+            points,
         });
 
+        let gp = &self.config.gameplay;
+        let min_distance = gp.powerup_min_spawn_distance;
         let can_spawn = self.powerup_spawn_cooldown <= 0.0
-            && self.capsules.len() < 2
+            && self.capsules.len() < MAX_CAPSULES
             && self
                 .capsules
                 .iter()
-                .all(|c| (c.x - x).hypot(c.y - y) > 280.0);
+                .all(|c| (c.x - x).hypot(c.y - y) > min_distance);
 
         if can_spawn && self.next_rand_f32() < self.config.gameplay.powerup_drop_chance {
             let kinds = PowerUpKind::all();
             let pick = ((self.next_rand_f32() * kinds.len() as f32) as usize) % kinds.len();
-            let min_cx = self.config.arena.wall_side + 76.0;
-            let max_cx = self.config.arena.width - self.config.arena.wall_side - 76.0;
-            self.powerup_spawn_cooldown = 1.65;
+            let (min_cx, max_cx) = self.capsule_x_bounds();
+            self.powerup_spawn_cooldown = self.config.gameplay.powerup_spawn_cooldown_sec;
             self.capsules.push(PowerUpCapsule {
                 x: x.clamp(min_cx, max_cx),
                 y,
@@ -1212,18 +1304,38 @@ impl GameWorld {
         }
     }
 
-    fn trigger_explosion(&mut self, x: f32, y: f32, events: &mut Vec<GameEvent>) {
-        let radius = self.config.gameplay.explosion_radius;
-        events.push(GameEvent::Explosion { x, y, radius });
+    /// Horizontal range in which a capsule centre may lie.
+    fn capsule_x_bounds(&self) -> (f32, f32) {
+        let margin = self.config.gameplay.powerup_wall_margin;
+        (
+            self.config.arena.wall_side + margin,
+            self.config.arena.width - self.config.arena.wall_side - margin,
+        )
+    }
 
-        let mut idx = 0;
-        while idx < self.bricks.len() {
-            let (bx, by) = self.bricks[idx].center();
-            let dist_sq = (bx - x).powi(2) + (by - y).powi(2);
-            if dist_sq <= radius * radius && self.bricks[idx].is_destructible() {
-                self.damage_brick(idx, true, events);
-            } else {
-                idx += 1;
+    fn trigger_explosion(&mut self, x: f32, y: f32, events: &mut Vec<GameEvent>) {
+        self.resolve_explosions(vec![(x, y)], events);
+    }
+
+    /// Resolves explosions iteratively. Each centre destroys every destructible brick in range;
+    /// exploding bricks add their own centre to the pending list. Targets are damaged in
+    /// descending index order so that `swap_remove` never invalidates an index still to visit.
+    fn resolve_explosions(&mut self, mut chain: Vec<(f32, f32)>, events: &mut Vec<GameEvent>) {
+        let radius = self.config.gameplay.explosion_radius;
+        while let Some((x, y)) = chain.pop() {
+            events.push(GameEvent::Explosion { x, y, radius });
+            let targets: Vec<usize> = self
+                .bricks
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| {
+                    let (bx, by) = b.center();
+                    (bx - x).powi(2) + (by - y).powi(2) <= radius * radius && b.is_destructible()
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for idx in targets.into_iter().rev() {
+                self.damage_brick_inner(idx, true, events, &mut chain);
             }
         }
     }
@@ -1296,16 +1408,15 @@ impl GameWorld {
         let arena_h = self.config.arena.height;
         let vortex = self.vortex_active;
         let paddle_x = self.paddle_x;
-        let min_cx = self.config.arena.wall_side + 76.0;
-        let max_cx = self.config.arena.width - self.config.arena.wall_side - 76.0;
+        let (min_cx, max_cx) = self.capsule_x_bounds();
 
-        // Horizontal anti-clustering separation if 2 capsules are falling simultaneously
-        if self.capsules.len() == 2 {
+        // Horizontal anti-clustering separation; only valid for exactly MAX_CAPSULES == 2.
+        if self.capsules.len() == MAX_CAPSULES {
             let dx = self.capsules[1].x - self.capsules[0].x;
             let dy = (self.capsules[1].y - self.capsules[0].y).abs();
-            if dx.abs() < 210.0 && dy < 160.0 {
+            if dx.abs() < CAPSULE_SEPARATION_DX && dy < CAPSULE_SEPARATION_DY {
                 let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
-                let push = 140.0 * dt * dir;
+                let push = CAPSULE_SEPARATION_SPEED * dt * dir;
                 self.capsules[0].x = (self.capsules[0].x - push).clamp(min_cx, max_cx);
                 self.capsules[1].x = (self.capsules[1].x + push).clamp(min_cx, max_cx);
             }
@@ -1315,11 +1426,15 @@ impl GameWorld {
         self.capsules.retain_mut(|cap| {
             cap.y += fall_speed * dt;
             if vortex {
-                let pull = (paddle_x - cap.x).clamp(-220.0, 220.0) * 1.8 * dt;
+                let pull = (paddle_x - cap.x)
+                    .clamp(-CAPSULE_VORTEX_MAX_OFFSET, CAPSULE_VORTEX_MAX_OFFSET)
+                    * CAPSULE_VORTEX_GAIN
+                    * dt;
                 cap.x = (cap.x + pull).clamp(min_cx, max_cx);
             }
-            let caught = (cap.x - paddle_x).abs() <= paddle_half_w + cap.radius * 0.85
-                && (cap.y - paddle_y).abs() <= paddle_h * 0.5 + cap.radius * 0.72;
+            let caught = (cap.x - paddle_x).abs()
+                <= paddle_half_w + cap.radius * CAPSULE_CATCH_X_FACTOR
+                && (cap.y - paddle_y).abs() <= paddle_h * 0.5 + cap.radius * CAPSULE_CATCH_Y_FACTOR;
             if caught {
                 collected.push((cap.kind, cap.x, cap.y));
                 false
@@ -1341,9 +1456,10 @@ impl GameWorld {
     }
 
     pub fn apply_powerup(&mut self, kind: PowerUpKind) {
-        self.last_powerup_key = Some(kind.i18n_key());
-        self.last_powerup_timer = 3.0;
-        self.score += self.config.gameplay.base_brick_score * 2;
+        self.last_powerup = Some(kind);
+        self.last_powerup_timer = self.config.gameplay.powerup_toast_sec;
+        self.score +=
+            self.config.gameplay.base_brick_score * self.config.gameplay.powerup_score_mult;
         self.high_score = self.high_score.max(self.score);
 
         match kind {
@@ -1360,7 +1476,8 @@ impl GameWorld {
             }
             PowerUpKind::MultiBall => {
                 if let Some(first) = self.balls.first().cloned() {
-                    for angle_offset in [-0.38f32, 0.38f32] {
+                    let spread = self.config.gameplay.multiball_spread_rad;
+                    for angle_offset in [-spread, spread] {
                         let mut clone = first.clone();
                         clone.stuck_offset = None;
                         let base_angle = clone.vx.atan2(-clone.vy) + angle_offset;
@@ -1386,19 +1503,21 @@ impl GameWorld {
             }
             PowerUpKind::Slow => {
                 for b in &mut self.balls {
-                    b.speed = (b.speed * 0.78).max(self.config.ball.min_speed);
+                    b.speed = (b.speed * self.config.gameplay.slow_factor)
+                        .max(self.config.ball.min_speed);
                 }
             }
             PowerUpKind::Fast => {
                 for b in &mut self.balls {
-                    b.speed = (b.speed * 1.22).min(self.config.ball.max_speed);
+                    b.speed = (b.speed * self.config.gameplay.fast_factor)
+                        .min(self.config.ball.max_speed);
                 }
             }
             PowerUpKind::ExtraLife => {
                 self.lives += 1;
             }
             PowerUpKind::Shield => {
-                self.shield_hits = 3;
+                self.shield_hits = self.config.gameplay.shield_hits;
             }
         }
     }

@@ -67,6 +67,22 @@ pub struct GameplayConfig {
     pub boss_speed: f32,
     pub boss_fire_interval_sec: f32,
     pub boss_hazard_speed: f32,
+    pub sudden_death_strike_interval_sec: f32,
+    pub portal_cooldown_sec: f32,
+    pub powerup_spawn_cooldown_sec: f32,
+    pub powerup_min_spawn_distance: f32,
+    pub powerup_wall_margin: f32,
+    pub powerup_toast_sec: f32,
+    pub slow_factor: f32,
+    pub fast_factor: f32,
+    pub shield_hits: u8,
+    pub boss_hp_per_tier: u32,
+    pub boss_speed_per_tier: f32,
+    pub boss_kill_score_mult: u64,
+    pub combo_step: u32,
+    pub combo_max_mult: u32,
+    pub multiball_spread_rad: f32,
+    pub powerup_score_mult: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

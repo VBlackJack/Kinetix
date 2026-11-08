@@ -15,20 +15,24 @@
  */
 
 mod audio;
+mod tuning;
 mod vfx;
 
 use audio::{
     load_progress, pointer_lock_active, prompt_level_code, save_progress, set_document_lang,
-    set_pointer_bounds, set_pointer_lock, share_level_code, SoundBank,
+    set_pointer_bounds, set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
-use kinetix_core::config::{GameConfig, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
+use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
 use kinetix_core::physics::{BrickKind, GameEvent, GameWorld, SessionStatus};
 use macroquad::prelude::*;
+use std::collections::BTreeSet;
+use tuning::*;
 use vfx::{
-    additive_material, draw_modern_capsule_brick, draw_powerup_capsule, draw_ribbon_trail,
-    draw_rounded_rect, nebula_material, DebrisShard, Starfield, WarpGrid,
+    additive_material, cap_oldest, draw_modern_capsule_brick, draw_powerup_capsule,
+    draw_ribbon_trail, draw_rounded_rect, fit_font_size, nebula_material, DebrisShard, Starfield,
+    WarpGrid, BADGE_FONT_SIZE_MAX, BADGE_FONT_SIZE_MIN,
 };
 
 const RAW_GAME_CONFIG: &str = include_str!("../../../assets/config/game_config.json");
@@ -40,17 +44,10 @@ const RAW_FONT: &[u8] = include_bytes!("../../../assets/fonts/ui_font.ttf");
 
 /// Malus power-ups and error popups.
 const MALUS_COLOR: [u8; 4] = [255, 65, 75, 255];
+/// Bonus power-ups (popups and HUD toast).
+const BONUS_COLOR: [u8; 4] = [30, 250, 165, 255];
 /// Colour of the bars around the arena when the window is not 16:9.
 const LETTERBOX_COLOR: Color = BLACK;
-/// Opacity of the black overlay drawn over the backdrop outside the arena viewport.
-const LETTERBOX_DIM_ALPHA: f32 = 0.35;
-/// Starfield extent relative to the arena on each axis (covers extreme window aspect ratios).
-const STARFIELD_EXTENT_FACTOR: f32 = 3.0;
-/// Star count for the arena area alone.
-const STARFIELD_BASE_COUNT: usize = 260;
-const POPUP_X: f32 = 680.0;
-const POPUP_Y: f32 = 540.0;
-const POPUP_LIFE_SEC: f32 = 1.8;
 
 struct Particle {
     x: f32,
@@ -70,6 +67,7 @@ struct Shockwave {
     radius: f32,
     max_radius: f32,
     life: f32,
+    max_life: f32,
     color: Color,
 }
 
@@ -147,6 +145,115 @@ fn error_popup(i18n: &I18nCatalog, err: &LevelCodeError) -> FloatingPopup {
     }
 }
 
+/// Keys that jump straight to the n-th world of the title menu (Key1 is the first world).
+const WORLD_SELECT_KEYS: [KeyCode; 9] = [
+    KeyCode::Key1,
+    KeyCode::Key2,
+    KeyCode::Key3,
+    KeyCode::Key4,
+    KeyCode::Key5,
+    KeyCode::Key6,
+    KeyCode::Key7,
+    KeyCode::Key8,
+    KeyCode::Key9,
+];
+
+fn rand_in(range: (f32, f32)) -> f32 {
+    rand::gen_range(range.0, range.1)
+}
+
+/// Worlds in campaign order as `(world id, index of the first level)`; a new entry starts
+/// whenever the world id changes along the level list.
+fn build_worlds(levels: &[LevelDef]) -> Vec<(usize, usize)> {
+    let mut worlds: Vec<(usize, usize)> = Vec::new();
+    for (idx, level) in levels.iter().enumerate() {
+        if worlds.last().map(|&(id, _)| id) != Some(level.world) {
+            worlds.push((level.world, idx));
+        }
+    }
+    worlds
+}
+
+/// Position in `worlds` of the world owning level `level_idx` (`fallback` when unknown).
+fn world_pos_for_level(
+    worlds: &[(usize, usize)],
+    levels: &[LevelDef],
+    level_idx: usize,
+    fallback: usize,
+) -> usize {
+    levels
+        .get(level_idx)
+        .and_then(|level| {
+            worlds
+                .iter()
+                .rposition(|&(id, first)| id == level.world && first <= level_idx)
+        })
+        .unwrap_or(fallback)
+}
+
+/// Input gestures that will make the pointer lock wanted from the given state (see
+/// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
+fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
+    match screen {
+        AppScreen::TitleMenu => {
+            let base = RESUME_CLICK | RESUME_SPACE | RESUME_ENTER | RESUME_F3;
+            // Tab from the title enters the game and wants the lock when the world is playing.
+            if status == SessionStatus::Playing {
+                base | RESUME_TAB
+            } else {
+                base
+            }
+        }
+        AppScreen::Editor => RESUME_F4 | RESUME_F3,
+        AppScreen::InGame => match status {
+            SessionStatus::Playing => 0,
+            SessionStatus::Paused => RESUME_P | RESUME_R | RESUME_F3,
+            SessionStatus::Victory | SessionStatus::GameOver => {
+                RESUME_CLICK | RESUME_SPACE | RESUME_R | RESUME_F3
+            }
+        },
+    }
+}
+
+/// Fills the glyph atlas with every glyph and size the UI uses, before the first frame, so the
+/// atlas is never grown (and its texture recreated) in the middle of a frame.
+fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: &[&str]) {
+    let mut chars: BTreeSet<char> = Font::ascii_character_list()
+        .into_iter()
+        .filter(|c| !c.is_control())
+        .collect();
+    let printable = |c: &char| !c.is_control();
+    for raw in raw_locales {
+        chars.extend(raw.chars().filter(printable));
+    }
+    for level in levels {
+        chars.extend(level.name.chars().filter(printable));
+    }
+    let chars: Vec<char> = chars.into_iter().collect();
+
+    // Glyphs are cached per physical pixel size (font size times the DPI scale, rounded up).
+    let dpi = miniquad::window::dpi_scale();
+    let physical = |size: u16| (size as f32 * dpi).ceil() as u16;
+    let sizes: BTreeSet<u16> = UI_FONT_SIZES
+        .iter()
+        .copied()
+        .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
+        .map(physical)
+        .collect();
+    for size in sizes {
+        font.populate_font_cache(&chars, size);
+    }
+
+    let title_chars: Vec<char> = titles
+        .iter()
+        .flat_map(|t| t.chars())
+        .filter(printable)
+        .collect::<BTreeSet<char>>()
+        .into_iter()
+        .collect();
+    font.populate_font_cache(&title_chars, physical(MENU_TITLE_SIZE));
+}
+
 struct HudContext<'a> {
     world: &'a GameWorld,
     levels: &'a LevelPack,
@@ -186,12 +293,12 @@ fn txt(font: &Font, text: &str, x: f32, y: f32, size: u16, color: Color) {
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "KINETIX".to_owned(),
-        window_width: 1920,
-        window_height: 1080,
+        window_title: WINDOW_TITLE.to_owned(),
+        window_width: WINDOW_WIDTH,
+        window_height: WINDOW_HEIGHT,
         window_resizable: true,
         high_dpi: true,
-        sample_count: 8,
+        sample_count: WINDOW_SAMPLE_COUNT,
         ..Default::default()
     }
 }
@@ -205,6 +312,12 @@ async fn main() {
     let catalog_en = I18nCatalog::from_json_str(RAW_EN).expect("Invalid en.json");
     let catalog_fr = I18nCatalog::from_json_str(RAW_FR).expect("Invalid fr.json");
     let ui_font = load_ttf_font_from_bytes(RAW_FONT).expect("Failed to load embedded UI font");
+    prewarm_font(
+        &ui_font,
+        &[RAW_EN, RAW_FR],
+        &level_pack.levels,
+        &[catalog_en.t("app.title"), catalog_fr.t("app.title")],
+    );
 
     let add_mat = additive_material();
     let neb_mat = nebula_material();
@@ -220,7 +333,7 @@ async fn main() {
         config.arena.wall_top,
         config.arena.width - config.arena.wall_side,
         config.arena.height,
-        48.0,
+        WARP_GRID_STEP,
     );
 
     let (saved_hs, saved_unlocked, saved_theme, saved_fr) = load_progress();
@@ -229,24 +342,29 @@ async fn main() {
     set_document_lang(lang == Language::Fr);
     let mut theme_idx: usize = saved_theme % theme_reg.themes.len();
     let mut world = GameWorld::new(config.clone(), &level_pack.levels);
+    let seed = (miniquad::date::now() * MS_PER_SEC) as u64;
+    world.reseed(seed);
+    macroquad::rand::srand(seed);
     world.high_score = saved_hs;
     world.max_unlocked_level = saved_unlocked.min(level_pack.levels.len().saturating_sub(1));
 
     let mut screen = AppScreen::TitleMenu;
-    let mut selected_world: usize = 1;
+    let worlds = build_worlds(&level_pack.levels);
+    let mut selected_world_pos: usize = 0;
     let mut selected_sector_idx: usize = 0;
 
-    let mut events: Vec<GameEvent> = Vec::with_capacity(64);
-    let mut particles: Vec<Particle> = Vec::with_capacity(2048);
-    let mut shards: Vec<DebrisShard> = Vec::with_capacity(256);
-    let mut shockwaves: Vec<Shockwave> = Vec::with_capacity(32);
-    let mut arcs: Vec<LightningArc> = Vec::with_capacity(32);
-    let mut popups: Vec<FloatingPopup> = Vec::with_capacity(32);
+    let mut events: Vec<GameEvent> = Vec::with_capacity(MAX_EVENTS);
+    let mut particles: Vec<Particle> = Vec::with_capacity(MAX_PARTICLES);
+    let mut shards: Vec<DebrisShard> = Vec::with_capacity(MAX_SHARDS);
+    let mut shockwaves: Vec<Shockwave> = Vec::with_capacity(MAX_SHOCKWAVES);
+    let mut arcs: Vec<LightningArc> = Vec::with_capacity(MAX_ARCS);
+    let mut popups: Vec<FloatingPopup> = Vec::with_capacity(MAX_POPUPS);
     let mut screen_shake: f32 = 0.0;
     let mut chromatic_pulse: f32 = 0.0;
     let mut hit_stop_timer: f32 = 0.0;
 
     let mut last_lock_wanted = false;
+    let mut last_resume_mask: Option<u32> = None;
     let mut lock_was_active = false;
     let mut last_pointer_bounds: Option<(f32, f32)> = None;
     let mut editor_brush = BrickKind::Standard {
@@ -256,13 +374,13 @@ async fn main() {
     };
 
     loop {
-        let raw_dt = get_frame_time().min(0.033);
+        let raw_dt = get_frame_time().min(MAX_FRAME_DT);
         let time = get_time() as f32;
         if hit_stop_timer > 0.0 {
             hit_stop_timer = (hit_stop_timer - raw_dt).max(0.0);
         }
         let dt = if hit_stop_timer > 0.0 {
-            raw_dt * 0.15
+            raw_dt * HIT_STOP_TIME_SCALE
         } else {
             raw_dt
         };
@@ -325,8 +443,8 @@ async fn main() {
             sfx.music_enabled = !sfx.music_enabled;
         }
 
-        let rt_w = (screen_width() * miniquad::window::dpi_scale()).max(640.0) as u32;
-        let rt_h = (screen_height() * miniquad::window::dpi_scale()).max(360.0) as u32;
+        let rt_w = (screen_width() * miniquad::window::dpi_scale()).max(MIN_RENDER_W) as u32;
+        let rt_h = (screen_height() * miniquad::window::dpi_scale()).max(MIN_RENDER_H) as u32;
 
         let arena_w = world.config.arena.width;
         let arena_h = world.config.arena.height;
@@ -355,40 +473,42 @@ async fn main() {
 
         match screen {
             AppScreen::TitleMenu => {
-                if is_key_pressed(KeyCode::Key1) {
-                    selected_world = 1;
-                    selected_sector_idx = 0;
-                } else if is_key_pressed(KeyCode::Key2) {
-                    selected_world = 2;
-                    selected_sector_idx = 5;
-                } else if is_key_pressed(KeyCode::Key3) {
-                    selected_world = 3;
-                    selected_sector_idx = 10;
+                if !worlds.is_empty() {
+                    for (n, key) in WORLD_SELECT_KEYS.iter().enumerate() {
+                        if is_key_pressed(*key) {
+                            if let Some(&(_, first_idx)) = worlds.get(n) {
+                                selected_world_pos = n;
+                                selected_sector_idx = first_idx;
+                            }
+                        }
+                    }
+                    if is_key_pressed(KeyCode::Left) {
+                        selected_world_pos = (selected_world_pos + worlds.len() - 1) % worlds.len();
+                        selected_sector_idx = worlds[selected_world_pos].1;
+                    }
+                    if is_key_pressed(KeyCode::Right) {
+                        selected_world_pos = (selected_world_pos + 1) % worlds.len();
+                        selected_sector_idx = worlds[selected_world_pos].1;
+                    }
                 }
-                if is_key_pressed(KeyCode::Left) {
-                    selected_world = if selected_world <= 1 {
-                        3
-                    } else {
-                        selected_world - 1
-                    };
-                    selected_sector_idx = (selected_world - 1) * 5;
-                }
-                if is_key_pressed(KeyCode::Right) {
-                    selected_world = if selected_world >= 3 {
-                        1
-                    } else {
-                        selected_world + 1
-                    };
-                    selected_sector_idx = (selected_world - 1) * 5;
-                }
+                let last_sector = level_pack.levels.len().saturating_sub(1);
                 if is_key_pressed(KeyCode::Up) {
-                    selected_sector_idx =
-                        (selected_sector_idx + 1).min(level_pack.levels.len() - 1);
-                    selected_world = level_pack.levels[selected_sector_idx].world;
+                    selected_sector_idx = (selected_sector_idx + 1).min(last_sector);
+                    selected_world_pos = world_pos_for_level(
+                        &worlds,
+                        &level_pack.levels,
+                        selected_sector_idx,
+                        selected_world_pos,
+                    );
                 }
                 if is_key_pressed(KeyCode::Down) {
                     selected_sector_idx = selected_sector_idx.saturating_sub(1);
-                    selected_world = level_pack.levels[selected_sector_idx].world;
+                    selected_world_pos = world_pos_for_level(
+                        &worlds,
+                        &level_pack.levels,
+                        selected_sector_idx,
+                        selected_world_pos,
+                    );
                 }
 
                 if is_key_pressed(KeyCode::Enter)
@@ -496,7 +616,7 @@ async fn main() {
 
                 world.set_paddle_target(world_mx);
 
-                let kb_speed = 1350.0 * dt;
+                let kb_speed = KEYBOARD_PADDLE_SPEED * dt;
                 if is_key_down(KeyCode::Left) || is_key_down(KeyCode::A) || is_key_down(KeyCode::Q)
                 {
                     world.set_paddle_target(world.paddle_x - kb_speed);
@@ -571,6 +691,14 @@ async fn main() {
         }
         lock_was_active = lock_wanted && pointer_lock_active();
 
+        // Tell the page which gestures will make the lock wanted next, so it can request the
+        // lock synchronously inside the input handler (required by Firefox).
+        let resume_mask = resume_mask_for(screen, world.status);
+        if last_resume_mask != Some(resume_mask) {
+            set_resume_mask(resume_mask);
+            last_resume_mask = Some(resume_mask);
+        }
+
         for ball in &world.balls {
             if ball.stuck_offset.is_none() {
                 warp_grid.apply_impulse(ball.x, ball.y, 95.0, 120.0 * dt);
@@ -585,59 +713,62 @@ async fn main() {
                     y,
                     color_idx,
                     destroyed,
+                    points,
                 } => {
                     sfx.play_brick(world.combo);
                     warp_grid.apply_impulse(x, y, 165.0, if destroyed { 320.0 } else { 140.0 });
                     let base_col = rgba(theme.brick_palette[color_idx % theme.brick_palette.len()]);
-                    let count = if destroyed { 30 } else { 12 };
-                    let gravity = if theme.style == RenderStyle::IndustrialMetal {
-                        580.0
+                    let count = if destroyed {
+                        BRICK_PARTICLES_DESTROYED
                     } else {
-                        140.0
+                        BRICK_PARTICLES_HIT
+                    };
+                    let gravity = if theme.style == RenderStyle::IndustrialMetal {
+                        GRAVITY_INDUSTRIAL
+                    } else {
+                        GRAVITY_DEFAULT
                     };
                     for i in 0..count {
                         let angle = (i as f32 / count as f32) * std::f32::consts::TAU
-                            + rand::gen_range(-0.25, 0.25);
-                        let spd = rand::gen_range(120.0, 520.0);
+                            + rand::gen_range(
+                                -BRICK_PARTICLE_ANGLE_JITTER,
+                                BRICK_PARTICLE_ANGLE_JITTER,
+                            );
+                        let spd = rand_in(BRICK_PARTICLE_SPEED);
                         particles.push(Particle {
                             x,
                             y,
                             vx: angle.cos() * spd,
                             vy: angle.sin() * spd,
-                            size: rand::gen_range(3.0, 8.0),
-                            life: 0.52,
-                            max_life: 0.52,
+                            size: rand_in(BRICK_PARTICLE_SIZE),
+                            life: BRICK_PARTICLE_LIFE,
+                            max_life: BRICK_PARTICLE_LIFE,
                             color: base_col,
                             gravity,
                         });
                     }
                     if destroyed {
-                        screen_shake = (screen_shake + 4.2).min(16.0);
-                        for _ in 0..6 {
+                        screen_shake =
+                            (screen_shake + SHAKE_BRICK_DESTROYED).min(SCREEN_SHAKE_MINOR_MAX);
+                        for _ in 0..SHARDS_PER_BRICK {
                             shards.push(DebrisShard {
-                                x: x + rand::gen_range(-26.0, 26.0),
-                                y: y + rand::gen_range(-10.0, 10.0),
-                                vx: rand::gen_range(-240.0, 240.0),
-                                vy: rand::gen_range(-280.0, 80.0),
-                                w: rand::gen_range(12.0, 22.0),
+                                x: x + rand::gen_range(-SHARD_SPREAD_X, SHARD_SPREAD_X),
+                                y: y + rand::gen_range(-SHARD_SPREAD_Y, SHARD_SPREAD_Y),
+                                vx: rand::gen_range(-SHARD_SPEED_X, SHARD_SPEED_X),
+                                vy: rand_in(SHARD_SPEED_Y),
+                                w: rand_in(SHARD_WIDTH),
                                 angle: rand::gen_range(0.0, std::f32::consts::TAU),
-                                v_angle: rand::gen_range(-12.0, 12.0),
-                                life: 0.78,
-                                max_life: 0.78,
+                                v_angle: rand::gen_range(-SHARD_SPIN, SHARD_SPIN),
+                                life: SHARD_LIFE,
+                                max_life: SHARD_LIFE,
                                 color: base_col,
                             });
                         }
-                        let mult = (1 + world.combo / 4).min(8);
-                        let pts = world.config.gameplay.base_brick_score * mult as u64;
                         popups.push(FloatingPopup {
-                            x: x - 24.0,
+                            x: x + BRICK_POPUP_DX,
                             y,
-                            text: if mult > 1 {
-                                format!("+{} (x{})", pts, mult)
-                            } else {
-                                format!("+{}", pts)
-                            },
-                            life: 0.70,
+                            text: format!("+{points}"),
+                            life: BRICK_POPUP_LIFE,
                             color: base_col,
                         });
                     }
@@ -645,42 +776,43 @@ async fn main() {
                 GameEvent::Explosion { x, y, radius } => {
                     sfx.play_explosion();
                     warp_grid.apply_impulse(x, y, radius * 2.2, 920.0);
-                    screen_shake = (screen_shake + 14.0).min(24.0);
-                    chromatic_pulse = 1.0;
-                    hit_stop_timer = 0.045;
+                    screen_shake = (screen_shake + SHAKE_EXPLOSION).min(SCREEN_SHAKE_MAX);
+                    chromatic_pulse = CHROMATIC_EXPLOSION;
+                    hit_stop_timer = HIT_STOP_SEC;
                     shockwaves.push(Shockwave {
                         x,
                         y,
-                        radius: 10.0,
-                        max_radius: radius * 1.4,
-                        life: 0.40,
+                        radius: EXPLOSION_WAVE_START_RADIUS,
+                        max_radius: radius * EXPLOSION_WAVE_RADIUS_FACTOR,
+                        life: EXPLOSION_WAVE_LIFE,
+                        max_life: EXPLOSION_WAVE_LIFE,
                         color: rgba(theme.fireball_glow),
                     });
-                    for _ in 0..65 {
+                    for _ in 0..EXPLOSION_PARTICLES {
                         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
-                        let spd = rand::gen_range(160.0, 680.0);
+                        let spd = rand_in(EXPLOSION_PARTICLE_SPEED);
                         particles.push(Particle {
                             x,
                             y,
                             vx: angle.cos() * spd,
                             vy: angle.sin() * spd,
-                            size: rand::gen_range(4.5, 10.0),
-                            life: 0.65,
-                            max_life: 0.65,
+                            size: rand_in(EXPLOSION_PARTICLE_SIZE),
+                            life: EXPLOSION_PARTICLE_LIFE,
+                            max_life: EXPLOSION_PARTICLE_LIFE,
                             color: rgba(theme.fireball_glow),
-                            gravity: 190.0,
+                            gravity: EXPLOSION_GRAVITY,
                         });
                     }
                 }
                 GameEvent::LightningBolt { from, to } => {
                     sfx.play_lightning();
                     warp_grid.apply_impulse(to.0, to.1, 180.0, 520.0);
-                    screen_shake = (screen_shake + 7.0).min(16.0);
-                    chromatic_pulse = 0.65;
+                    screen_shake = (screen_shake + SHAKE_LIGHTNING).min(SCREEN_SHAKE_MINOR_MAX);
+                    chromatic_pulse = CHROMATIC_LIGHTNING;
                     arcs.push(LightningArc {
                         from,
                         to,
-                        life: 0.25,
+                        life: LIGHTNING_ARC_LIFE,
                     });
                 }
                 GameEvent::PortalWarp { from, to } => {
@@ -690,41 +822,43 @@ async fn main() {
                     shockwaves.push(Shockwave {
                         x: from.0,
                         y: from.1,
-                        radius: 6.0,
-                        max_radius: 75.0,
-                        life: 0.32,
+                        radius: PORTAL_WAVE_START_RADIUS,
+                        max_radius: PORTAL_WAVE_FROM.0,
+                        life: PORTAL_WAVE_FROM.1,
+                        max_life: PORTAL_WAVE_FROM.1,
                         color: rgba(theme.lightning_color),
                     });
                     shockwaves.push(Shockwave {
                         x: to.0,
                         y: to.1,
-                        radius: 6.0,
-                        max_radius: 85.0,
-                        life: 0.36,
+                        radius: PORTAL_WAVE_START_RADIUS,
+                        max_radius: PORTAL_WAVE_TO.0,
+                        life: PORTAL_WAVE_TO.1,
+                        max_life: PORTAL_WAVE_TO.1,
                         color: rgba(theme.paddle_accent),
                     });
                     popups.push(FloatingPopup {
-                        x: to.0 - 40.0,
-                        y: to.1 - 16.0,
+                        x: to.0 + PORTAL_POPUP_DX,
+                        y: to.1 + PORTAL_POPUP_DY,
                         text: i18n.t("status.portal_warp").to_string(),
-                        life: 0.75,
+                        life: PORTAL_POPUP_LIFE,
                         color: rgba(theme.lightning_color),
                     });
                 }
                 GameEvent::PaddleHit { x, y } => {
                     sfx.play_paddle();
                     warp_grid.apply_impulse(x, y, 130.0, 260.0);
-                    for _ in 0..14 {
+                    for _ in 0..PADDLE_PARTICLES {
                         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
-                        let spd = rand::gen_range(80.0, 260.0);
+                        let spd = rand_in(PADDLE_PARTICLE_SPEED);
                         particles.push(Particle {
                             x,
                             y,
                             vx: angle.cos() * spd,
                             vy: angle.sin() * spd,
-                            size: 4.5,
-                            life: 0.28,
-                            max_life: 0.28,
+                            size: PADDLE_PARTICLE_SIZE,
+                            life: PADDLE_PARTICLE_LIFE,
+                            max_life: PADDLE_PARTICLE_LIFE,
                             color: rgba(theme.paddle_core),
                             gravity: 0.0,
                         });
@@ -733,17 +867,17 @@ async fn main() {
                 GameEvent::WallHit { x, y } => {
                     sfx.play_wall();
                     warp_grid.apply_impulse(x, y, 100.0, 180.0);
-                    for _ in 0..8 {
+                    for _ in 0..WALL_PARTICLES {
                         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
-                        let spd = rand::gen_range(50.0, 180.0);
+                        let spd = rand_in(WALL_PARTICLE_SPEED);
                         particles.push(Particle {
                             x,
                             y,
                             vx: angle.cos() * spd,
                             vy: angle.sin() * spd,
-                            size: 3.5,
-                            life: 0.22,
-                            max_life: 0.22,
+                            size: WALL_PARTICLE_SIZE,
+                            life: WALL_PARTICLE_LIFE,
+                            max_life: WALL_PARTICLE_LIFE,
                             color: rgba(theme.border_color),
                             gravity: 0.0,
                         });
@@ -752,25 +886,26 @@ async fn main() {
                 GameEvent::PowerUpCollected { kind, x, y } => {
                     sfx.play_powerup();
                     warp_grid.apply_impulse(x, y, 150.0, 360.0);
-                    let pop_col = if kind.is_malus() {
-                        rgba(MALUS_COLOR)
+                    let pop_col = rgba(if kind.is_malus() {
+                        MALUS_COLOR
                     } else {
-                        Color::from_rgba(40, 255, 165, 255)
-                    };
+                        BONUS_COLOR
+                    });
                     shockwaves.push(Shockwave {
                         x,
                         y,
-                        radius: 8.0,
-                        max_radius: 105.0,
-                        life: 0.35,
+                        radius: POWERUP_WAVE_START_RADIUS,
+                        max_radius: POWERUP_WAVE_RADIUS,
+                        life: POWERUP_WAVE_LIFE,
+                        max_life: POWERUP_WAVE_LIFE,
                         color: pop_col,
                     });
                     let label = i18n.t(kind.i18n_key()).to_string();
                     popups.push(FloatingPopup {
-                        x: (x - 120.0).clamp(80.0, 1560.0),
-                        y: y - 28.0,
+                        x: (x + POWERUP_POPUP_DX).clamp(POPUP_MIN_X, POPUP_MAX_X),
+                        y: y + POWERUP_POPUP_DY,
                         text: label,
-                        life: 1.15,
+                        life: POWERUP_POPUP_LIFE,
                         color: pop_col,
                     });
                 }
@@ -780,23 +915,28 @@ async fn main() {
                         x,
                         y,
                         vx: 0.0,
-                        vy: -120.0,
-                        size: 5.5,
-                        life: 0.12,
-                        max_life: 0.12,
+                        vy: LASER_PARTICLE_VY,
+                        size: LASER_PARTICLE_SIZE,
+                        life: LASER_PARTICLE_LIFE,
+                        max_life: LASER_PARTICLE_LIFE,
                         color: rgba(theme.paddle_accent),
                         gravity: 0.0,
                     });
                 }
             }
         }
+        cap_oldest(&mut particles, MAX_PARTICLES);
+        cap_oldest(&mut shards, MAX_SHARDS);
+        cap_oldest(&mut shockwaves, MAX_SHOCKWAVES);
+        cap_oldest(&mut arcs, MAX_ARCS);
+        cap_oldest(&mut popups, MAX_POPUPS);
 
         warp_grid.update(raw_dt);
         if screen_shake > 0.0 {
-            screen_shake = (screen_shake - raw_dt * 28.0).max(0.0);
+            screen_shake = (screen_shake - raw_dt * SCREEN_SHAKE_DECAY_PER_SEC).max(0.0);
         }
         if chromatic_pulse > 0.0 {
-            chromatic_pulse = (chromatic_pulse - raw_dt * 3.2).max(0.0);
+            chromatic_pulse = (chromatic_pulse - raw_dt * CHROMATIC_DECAY_PER_SEC).max(0.0);
         }
         particles.retain_mut(|p| {
             p.x += p.vx * dt;
@@ -808,14 +948,14 @@ async fn main() {
         shards.retain_mut(|s| {
             s.x += s.vx * dt;
             s.y += s.vy * dt;
-            s.vy += 650.0 * dt;
+            s.vy += SHARD_GRAVITY * dt;
             s.angle += s.v_angle * dt;
             s.life -= raw_dt;
             s.life > 0.0
         });
         shockwaves.retain_mut(|s| {
             s.life -= raw_dt;
-            let progress = 1.0 - (s.life / 0.40).clamp(0.0, 1.0);
+            let progress = 1.0 - (s.life / s.max_life).clamp(0.0, 1.0);
             s.radius = s.max_radius * progress;
             s.life > 0.0
         });
@@ -824,7 +964,7 @@ async fn main() {
             a.life > 0.0
         });
         popups.retain_mut(|pop| {
-            pop.y -= 55.0 * raw_dt;
+            pop.y -= POPUP_RISE_SPEED * raw_dt;
             pop.life -= raw_dt;
             pop.life > 0.0
         });
@@ -850,7 +990,14 @@ async fn main() {
             target: shake_target,
             ..Default::default()
         });
-        draw_backdrop(&world, theme, &neb_mat, &starfield, backdrop, time);
+        // Drawn rect inflated by the shake amplitude so the shaking camera never shows the clear colour.
+        let backdrop_drawn = Rect::new(
+            backdrop.x - SCREEN_SHAKE_MAX,
+            backdrop.y - SCREEN_SHAKE_MAX,
+            backdrop.w + 2.0 * SCREEN_SHAKE_MAX,
+            backdrop.h + 2.0 * SCREEN_SHAKE_MAX,
+        );
+        draw_backdrop(&world, theme, &neb_mat, &starfield, backdrop_drawn, time);
 
         // Dim the bars (screen space) so the playfield stays readable.
         set_default_camera();
@@ -908,13 +1055,23 @@ async fn main() {
                 theme,
                 i18n,
                 &ui_font,
-                selected_world,
-                selected_sector_idx,
+                &MenuSelection {
+                    worlds: &worlds,
+                    world_pos: selected_world_pos,
+                    sector_idx: selected_sector_idx,
+                },
             );
         }
 
         next_frame().await
     }
+}
+
+/// Title menu selection state: the world list and the highlighted world / start sector.
+struct MenuSelection<'a> {
+    worlds: &'a [(usize, usize)],
+    world_pos: usize,
+    sector_idx: usize,
 }
 
 fn draw_title_menu(
@@ -923,71 +1080,118 @@ fn draw_title_menu(
     theme: &ThemeDef,
     i18n: &I18nCatalog,
     font: &Font,
-    selected_world: usize,
-    selected_sector_idx: usize,
+    selection: &MenuSelection,
 ) {
+    let MenuSelection {
+        worlds,
+        world_pos: selected_world_pos,
+        sector_idx: selected_sector_idx,
+    } = *selection;
     let w = world.config.arena.width;
     let h = world.config.arena.height;
-    draw_rectangle(0.0, 0.0, w, h, Color::from_rgba(5, 4, 15, 215));
+    draw_rectangle(0.0, 0.0, w, h, rgba(MENU_DIM_COLOR));
     let pri = rgba(theme.text_primary);
     let acc = rgba(theme.text_accent);
     let border = rgba(theme.border_color);
 
     // Modern Glassmorphic Modal Panel
-    draw_rounded_rect(310.0, 110.0, 1300.0, 860.0, 26.0, border);
     draw_rounded_rect(
-        314.0,
-        114.0,
-        1292.0,
-        852.0,
-        24.0,
-        Color::from_rgba(12, 14, 30, 245),
+        MENU_PANEL_X,
+        MENU_PANEL_Y,
+        MENU_PANEL_W,
+        MENU_PANEL_H,
+        MENU_PANEL_RADIUS,
+        border,
     );
     draw_rounded_rect(
-        340.0,
-        126.0,
-        1240.0,
-        90.0,
-        16.0,
+        MENU_PANEL_X + MENU_PANEL_BORDER,
+        MENU_PANEL_Y + MENU_PANEL_BORDER,
+        MENU_PANEL_W - 2.0 * MENU_PANEL_BORDER,
+        MENU_PANEL_H - 2.0 * MENU_PANEL_BORDER,
+        MENU_PANEL_RADIUS - MENU_PANEL_BORDER,
+        rgba(MENU_PANEL_COLOR),
+    );
+    draw_rounded_rect(
+        MENU_PANEL_X + MENU_HEADER_INSET_X,
+        MENU_PANEL_Y + MENU_HEADER_INSET_Y,
+        MENU_PANEL_W - 2.0 * MENU_HEADER_INSET_X,
+        MENU_HEADER_H,
+        MENU_HEADER_RADIUS,
         Color::new(1.0, 1.0, 1.0, 0.05),
     );
 
-    txt(font, i18n.t("app.title"), 745.0, 235.0, 96, acc);
-    txt(font, i18n.t("app.subtitle"), 635.0, 290.0, 32, pri);
+    txt(
+        font,
+        i18n.t("app.title"),
+        MENU_PANEL_X + MENU_TITLE_DX,
+        MENU_TITLE_Y,
+        MENU_TITLE_SIZE,
+        acc,
+    );
+    txt(
+        font,
+        i18n.t("app.subtitle"),
+        MENU_PANEL_X + MENU_SUBTITLE_DX,
+        MENU_SUBTITLE_Y,
+        MENU_SUBTITLE_SIZE,
+        pri,
+    );
 
     draw_rounded_rect(
-        680.0,
-        325.0,
-        560.0,
-        56.0,
-        14.0,
-        Color::new(acc.r, acc.g, acc.b, 0.16),
+        MENU_PANEL_X + MENU_BEST_PILL_DX,
+        MENU_BEST_PILL_Y,
+        MENU_BEST_PILL_W,
+        MENU_BEST_PILL_H,
+        MENU_BEST_PILL_RADIUS,
+        Color::new(acc.r, acc.g, acc.b, MENU_BEST_PILL_ALPHA),
     );
     let best_line = format!("{}: {:07}", i18n.t("menu.best_score"), world.high_score);
-    txt(font, &best_line, 760.0, 364.0, 34, acc);
+    txt(
+        font,
+        &best_line,
+        MENU_PANEL_X + MENU_BEST_TEXT_DX,
+        MENU_BEST_TEXT_Y,
+        MENU_BEST_TEXT_SIZE,
+        acc,
+    );
 
-    txt(font, i18n.t("menu.campaigns"), 560.0, 445.0, 28, pri);
-    for (idx, w_key) in ["campaigns.c1", "campaigns.c2", "campaigns.c3"]
-        .iter()
-        .enumerate()
-    {
-        let w_num = idx + 1;
-        let y = 475.0 + idx as f32 * 68.0;
-        let is_sel = selected_world == w_num;
+    txt(
+        font,
+        i18n.t("menu.campaigns"),
+        MENU_PANEL_X + MENU_LABEL_DX,
+        MENU_CAMPAIGNS_Y,
+        MENU_LABEL_SIZE,
+        pri,
+    );
+    for (pos, &(world_id, _)) in worlds.iter().enumerate() {
+        let y = MENU_WORLD_LIST_Y + pos as f32 * MENU_WORLD_ROW_STEP;
+        let is_sel = selected_world_pos == pos;
         let pill_bg = if is_sel {
-            Color::new(acc.r, acc.g, acc.b, 0.25)
+            Color::new(acc.r, acc.g, acc.b, MENU_PILL_SELECTED_ALPHA)
         } else {
-            Color::from_rgba(24, 28, 52, 200)
+            rgba(MENU_PILL_IDLE_COLOR)
         };
-        draw_rounded_rect(510.0, y, 900.0, 54.0, 14.0, pill_bg);
+        draw_rounded_rect(
+            MENU_PANEL_X + MENU_WORLD_PILL_DX,
+            y,
+            MENU_WORLD_PILL_W,
+            MENU_WORLD_PILL_H,
+            MENU_WORLD_PILL_RADIUS,
+            pill_bg,
+        );
         let col = if is_sel { acc } else { pri };
-        let prefix = if is_sel { ">>  " } else { "    " };
+        let prefix = if is_sel {
+            MENU_SELECTED_PREFIX
+        } else {
+            MENU_UNSELECTED_PREFIX
+        };
+        let label_key = format!("campaigns.c{world_id}");
         txt(
             font,
-            &format!("{}{}", prefix, i18n.t(w_key)),
-            540.0,
-            y + 37.0,
-            30,
+            &format!("{}{}", prefix, i18n.t(&label_key)),
+            MENU_PANEL_X + MENU_WORLD_TEXT_DX,
+            y + MENU_WORLD_TEXT_DY,
+            MENU_WORLD_TEXT_SIZE,
             col,
         );
     }
@@ -999,28 +1203,56 @@ fn draw_title_menu(
         sec_def.id,
         sec_def.name
     );
-    txt(font, &sec_line, 560.0, 735.0, 32, acc);
+    txt(
+        font,
+        &sec_line,
+        MENU_PANEL_X + MENU_LABEL_DX,
+        MENU_SECTOR_Y,
+        MENU_SECTOR_SIZE,
+        acc,
+    );
 
     // Glowing CTA Pill Button
-    draw_rounded_rect(470.0, 775.0, 980.0, 78.0, 20.0, acc);
     draw_rounded_rect(
-        474.0,
-        779.0,
-        972.0,
-        70.0,
-        18.0,
-        Color::from_rgba(22, 16, 48, 240),
+        MENU_CTA_X,
+        MENU_CTA_Y,
+        MENU_CTA_W,
+        MENU_CTA_H,
+        MENU_CTA_RADIUS,
+        acc,
     );
-    txt(font, i18n.t("menu.play"), 515.0, 825.0, 29, WHITE);
+    draw_rounded_rect(
+        MENU_CTA_X + MENU_CTA_BORDER,
+        MENU_CTA_Y + MENU_CTA_BORDER,
+        MENU_CTA_W - 2.0 * MENU_CTA_BORDER,
+        MENU_CTA_H - 2.0 * MENU_CTA_BORDER,
+        MENU_CTA_RADIUS - MENU_CTA_BORDER,
+        rgba(MENU_CTA_COLOR),
+    );
+    txt(
+        font,
+        i18n.t("menu.play"),
+        MENU_CTA_X + MENU_CTA_TEXT_DX,
+        MENU_CTA_TEXT_Y,
+        MENU_CTA_TEXT_SIZE,
+        WHITE,
+    );
 
-    let footer = format!(
-        "{}   |   {}   |   {}   |   {}",
+    let footer = [
         i18n.t("menu.editor_btn"),
         i18n.t("menu.theme_btn"),
         i18n.t("menu.lang_btn"),
-        i18n.t("menu.music_btn")
+        i18n.t("menu.music_btn"),
+    ]
+    .join(MENU_FOOTER_SEPARATOR);
+    txt(
+        font,
+        &footer,
+        MENU_PANEL_X + MENU_FOOTER_DX,
+        MENU_FOOTER_Y,
+        MENU_FOOTER_SIZE,
+        pri,
     );
-    txt(font, &footer, 395.0, 920.0, 23, pri);
 }
 
 fn draw_backdrop(
@@ -1122,7 +1354,8 @@ fn draw_arena_background(
     if world.shield_hits > 0 {
         let sy = world.shield_y();
         let shield_col = rgba(theme.paddle_core);
-        let alpha = (world.shield_hits as f32 / 3.0) * 0.85;
+        let alpha = (world.shield_hits as f32 / world.config.gameplay.shield_hits.max(1) as f32)
+            * SHIELD_MAX_ALPHA;
         draw_line(
             left + 4.0,
             sy,
@@ -1161,7 +1394,7 @@ fn draw_boss_and_hazards(world: &GameWorld, theme: &ThemeDef, i18n: &I18nCatalog
             i18n.t("hud.boss"),
             boss.x + 52.0,
             boss.y + 42.0,
-            28,
+            BOSS_LABEL_SIZE,
             WHITE,
         );
     }
@@ -1506,7 +1739,7 @@ fn draw_additive_fx(
     }
 
     for s in shockwaves {
-        let alpha = (s.life / 0.40).clamp(0.0, 1.0);
+        let alpha = (s.life / s.max_life).clamp(0.0, 1.0);
         let c = Color::new(s.color.r, s.color.g, s.color.b, alpha * 0.88);
         draw_circle_lines(s.x, s.y, s.radius, 5.5, c);
         draw_circle_lines(
@@ -1523,9 +1756,13 @@ fn draw_additive_fx(
         let (x1, y1) = arc.from;
         let (x2, y2) = arc.to;
         let mut prev = (x1, y1);
-        for seg in 1..=6 {
-            let t = seg as f32 / 6.0;
-            let jitter = if seg < 6 { 22.0 } else { 0.0 };
+        for seg in 1..=LIGHTNING_SEGMENTS {
+            let t = seg as f32 / LIGHTNING_SEGMENTS as f32;
+            let jitter = if seg < LIGHTNING_SEGMENTS {
+                LIGHTNING_JITTER
+            } else {
+                0.0
+            };
             let nx = x1 + (x2 - x1) * t + rand::gen_range(-jitter, jitter);
             let ny = y1 + (y2 - y1) * t + rand::gen_range(-jitter, jitter);
             draw_line(
@@ -1544,9 +1781,9 @@ fn draw_additive_fx(
 
 fn draw_popups(popups: &[FloatingPopup], font: &Font) {
     for pop in popups {
-        let alpha = (pop.life / 0.70).clamp(0.0, 1.0);
+        let alpha = (pop.life / POPUP_FADE_REF_SEC).clamp(0.0, 1.0);
         let c = Color::new(pop.color.r, pop.color.g, pop.color.b, alpha);
-        txt(font, &pop.text, pop.x, pop.y, 26, c);
+        txt(font, &pop.text, pop.x, pop.y, POPUP_FONT_SIZE, c);
     }
 }
 
@@ -1573,21 +1810,23 @@ fn draw_hud(ctx: &HudContext) {
 
     // Sleek Compact Top Dashboard Bar
     draw_rounded_rect(
-        48.0,
-        8.0,
-        1824.0,
-        58.0,
-        12.0,
-        Color::new(border.r, border.g, border.b, 0.40),
+        HUD_BAR_X,
+        HUD_BAR_Y,
+        HUD_BAR_W,
+        HUD_BAR_H,
+        HUD_BAR_RADIUS,
+        Color::new(border.r, border.g, border.b, HUD_BAR_BORDER_ALPHA),
     );
     draw_rounded_rect(
-        49.5,
-        9.5,
-        1821.0,
-        55.0,
-        11.0,
-        Color::from_rgba(10, 12, 26, 225),
+        HUD_BAR_X + HUD_BAR_INSET,
+        HUD_BAR_Y + HUD_BAR_INSET,
+        HUD_BAR_W - 2.0 * HUD_BAR_INSET,
+        HUD_BAR_H - 2.0 * HUD_BAR_INSET,
+        HUD_BAR_RADIUS - HUD_BAR_INSET,
+        rgba(HUD_BAR_COLOR),
     );
+    let text_x = HUD_BAR_X + HUD_TEXT_DX;
+    let right_x = HUD_BAR_X + HUD_RIGHT_DX;
 
     let top_bar = format!(
         "{}   |   {}: {:07} ({}: {:07})   |   {}: {}   |   {}: x{}   |   {} {}: {}",
@@ -1604,75 +1843,141 @@ fn draw_hud(ctx: &HudContext) {
         world.current_level_idx + 1,
         lvl_name
     );
-    txt(font, &top_bar, 72.0, 34.0, 21, pri);
+    txt(
+        font,
+        &top_bar,
+        text_x,
+        HUD_TOP_TEXT_Y,
+        HUD_TOP_TEXT_SIZE,
+        pri,
+    );
 
     let perf_badge = format!("{}x{} px | {} {}", rt_w, rt_h, get_fps(), i18n.t("hud.fps"));
-    txt(font, &perf_badge, 1555.0, 32.0, 17, acc);
+    txt(
+        font,
+        &perf_badge,
+        right_x,
+        HUD_PERF_Y,
+        HUD_RIGHT_TEXT_SIZE,
+        acc,
+    );
 
     let v_ratio = (world.vortex_energy / world.config.gameplay.vortex_max_energy).clamp(0.0, 1.0);
-    txt(font, i18n.t("hud.vortex"), 1555.0, 56.0, 17, pri);
+    txt(
+        font,
+        i18n.t("hud.vortex"),
+        right_x,
+        HUD_VORTEX_LABEL_Y,
+        HUD_RIGHT_TEXT_SIZE,
+        pri,
+    );
+    let vortex_x = HUD_BAR_X + HUD_VORTEX_BAR_DX;
     draw_rounded_rect(
-        1650.0,
-        42.0,
-        190.0,
-        12.0,
-        6.0,
-        Color::from_rgba(28, 32, 52, 240),
+        vortex_x,
+        HUD_VORTEX_BAR_Y,
+        HUD_VORTEX_BAR_W,
+        HUD_VORTEX_BAR_H,
+        HUD_VORTEX_BAR_H * 0.5,
+        rgba(HUD_VORTEX_BAR_COLOR),
     );
-    draw_rounded_rect(1650.0, 42.0, (190.0 * v_ratio).max(10.0), 12.0, 6.0, acc);
+    draw_rounded_rect(
+        vortex_x,
+        HUD_VORTEX_BAR_Y,
+        (HUD_VORTEX_BAR_W * v_ratio).max(HUD_VORTEX_BAR_MIN_W),
+        HUD_VORTEX_BAR_H,
+        HUD_VORTEX_BAR_H * 0.5,
+        acc,
+    );
 
-    let sub_bar = format!(
-        "{}: {}    {}    {}    {}    {}    {}    [{}: {}]",
-        i18n.t("hud.theme"),
-        i18n.t(&theme.name_key),
-        i18n.t("controls.theme_hint"),
-        i18n.t("controls.lang_hint"),
-        i18n.t("controls.level_hint"),
-        i18n.t("controls.editor_hint"),
-        i18n.t("controls.mute_hint"),
-        i18n.t("hud.lang"),
-        lang.code()
+    // Shrinks (down to the badge minimum) instead of running under the right-hand block.
+    let sub_bar = build_sub_bar(i18n, theme, lang);
+    let sub_size = fit_font_size(
+        |size| measure_text(&sub_bar, Some(font), size, 1.0).width,
+        HUD_SUB_TEXT_SIZE,
+        BADGE_FONT_SIZE_MIN,
+        HUD_SUB_BAR_MAX_W,
     );
-    txt(font, &sub_bar, 72.0, 56.0, 16, acc);
+    txt(font, &sub_bar, text_x, HUD_SUB_TEXT_Y, sub_size, acc);
 
     if editor_mode {
-        txt(font, i18n.t("editor.banner"), 72.0, 138.0, 28, acc);
-        txt(font, i18n.t("editor.instructions"), 72.0, 1058.0, 22, pri);
+        txt(
+            font,
+            i18n.t("editor.banner"),
+            HUD_BANNER_X,
+            HUD_BANNER_Y,
+            HUD_BANNER_SIZE,
+            acc,
+        );
+        txt(
+            font,
+            i18n.t("editor.instructions"),
+            HUD_BANNER_X,
+            HUD_FOOTER_Y,
+            HUD_FOOTER_SIZE,
+            pri,
+        );
         return;
     }
 
     if world.level_elapsed >= world.config.gameplay.sudden_death_time_sec {
-        txt(font, i18n.t("status.sudden_death"), 72.0, 136.0, 26, acc);
+        txt(
+            font,
+            i18n.t("status.sudden_death"),
+            HUD_BANNER_X,
+            HUD_SUDDEN_DEATH_Y,
+            HUD_SUDDEN_DEATH_SIZE,
+            acc,
+        );
     }
 
     if world.last_powerup_timer > 0.0 {
-        if let Some(key) = world.last_powerup_key {
-            let msg = i18n.t(key);
-            let is_malus = key.ends_with("shrink") || key.ends_with("fast");
-            let toast_col = if is_malus {
-                rgba(MALUS_COLOR)
+        if let Some(kind) = world.last_powerup {
+            let msg = i18n.t(kind.i18n_key());
+            let toast_col = rgba(if kind.is_malus() {
+                MALUS_COLOR
             } else {
-                Color::from_rgba(30, 250, 165, 255)
-            };
-            let dims = measure_text(msg, Some(font), 24, 1.0);
-            let bw = dims.width + 44.0;
-            let bx = 960.0 - bw * 0.5;
-            draw_rounded_rect(bx, 82.0, bw, 38.0, 10.0, toast_col);
+                BONUS_COLOR
+            });
+            let dims = measure_text(msg, Some(font), TOAST_FONT_SIZE, 1.0);
+            let bw = dims.width + 2.0 * TOAST_PAD_X;
+            let bx = world.config.arena.width * 0.5 - bw * 0.5;
+            draw_rounded_rect(bx, TOAST_Y, bw, TOAST_H, TOAST_RADIUS, toast_col);
             draw_rounded_rect(
-                bx + 2.5,
-                84.5,
-                bw - 5.0,
-                33.0,
-                8.0,
-                Color::from_rgba(8, 12, 24, 240),
+                bx + TOAST_BORDER,
+                TOAST_Y + TOAST_BORDER,
+                bw - 2.0 * TOAST_BORDER,
+                TOAST_H - 2.0 * TOAST_BORDER,
+                TOAST_RADIUS - TOAST_BORDER,
+                rgba(TOAST_BG_COLOR),
             );
-            txt(font, msg, bx + 22.0, 109.0, 24, toast_col);
+            txt(
+                font,
+                msg,
+                bx + TOAST_PAD_X,
+                TOAST_Y + TOAST_TEXT_DY,
+                TOAST_FONT_SIZE,
+                toast_col,
+            );
         }
     }
     if world.balls.iter().any(|b| b.stuck_offset.is_some()) {
-        txt(font, i18n.t("controls.launch_hint"), 380.0, 1060.0, 22, pri);
+        txt(
+            font,
+            i18n.t("controls.launch_hint"),
+            HUD_HINT_X,
+            HUD_HINT_Y,
+            HUD_FOOTER_SIZE,
+            pri,
+        );
     } else if world.laser_active {
-        txt(font, i18n.t("controls.laser_hint"), 380.0, 1060.0, 22, acc);
+        txt(
+            font,
+            i18n.t("controls.laser_hint"),
+            HUD_HINT_X,
+            HUD_HINT_Y,
+            HUD_FOOTER_SIZE,
+            acc,
+        );
     }
 
     match world.status {
@@ -1707,18 +2012,55 @@ fn draw_hud(ctx: &HudContext) {
     }
 }
 
+/// Second HUD line: current renderer, the hotkey reminders and the active language.
+fn build_sub_bar(i18n: &I18nCatalog, theme: &ThemeDef, lang: Language) -> String {
+    [
+        format!("{}: {}", i18n.t("hud.theme"), i18n.t(&theme.name_key)),
+        i18n.t("controls.theme_hint").to_string(),
+        i18n.t("controls.lang_hint").to_string(),
+        i18n.t("controls.level_hint").to_string(),
+        i18n.t("controls.editor_hint").to_string(),
+        i18n.t("controls.mute_hint").to_string(),
+        i18n.t("controls.pause_hint").to_string(),
+        i18n.t("controls.restart_hint").to_string(),
+        format!("[{}: {}]", i18n.t("hud.lang"), lang.code()),
+    ]
+    .join(HUD_SUB_BAR_SEPARATOR)
+}
+
 fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, sub_col: Color) {
-    draw_rounded_rect(460.0, 410.0, 1000.0, 250.0, 24.0, title_col);
     draw_rounded_rect(
-        464.0,
-        414.0,
-        992.0,
-        242.0,
-        22.0,
-        Color::from_rgba(10, 12, 26, 242),
+        OVERLAY_X,
+        OVERLAY_Y,
+        OVERLAY_W,
+        OVERLAY_H,
+        OVERLAY_RADIUS,
+        title_col,
     );
-    txt(font, title, 530.0, 515.0, 48, title_col);
-    txt(font, subtitle, 530.0, 585.0, 28, sub_col);
+    draw_rounded_rect(
+        OVERLAY_X + OVERLAY_BORDER,
+        OVERLAY_Y + OVERLAY_BORDER,
+        OVERLAY_W - 2.0 * OVERLAY_BORDER,
+        OVERLAY_H - 2.0 * OVERLAY_BORDER,
+        OVERLAY_RADIUS - OVERLAY_BORDER,
+        rgba(OVERLAY_COLOR),
+    );
+    txt(
+        font,
+        title,
+        OVERLAY_X + OVERLAY_TEXT_DX,
+        OVERLAY_Y + OVERLAY_TITLE_DY,
+        OVERLAY_TITLE_SIZE,
+        title_col,
+    );
+    txt(
+        font,
+        subtitle,
+        OVERLAY_X + OVERLAY_TEXT_DX,
+        OVERLAY_Y + OVERLAY_SUB_DY,
+        OVERLAY_SUB_SIZE,
+        sub_col,
+    );
 }
 
 #[cfg(test)]
@@ -1794,5 +2136,97 @@ mod tests {
             vy,
             ((1000.0f32 - 1000.0 * 1080.0 / 1920.0) * 0.5 * 2.0).round() as i32
         );
+    }
+
+    fn level(id: usize, world: usize) -> LevelDef {
+        LevelDef {
+            id,
+            world,
+            name: String::new(),
+            boss: false,
+            rows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worlds_are_derived_from_the_level_list() {
+        let levels = [
+            level(1, 1),
+            level(2, 1),
+            level(3, 2),
+            level(4, 2),
+            level(5, 5),
+        ];
+        assert_eq!(build_worlds(&levels), vec![(1, 0), (2, 2), (5, 4)]);
+        assert!(build_worlds(&[]).is_empty());
+    }
+
+    #[test]
+    fn sector_navigation_syncs_the_world_position() {
+        let levels = [level(1, 1), level(2, 1), level(3, 2), level(4, 2)];
+        let worlds = build_worlds(&levels);
+        assert_eq!(world_pos_for_level(&worlds, &levels, 1, 9), 0);
+        assert_eq!(world_pos_for_level(&worlds, &levels, 2, 9), 1);
+        assert_eq!(world_pos_for_level(&worlds, &levels, 99, 9), 9);
+    }
+
+    #[test]
+    fn resume_mask_matches_the_inputs_that_start_play() {
+        assert_eq!(
+            resume_mask_for(AppScreen::InGame, SessionStatus::Playing),
+            0
+        );
+        let paused = resume_mask_for(AppScreen::InGame, SessionStatus::Paused);
+        assert_eq!(paused, RESUME_P | RESUME_R | RESUME_F3);
+        let over = resume_mask_for(AppScreen::InGame, SessionStatus::GameOver);
+        assert_eq!(
+            over,
+            resume_mask_for(AppScreen::InGame, SessionStatus::Victory)
+        );
+        assert_eq!(over & RESUME_P, 0);
+        assert_ne!(
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing) & RESUME_CLICK,
+            0
+        );
+        assert_ne!(
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing) & RESUME_TAB,
+            0
+        );
+        assert_eq!(
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused) & RESUME_TAB,
+            0
+        );
+        assert_eq!(
+            resume_mask_for(AppScreen::Editor, SessionStatus::Playing),
+            RESUME_F4 | RESUME_F3
+        );
+    }
+
+    fn text_width(face: &ttf_parser::Face, text: &str, size: f32) -> f32 {
+        let scale = size / face.units_per_em() as f32;
+        text.chars()
+            .filter_map(|c| face.glyph_index(c))
+            .filter_map(|g| face.glyph_hor_advance(g))
+            .map(|a| a as f32 * scale)
+            .sum()
+    }
+
+    #[test]
+    fn hud_sub_bar_fits_beside_the_right_hand_block() {
+        let face = ttf_parser::Face::parse(RAW_FONT, 0).expect("valid font");
+        let themes: ThemeRegistry = serde_json::from_str(RAW_THEMES).expect("themes");
+        let limit = HUD_SUB_BAR_MAX_W;
+        for (code, raw, lang) in [("en", RAW_EN, Language::En), ("fr", RAW_FR, Language::Fr)] {
+            let i18n = I18nCatalog::from_json_str(raw).expect("catalog");
+            for theme in &themes.themes {
+                let line = build_sub_bar(&i18n, theme, lang);
+                let width = text_width(&face, &line, HUD_SUB_TEXT_SIZE as f32);
+                assert!(
+                    width <= limit,
+                    "{code}/{}: sub bar is {width:.0}px, limit {limit:.0}px",
+                    theme.name_key
+                );
+            }
+        }
     }
 }

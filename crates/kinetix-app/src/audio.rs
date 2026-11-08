@@ -37,6 +37,7 @@ extern "C" {
     fn kinetix_set_pointer_lock(enabled: u32);
     fn kinetix_set_pointer_bounds(left_css_px: f32, right_css_px: f32);
     fn kinetix_pointer_lock_active() -> u32;
+    fn kinetix_set_resume_mask(mask: u32);
 }
 
 pub struct SoundBank {
@@ -133,7 +134,7 @@ pub fn load_progress() -> (u64, usize, usize, bool) {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_progress() -> (u64, usize, usize, bool) {
-    (0, 0, 0, true)
+    (0, 0, 0, false)
 }
 
 /// Shows the level code to the player (web: clipboard + prompt dialog titled with `message`).
@@ -218,4 +219,14 @@ pub fn pointer_lock_active() -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pointer_lock_active() -> bool {
     true
+}
+
+/// Tells the page which input gestures will make the pointer lock wanted next, so it can request
+/// the lock synchronously inside the gesture (web only; no-op natively).
+#[allow(unused_variables)]
+pub fn set_resume_mask(mask: u32) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        kinetix_set_resume_mask(mask);
+    }
 }

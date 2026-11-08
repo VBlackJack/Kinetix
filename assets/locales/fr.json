@@ -11,7 +11,6 @@
     "theme_btn": "[F1] MOTEUR DE RENDU",
     "lang_btn": "[F2] LANGUE",
     "music_btn": "[B] MUSIQUE DYNAMIQUE",
-    "sfx_btn": "[M] EFFETS SONORES",
     "unlocked": "DÉBLOQUÉ",
     "locked": "VERROUILLÉ",
     "best_score": "RECORD ABSOLU"
@@ -31,9 +30,7 @@
     "boss": "NOYAU OMEGA",
     "theme": "RENDU",
     "lang": "LANGUE",
-    "fps": "IPS",
-    "balls": "BALLES",
-    "synergy": "BONUS ACTIFS"
+    "fps": "IPS"
   },
   "controls": {
     "launch_hint": "CLIC GAUCHE / ESPACE : Lancer  |  CLIC DROIT / MAJ : Vortex  |  [TAB] Menu Titre",
@@ -82,7 +79,7 @@
     "badge": {
       "fireball": "FEU",
       "megaball": "MÉGA",
-      "multiball": "x3 BAL",
+      "multiball": "x3 BALLES",
       "expand": "+LARGE",
       "shrink": "RÉDUIT!",
       "magnet": "AIMANT",
