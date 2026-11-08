@@ -186,6 +186,7 @@ impl GameWorld {
     pub fn import_level_code(&mut self, code: &str) -> Result<(), LevelCodeError> {
         let rows = parse_level_code(code)?;
         self.load_from_rows(&rows, false, LEVEL_CODE_BASE_TIER);
+        self.campaign_board = false;
         Ok(())
     }
 

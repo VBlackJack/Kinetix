@@ -191,12 +191,49 @@ fn world_pos_for_level(
         .unwrap_or(fallback)
 }
 
+/// A sector can be started when its index is not above the highest unlocked one.
+fn is_sector_unlocked(sector_idx: usize, max_unlocked: usize) -> bool {
+    sector_idx <= max_unlocked
+}
+
+/// A world is playable once its first sector is unlocked.
+fn is_world_unlocked(first_level_idx: usize, max_unlocked: usize) -> bool {
+    is_sector_unlocked(first_level_idx, max_unlocked)
+}
+
+/// Keeps a menu sector selection on an existing, unlocked sector.
+fn clamp_sector(selected: usize, max_unlocked: usize, last_sector: usize) -> usize {
+    selected.min(max_unlocked).min(last_sector)
+}
+
+/// Position of the next unlocked world after `from` in the given direction, wrapping around and
+/// skipping locked worlds; `from` itself when no other world is unlocked.
+fn step_unlocked_world(
+    worlds: &[(usize, usize)],
+    from: usize,
+    forward: bool,
+    max_unlocked: usize,
+) -> usize {
+    let count = worlds.len();
+    for step in 1..count {
+        let pos = if forward {
+            (from + step) % count
+        } else {
+            (from + count - step) % count
+        };
+        if is_world_unlocked(worlds[pos].1, max_unlocked) {
+            return pos;
+        }
+    }
+    from
+}
+
 /// Input gestures that will make the pointer lock wanted from the given state (see
 /// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
 fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
     match screen {
         AppScreen::TitleMenu => {
-            let base = RESUME_CLICK | RESUME_SPACE | RESUME_ENTER | RESUME_F3;
+            let base = RESUME_CLICK | RESUME_SPACE | RESUME_ENTER | RESUME_CHEAT_MASK;
             // Tab from the title enters the game and wants the lock when the world is playing.
             if status == SessionStatus::Playing {
                 base | RESUME_TAB
@@ -204,12 +241,12 @@ fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
                 base
             }
         }
-        AppScreen::Editor => RESUME_F4 | RESUME_F3,
+        AppScreen::Editor => RESUME_F4 | RESUME_CHEAT_MASK,
         AppScreen::InGame => match status {
             SessionStatus::Playing => 0,
-            SessionStatus::Paused => RESUME_P | RESUME_R | RESUME_F3,
+            SessionStatus::Paused => RESUME_P | RESUME_R | RESUME_CHEAT_MASK,
             SessionStatus::Victory | SessionStatus::GameOver => {
-                RESUME_CLICK | RESUME_SPACE | RESUME_R | RESUME_F3
+                RESUME_CLICK | RESUME_SPACE | RESUME_R | RESUME_CHEAT_MASK
             }
         },
     }
@@ -238,6 +275,7 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
         .iter()
         .copied()
         .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
+        .chain(MENU_WORLD_TEXT_SIZE_MIN..=MENU_WORLD_TEXT_SIZE)
         .map(physical)
         .collect();
     for size in sizes {
@@ -417,7 +455,7 @@ async fn main() {
                 lang == Language::Fr,
             );
         }
-        if is_key_pressed(KeyCode::F3) {
+        if LEVEL_CHEAT_ENABLED && is_key_pressed(KeyCode::F3) {
             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
             world.load_level(next_lvl, &level_pack.levels);
             screen = AppScreen::InGame;
@@ -473,27 +511,33 @@ async fn main() {
 
         match screen {
             AppScreen::TitleMenu => {
+                let max_unlocked = world.max_unlocked_level;
                 if !worlds.is_empty() {
                     for (n, key) in WORLD_SELECT_KEYS.iter().enumerate() {
                         if is_key_pressed(*key) {
                             if let Some(&(_, first_idx)) = worlds.get(n) {
-                                selected_world_pos = n;
-                                selected_sector_idx = first_idx;
+                                if is_world_unlocked(first_idx, max_unlocked) {
+                                    selected_world_pos = n;
+                                    selected_sector_idx = first_idx;
+                                }
                             }
                         }
                     }
                     if is_key_pressed(KeyCode::Left) {
-                        selected_world_pos = (selected_world_pos + worlds.len() - 1) % worlds.len();
+                        selected_world_pos =
+                            step_unlocked_world(&worlds, selected_world_pos, false, max_unlocked);
                         selected_sector_idx = worlds[selected_world_pos].1;
                     }
                     if is_key_pressed(KeyCode::Right) {
-                        selected_world_pos = (selected_world_pos + 1) % worlds.len();
+                        selected_world_pos =
+                            step_unlocked_world(&worlds, selected_world_pos, true, max_unlocked);
                         selected_sector_idx = worlds[selected_world_pos].1;
                     }
                 }
                 let last_sector = level_pack.levels.len().saturating_sub(1);
                 if is_key_pressed(KeyCode::Up) {
-                    selected_sector_idx = (selected_sector_idx + 1).min(last_sector);
+                    selected_sector_idx =
+                        clamp_sector(selected_sector_idx + 1, max_unlocked, last_sector);
                     selected_world_pos = world_pos_for_level(
                         &worlds,
                         &level_pack.levels,
@@ -510,10 +554,12 @@ async fn main() {
                         selected_world_pos,
                     );
                 }
+                selected_sector_idx = clamp_sector(selected_sector_idx, max_unlocked, last_sector);
 
-                if is_key_pressed(KeyCode::Enter)
+                if (is_key_pressed(KeyCode::Enter)
                     || is_key_pressed(KeyCode::Space)
-                    || is_mouse_button_pressed(MouseButton::Left)
+                    || is_mouse_button_pressed(MouseButton::Left))
+                    && is_sector_unlocked(selected_sector_idx, max_unlocked)
                 {
                     world.lives = world.config.gameplay.initial_lives;
                     world.score = 0;
@@ -561,7 +607,7 @@ async fn main() {
                     };
                 }
                 if is_key_pressed(KeyCode::C) {
-                    world.bricks.clear();
+                    world.clear_bricks();
                 }
                 if is_key_pressed(KeyCode::X) {
                     let code = world.export_level_code();
@@ -643,6 +689,12 @@ async fn main() {
                 if action_triggered {
                     match world.status {
                         SessionStatus::Playing => world.launch_or_fire(&mut events),
+                        SessionStatus::Victory if !world.is_campaign_board() => {
+                            // A custom board has no next sector: go back to the editor.
+                            screen = AppScreen::Editor;
+                            world.reset_paddle_and_ball();
+                            world.status = SessionStatus::Playing;
+                        }
                         SessionStatus::Victory => {
                             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
                             world.load_level(next_lvl, &level_pack.levels);
@@ -1163,7 +1215,8 @@ fn draw_title_menu(
         MENU_LABEL_SIZE,
         pri,
     );
-    for (pos, &(world_id, _)) in worlds.iter().enumerate() {
+    for (pos, &(world_id, first_idx)) in worlds.iter().enumerate() {
+        let unlocked = is_world_unlocked(first_idx, world.max_unlocked_level);
         let y = MENU_WORLD_LIST_Y + pos as f32 * MENU_WORLD_ROW_STEP;
         let is_sel = selected_world_pos == pos;
         let pill_bg = if is_sel {
@@ -1179,21 +1232,54 @@ fn draw_title_menu(
             MENU_WORLD_PILL_RADIUS,
             pill_bg,
         );
-        let col = if is_sel { acc } else { pri };
+        let base_col = if is_sel { acc } else { pri };
+        let col = if unlocked {
+            base_col
+        } else {
+            Color::new(base_col.r, base_col.g, base_col.b, MENU_LOCKED_ALPHA)
+        };
         let prefix = if is_sel {
             MENU_SELECTED_PREFIX
         } else {
             MENU_UNSELECTED_PREFIX
         };
         let label_key = format!("campaigns.c{world_id}");
+        let row_text = format!("{}{}", prefix, i18n.t(&label_key));
+        let text_x = MENU_PANEL_X + MENU_WORLD_TEXT_DX;
+        let pill_right = MENU_PANEL_X + MENU_WORLD_PILL_DX + MENU_WORLD_PILL_W;
+        // A locked row reserves room for its label on the right and shrinks the name to fit.
+        let lock_label = i18n.t("menu.locked");
+        let lock_w = if unlocked {
+            0.0
+        } else {
+            measure_text(lock_label, Some(font), MENU_WORLD_TEXT_SIZE, 1.0).width + MENU_LOCK_GAP
+        };
+        let text_limit = pill_right - MENU_LOCK_LABEL_PAD - lock_w - text_x;
+        let row_size = fit_font_size(
+            |size| measure_text(&row_text, Some(font), size, 1.0).width,
+            MENU_WORLD_TEXT_SIZE,
+            MENU_WORLD_TEXT_SIZE_MIN,
+            text_limit,
+        );
         txt(
             font,
-            &format!("{}{}", prefix, i18n.t(&label_key)),
-            MENU_PANEL_X + MENU_WORLD_TEXT_DX,
+            &row_text,
+            text_x,
             y + MENU_WORLD_TEXT_DY,
-            MENU_WORLD_TEXT_SIZE,
+            row_size,
             col,
         );
+        if !unlocked {
+            let label_w = lock_w - MENU_LOCK_GAP;
+            txt(
+                font,
+                lock_label,
+                pill_right - MENU_LOCK_LABEL_PAD - label_w,
+                y + MENU_WORLD_TEXT_DY,
+                MENU_WORLD_TEXT_SIZE,
+                col,
+            );
+        }
     }
 
     let sec_def = &levels.levels[selected_sector_idx % levels.levels.len()];
@@ -2014,17 +2100,25 @@ fn draw_hud(ctx: &HudContext) {
 
 /// Second HUD line: current renderer, the hotkey reminders and the active language.
 fn build_sub_bar(i18n: &I18nCatalog, theme: &ThemeDef, lang: Language) -> String {
+    let level_hint = LEVEL_CHEAT_ENABLED.then(|| i18n.t("controls.level_hint").to_string());
     [
-        format!("{}: {}", i18n.t("hud.theme"), i18n.t(&theme.name_key)),
-        i18n.t("controls.theme_hint").to_string(),
-        i18n.t("controls.lang_hint").to_string(),
-        i18n.t("controls.level_hint").to_string(),
-        i18n.t("controls.editor_hint").to_string(),
-        i18n.t("controls.mute_hint").to_string(),
-        i18n.t("controls.pause_hint").to_string(),
-        i18n.t("controls.restart_hint").to_string(),
-        format!("[{}: {}]", i18n.t("hud.lang"), lang.code()),
+        Some(format!(
+            "{}: {}",
+            i18n.t("hud.theme"),
+            i18n.t(&theme.name_key)
+        )),
+        Some(i18n.t("controls.theme_hint").to_string()),
+        Some(i18n.t("controls.lang_hint").to_string()),
+        level_hint,
+        Some(i18n.t("controls.editor_hint").to_string()),
+        Some(i18n.t("controls.mute_hint").to_string()),
+        Some(i18n.t("controls.pause_hint").to_string()),
+        Some(i18n.t("controls.restart_hint").to_string()),
+        Some(format!("[{}: {}]", i18n.t("hud.lang"), lang.code())),
     ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
     .join(HUD_SUB_BAR_SEPARATOR)
 }
 
@@ -2171,13 +2265,52 @@ mod tests {
     }
 
     #[test]
+    fn fresh_profile_can_only_start_the_first_sector() {
+        let max_unlocked = 0;
+        assert!(is_sector_unlocked(0, max_unlocked));
+        assert!(!is_sector_unlocked(1, max_unlocked));
+        assert_eq!(clamp_sector(9, max_unlocked, 14), 0);
+    }
+
+    #[test]
+    fn sector_clamp_respects_both_bounds() {
+        assert_eq!(clamp_sector(3, 5, 14), 3);
+        assert_eq!(clamp_sector(6, 5, 14), 5);
+        assert_eq!(clamp_sector(20, 30, 14), 14);
+        assert_eq!(clamp_sector(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn world_unlock_boundary_is_its_first_sector() {
+        assert!(is_world_unlocked(5, 5));
+        assert!(!is_world_unlocked(5, 4));
+        assert!(is_world_unlocked(0, 0));
+    }
+
+    #[test]
+    fn world_navigation_skips_locked_worlds() {
+        let worlds = [(1, 0), (2, 5), (3, 10)];
+        // Only world 1 unlocked: nothing else to move to.
+        assert_eq!(step_unlocked_world(&worlds, 0, true, 4), 0);
+        assert_eq!(step_unlocked_world(&worlds, 0, false, 4), 0);
+        // Worlds 1 and 2 unlocked: wraps between them and never reaches world 3.
+        assert_eq!(step_unlocked_world(&worlds, 0, true, 5), 1);
+        assert_eq!(step_unlocked_world(&worlds, 1, true, 9), 0);
+        assert_eq!(step_unlocked_world(&worlds, 0, false, 9), 1);
+        // Everything unlocked: plain wrap-around.
+        assert_eq!(step_unlocked_world(&worlds, 2, true, 14), 0);
+        assert_eq!(step_unlocked_world(&worlds, 0, false, 14), 2);
+        assert_eq!(step_unlocked_world(&[], 0, true, 0), 0);
+    }
+
+    #[test]
     fn resume_mask_matches_the_inputs_that_start_play() {
         assert_eq!(
             resume_mask_for(AppScreen::InGame, SessionStatus::Playing),
             0
         );
         let paused = resume_mask_for(AppScreen::InGame, SessionStatus::Paused);
-        assert_eq!(paused, RESUME_P | RESUME_R | RESUME_F3);
+        assert_eq!(paused, RESUME_P | RESUME_R | RESUME_CHEAT_MASK);
         let over = resume_mask_for(AppScreen::InGame, SessionStatus::GameOver);
         assert_eq!(
             over,
@@ -2198,7 +2331,7 @@ mod tests {
         );
         assert_eq!(
             resume_mask_for(AppScreen::Editor, SessionStatus::Playing),
-            RESUME_F4 | RESUME_F3
+            RESUME_F4 | RESUME_CHEAT_MASK
         );
     }
 

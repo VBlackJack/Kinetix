@@ -173,10 +173,18 @@ pub const MENU_WORLD_PILL_RADIUS: f32 = 14.0;
 pub const MENU_WORLD_TEXT_DX: f32 = 230.0;
 pub const MENU_WORLD_TEXT_DY: f32 = 37.0;
 pub const MENU_WORLD_TEXT_SIZE: u16 = 30;
+/// Smallest size a world row shrinks to so its text clears the right-hand "locked" label.
+pub const MENU_WORLD_TEXT_SIZE_MIN: u16 = 20;
+/// Gap kept between a world row's text and its "locked" label.
+pub const MENU_LOCK_GAP: f32 = 24.0;
 pub const MENU_PILL_SELECTED_ALPHA: f32 = 0.25;
 pub const MENU_PILL_IDLE_COLOR: [u8; 4] = [24, 28, 52, 200];
 pub const MENU_SELECTED_PREFIX: &str = ">>  ";
 pub const MENU_UNSELECTED_PREFIX: &str = "    ";
+/// Alpha of a locked world row (dimmed).
+pub const MENU_LOCKED_ALPHA: f32 = 0.4;
+/// Gap between the right edge of a world pill and its "locked" label.
+pub const MENU_LOCK_LABEL_PAD: f32 = 30.0;
 pub const MENU_SECTOR_Y: f32 = 735.0;
 pub const MENU_SECTOR_SIZE: u16 = 32;
 pub const MENU_CTA_X: f32 = 470.0;
@@ -273,3 +281,7 @@ pub const RESUME_R: u32 = 16;
 pub const RESUME_F3: u32 = 32;
 pub const RESUME_F4: u32 = 64;
 pub const RESUME_TAB: u32 = 128;
+/// Debug-only "next sector" cheat (F3); release builds neither bind the key nor advertise it.
+pub const LEVEL_CHEAT_ENABLED: bool = cfg!(debug_assertions);
+/// Resume gestures contributed by the F3 cheat: none when the cheat is compiled out.
+pub const RESUME_CHEAT_MASK: u32 = if LEVEL_CHEAT_ENABLED { RESUME_F3 } else { 0 };

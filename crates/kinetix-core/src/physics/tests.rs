@@ -560,3 +560,57 @@ fn new_worlds_share_the_default_sequence() {
     let (mut a, mut b) = (world(), world());
     assert_eq!(a.next_rand_f32(), b.next_rand_f32());
 }
+
+/// Leaves the world one frame away from winning, with no destructible brick left.
+fn arm_victory(w: &mut GameWorld) {
+    w.bricks.retain(|b| !b.is_destructible());
+    w.boss = None;
+    w.balls[0].stuck_offset = None;
+    w.balls[0].x = 960.0;
+    w.balls[0].y = 600.0;
+    w.balls[0].vx = 0.0;
+    w.balls[0].vy = -1.0;
+}
+
+fn win_and_unlock(w: &mut GameWorld) -> usize {
+    arm_victory(w);
+    let mut events = Vec::new();
+    w.update(TINY_DT, &mut events);
+    assert_eq!(w.status, SessionStatus::Victory);
+    w.max_unlocked_level
+}
+
+#[test]
+fn clearing_the_board_in_the_editor_does_not_unlock() {
+    let mut w = world();
+    w.clear_bricks();
+    assert_eq!(win_and_unlock(&mut w), 0);
+}
+
+#[test]
+fn painting_then_winning_does_not_unlock() {
+    let mut w = world();
+    w.paint_brick_at(960.0, BRICK_TOP_OFFSET + 1.0, None);
+    assert!(!w.is_campaign_board());
+    assert_eq!(win_and_unlock(&mut w), 0);
+}
+
+#[test]
+fn importing_a_code_then_winning_does_not_unlock() {
+    let mut w = world();
+    let code = w.export_level_code();
+    w.import_level_code(&code).expect("valid code");
+    assert!(!w.is_campaign_board());
+    assert_eq!(win_and_unlock(&mut w), 0);
+}
+
+#[test]
+fn campaign_clear_unlocks_next_sector_and_is_capped() {
+    let lv = levels();
+    let mut w = world();
+    assert_eq!(win_and_unlock(&mut w), 1);
+
+    w.load_level(lv.len() - 1, &lv);
+    assert_eq!(w.max_unlocked_level, 1, "loading must not unlock");
+    assert_eq!(win_and_unlock(&mut w), lv.len() - 1);
+}

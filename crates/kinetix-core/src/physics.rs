@@ -466,6 +466,10 @@ pub struct GameWorld {
     pub score: u64,
     pub high_score: u64,
     pub max_unlocked_level: usize,
+    /// True only while the board comes straight from a campaign sector; editing or importing
+    /// turns it into a custom board, which can never unlock campaign progress.
+    pub(crate) campaign_board: bool,
+    level_count: usize,
     pub lives: u32,
     pub combo: u32,
     pub combo_timer: f32,
@@ -500,6 +504,8 @@ impl GameWorld {
             score: 0,
             high_score: 0,
             max_unlocked_level: 0,
+            campaign_board: false,
+            level_count: levels.len(),
             lives: config.gameplay.initial_lives,
             combo: 0,
             combo_timer: 0.0,
@@ -542,9 +548,20 @@ impl GameWorld {
             return;
         }
         self.current_level_idx = idx % levels.len();
-        self.max_unlocked_level = self.max_unlocked_level.max(self.current_level_idx);
         let level = &levels[self.current_level_idx];
         self.load_from_rows(&level.rows, level.boss, level.world);
+        self.campaign_board = true;
+    }
+
+    /// True when the current board is an untouched campaign sector.
+    pub fn is_campaign_board(&self) -> bool {
+        self.campaign_board
+    }
+
+    /// Removes every brick (editor clear); the board stops counting as a campaign sector.
+    pub fn clear_bricks(&mut self) {
+        self.bricks.clear();
+        self.campaign_board = false;
     }
 
     pub fn load_from_rows(&mut self, rows: &[String], has_boss: bool, world_tier: usize) {
@@ -670,6 +687,7 @@ impl GameWorld {
     }
 
     pub fn paint_brick_at(&mut self, world_x: f32, world_y: f32, kind: Option<BrickKind>) {
+        self.campaign_board = false;
         let grid = BrickGrid::new(&self.config.arena, EDITOR_COLS);
         let Some((c_idx, r_idx)) = grid.cell_at(world_x, world_y, EDITOR_ROWS) else {
             return;
@@ -846,7 +864,11 @@ impl GameWorld {
         let boss_done = self.boss.is_none();
         if bricks_done && boss_done {
             self.status = SessionStatus::Victory;
-            self.max_unlocked_level = self.max_unlocked_level.max(self.current_level_idx + 1);
+            if self.campaign_board {
+                let last_level = self.level_count.saturating_sub(1);
+                let unlocked = (self.current_level_idx + 1).min(last_level);
+                self.max_unlocked_level = self.max_unlocked_level.max(unlocked);
+            }
         }
     }
 
