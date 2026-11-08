@@ -16,6 +16,18 @@
 
 //! Player progress persistence: browser storage on the web, a JSON file on native builds.
 
+/// Decides whether a new high score must be saved now: it has to exceed the last saved value
+/// and at least `interval_sec` must have elapsed since the previous save (pure, testable).
+pub fn high_score_save_due(
+    high_score: u64,
+    last_saved: u64,
+    now_sec: f64,
+    last_save_sec: f64,
+    interval_sec: f64,
+) -> bool {
+    high_score > last_saved && now_sec - last_save_sec >= interval_sec
+}
+
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -496,5 +508,23 @@ mod native {
                 (3, 0, 0, false)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::high_score_save_due;
+
+    #[test]
+    fn no_save_without_a_new_high_score() {
+        assert!(!high_score_save_due(100, 100, 50.0, 0.0, 5.0));
+        assert!(!high_score_save_due(90, 100, 50.0, 0.0, 5.0));
+    }
+
+    #[test]
+    fn new_high_score_is_throttled_by_the_interval() {
+        assert!(!high_score_save_due(200, 100, 12.0, 10.0, 5.0));
+        assert!(high_score_save_due(200, 100, 15.0, 10.0, 5.0));
+        assert!(high_score_save_due(200, 100, 99.0, 10.0, 5.0));
     }
 }

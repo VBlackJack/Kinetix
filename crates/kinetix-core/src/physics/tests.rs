@@ -513,7 +513,7 @@ fn boss_kill_points_use_the_configured_multiplier() {
     assert!(w.boss.is_none());
     assert!(events.iter().any(|e| matches!(
         e,
-        GameEvent::BrickHit { destroyed: true, points, .. } if *points == expected
+        GameEvent::BrickHit { destroyed: true, points, multiplier: NO_MULTIPLIER, .. } if *points == expected
     )));
     assert_eq!(w.score, expected);
 }
@@ -613,4 +613,50 @@ fn campaign_clear_unlocks_next_sector_and_is_capped() {
     w.load_level(lv.len() - 1, &lv);
     assert_eq!(w.max_unlocked_level, 1, "loading must not unlock");
     assert_eq!(win_and_unlock(&mut w), lv.len() - 1);
+}
+
+#[test]
+fn combo_multiplier_steps_and_caps() {
+    assert_eq!(combo_multiplier(0, 5, 4), NO_MULTIPLIER);
+    assert_eq!(combo_multiplier(4, 5, 4), NO_MULTIPLIER);
+    assert_eq!(combo_multiplier(5, 5, 4), 2);
+    assert_eq!(combo_multiplier(100, 5, 4), 4);
+    // A zero step must not divide by zero.
+    assert_eq!(combo_multiplier(3, 0, 10), 4);
+}
+
+#[test]
+fn brick_hit_reports_the_combo_multiplier_used_for_the_award() {
+    let mut w = empty_world(960.0, 600.0, 0.0, -1.0);
+    let gp = w.config.gameplay.clone();
+    w.combo = gp.combo_step * 2;
+    w.bricks.push(brick(500.0, 300.0, standard(1, 1, 0)));
+    let mut events = Vec::new();
+    assert!(w.damage_brick(0, false, &mut events));
+    let expected = combo_multiplier(w.combo, gp.combo_step, gp.combo_max_mult);
+    let Some(GameEvent::BrickHit {
+        points, multiplier, ..
+    }) = events.last()
+    else {
+        panic!("expected a BrickHit");
+    };
+    assert_eq!(*multiplier, expected);
+    assert!(*multiplier > NO_MULTIPLIER);
+    assert_eq!(*points, gp.base_brick_score * u64::from(expected));
+}
+
+#[test]
+fn non_destroying_hits_report_no_multiplier() {
+    let mut w = empty_world(960.0, 600.0, 0.0, -1.0);
+    w.combo = 50;
+    w.bricks.push(brick(500.0, 300.0, standard(2, 2, 0)));
+    let mut events = Vec::new();
+    assert!(!w.damage_brick(0, false, &mut events));
+    assert!(matches!(
+        events.last(),
+        Some(GameEvent::BrickHit {
+            multiplier: NO_MULTIPLIER,
+            ..
+        })
+    ));
 }

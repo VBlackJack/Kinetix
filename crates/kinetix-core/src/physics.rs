@@ -393,6 +393,15 @@ pub struct Ball {
     pub trail: Vec<(f32, f32)>,
 }
 
+/// Multiplier reported when no combo bonus applies.
+pub const NO_MULTIPLIER: u32 = 1;
+
+/// Single source of the combo formula: one extra multiplier level per `step` combo hits,
+/// capped at `max_mult`.
+pub fn combo_multiplier(combo: u32, step: u32, max_mult: u32) -> u32 {
+    (NO_MULTIPLIER + combo / step.max(1)).min(max_mult)
+}
+
 #[derive(Debug, Clone)]
 pub enum GameEvent {
     BrickHit {
@@ -402,6 +411,8 @@ pub enum GameEvent {
         destroyed: bool,
         /// Score awarded by this hit: 0 unless the brick was destroyed.
         points: u64,
+        /// Combo multiplier applied to `points` (`NO_MULTIPLIER` when none applies).
+        multiplier: u32,
     },
     Explosion {
         x: f32,
@@ -1078,6 +1089,7 @@ impl GameWorld {
                             color_idx: BOSS_HIT_COLOR_IDX,
                             destroyed,
                             points,
+                            multiplier: NO_MULTIPLIER,
                         });
                         if destroyed {
                             self.boss = None;
@@ -1204,6 +1216,7 @@ impl GameWorld {
                     color_idx: SOLID_HIT_COLOR_IDX,
                     destroyed: false,
                     points: 0,
+                    multiplier: NO_MULTIPLIER,
                 });
                 false
             }
@@ -1227,6 +1240,7 @@ impl GameWorld {
                         color_idx: GHOST_HIT_COLOR_IDX,
                         destroyed: false,
                         points: 0,
+                        multiplier: NO_MULTIPLIER,
                     });
                     false
                 }
@@ -1246,6 +1260,7 @@ impl GameWorld {
                         color_idx,
                         destroyed: false,
                         points: 0,
+                        multiplier: NO_MULTIPLIER,
                     });
                     false
                 }
@@ -1273,6 +1288,7 @@ impl GameWorld {
                         color_idx,
                         destroyed: false,
                         points: 0,
+                        multiplier: NO_MULTIPLIER,
                     });
                     false
                 }
@@ -1290,8 +1306,8 @@ impl GameWorld {
         let gp = &self.config.gameplay;
         self.combo += 1;
         self.combo_timer = gp.combo_timeout_sec;
-        let mult = u64::from((1 + self.combo / gp.combo_step.max(1)).min(gp.combo_max_mult));
-        let points = gp.base_brick_score * mult;
+        let multiplier = combo_multiplier(self.combo, gp.combo_step, gp.combo_max_mult);
+        let points = gp.base_brick_score * u64::from(multiplier);
         self.score += points;
         self.high_score = self.high_score.max(self.score);
 
@@ -1301,6 +1317,7 @@ impl GameWorld {
             color_idx,
             destroyed: true,
             points,
+            multiplier,
         });
 
         let gp = &self.config.gameplay;

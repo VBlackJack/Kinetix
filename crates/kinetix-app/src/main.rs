@@ -28,7 +28,7 @@ use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
 use kinetix_core::physics::{BrickKind, GameEvent, GameWorld, SessionStatus};
 use macroquad::prelude::*;
-use persistence::{load_progress, save_progress};
+use persistence::{high_score_save_due, load_progress, save_progress};
 use std::collections::BTreeSet;
 use tuning::*;
 use vfx::{
@@ -230,6 +230,161 @@ fn step_unlocked_world(
     from
 }
 
+/// Tracks the last persisted high score and save time to throttle automatic saves.
+struct SaveTracker {
+    last_saved_high_score: u64,
+    last_save_sec: f64,
+}
+
+impl SaveTracker {
+    fn new(saved_high_score: u64) -> Self {
+        Self {
+            last_saved_high_score: saved_high_score,
+            last_save_sec: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Saves unconditionally and records the saved high score and time.
+    fn persist(&mut self, world: &GameWorld, theme_idx: usize, lang_fr: bool, now_sec: f64) {
+        save_progress(
+            world.high_score,
+            world.max_unlocked_level,
+            theme_idx,
+            lang_fr,
+        );
+        self.last_saved_high_score = world.high_score;
+        self.last_save_sec = now_sec;
+    }
+
+    /// Saves only when a new high score is due according to the throttle.
+    fn persist_if_due(&mut self, world: &GameWorld, theme_idx: usize, lang_fr: bool, now_sec: f64) {
+        if high_score_save_due(
+            world.high_score,
+            self.last_saved_high_score,
+            now_sec,
+            self.last_save_sec,
+            HIGH_SCORE_SAVE_INTERVAL_SEC,
+        ) {
+            self.persist(world, theme_idx, lang_fr, now_sec);
+        }
+    }
+}
+
+/// Replaces the count placeholder of a locale string with the number of worlds.
+fn substitute_count(template: &str, count: usize) -> String {
+    template.replace(COUNT_PLACEHOLDER, &count.to_string())
+}
+
+/// Text of a brick score popup: the points, plus the combo multiplier when it exceeds 1.
+fn format_score_popup(points: u64, multiplier: u32) -> String {
+    if multiplier > POPUP_MULTIPLIER_HIDDEN_MAX {
+        format!(
+            "{POPUP_POINTS_PREFIX}{points}{POPUP_MULTIPLIER_OPEN}{multiplier}{POPUP_MULTIPLIER_CLOSE}"
+        )
+    } else {
+        format!("{POPUP_POINTS_PREFIX}{points}")
+    }
+}
+
+/// Geometry of the title menu world list, derived from the number of worlds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorldRowLayout {
+    step: f32,
+    pill_h: f32,
+    text_dy: f32,
+    text_size: u16,
+}
+
+/// Fits `count` world rows between `MENU_WORLD_LIST_Y` and `MENU_WORLD_LIST_BOTTOM_Y`. While
+/// they fit at full size the rows keep their reference look; past that the pills shrink down to
+/// `MENU_WORLD_PILL_MIN_H` and the gaps absorb the remainder.
+fn world_row_layout(count: usize) -> WorldRowLayout {
+    let count = count.min(WORLD_SELECT_KEYS.len());
+    let n = count.max(1) as f32;
+    let available = MENU_WORLD_LIST_BOTTOM_Y - MENU_WORLD_LIST_Y;
+    let full_needed = n * MENU_WORLD_PILL_H + (n - 1.0) * MENU_WORLD_ROW_GAP;
+    let pill_h = if full_needed <= available {
+        MENU_WORLD_PILL_H
+    } else {
+        let scale = available / full_needed;
+        (MENU_WORLD_PILL_H * scale).clamp(MENU_WORLD_PILL_MIN_H, MENU_WORLD_PILL_H)
+    };
+    let gap = if count <= 1 {
+        MENU_WORLD_ROW_GAP
+    } else {
+        ((available - n * pill_h) / (n - 1.0)).clamp(0.0, MENU_WORLD_ROW_GAP)
+    };
+    let ratio = pill_h / MENU_WORLD_PILL_H;
+    let text_size = ((f32::from(MENU_WORLD_TEXT_SIZE) * ratio).round() as u16)
+        .clamp(MENU_WORLD_TEXT_SIZE_FLOOR, MENU_WORLD_TEXT_SIZE);
+    WorldRowLayout {
+        step: pill_h + gap,
+        pill_h,
+        text_dy: MENU_WORLD_TEXT_DY * ratio,
+        text_size,
+    }
+}
+
+/// Seeds the virtual cursor X when the grab starts. A session that is already running keeps the
+/// paddle where it is (the accumulated raw mouse position has drifted from the window); only a
+/// session starting from the menu seeds from the real cursor.
+fn seed_virtual_cursor_x(
+    session_live: bool,
+    paddle_screen_x: f32,
+    mouse_x: f32,
+    min_x: f32,
+    max_x: f32,
+) -> f32 {
+    let source = if session_live {
+        paddle_screen_x
+    } else {
+        mouse_x
+    };
+    source.clamp(min_x, max_x)
+}
+
+/// True when a single-frame raw delta is larger than the whole on-screen arena: the device
+/// reports absolute coordinates (remote desktop, VM integration, tablet) and the grab is unusable.
+fn absolute_input_detected(delta: f32, extent: f32) -> bool {
+    delta.abs() > extent
+}
+
+/// True when the window lost focus while the game is being played, so it must pause.
+#[cfg(not(target_arch = "wasm32"))]
+fn focus_loss_pauses(in_game: bool, playing: bool, focus_lost: bool) -> bool {
+    in_game && playing && focus_lost
+}
+
+/// Records window focus loss events forwarded by macroquad (native builds).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct FocusWatcher {
+    lost: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl miniquad::EventHandler for FocusWatcher {
+    fn update(&mut self) {}
+    fn draw(&mut self) {}
+    fn window_minimized_event(&mut self) {
+        self.lost = true;
+    }
+}
+
+/// Moves the virtual cursor X by a raw mouse delta, clamped to the on-screen arena extent.
+fn advance_virtual_cursor_x(current: f32, delta: f32, min_x: f32, max_x: f32) -> f32 {
+    (current + delta).clamp(min_x, max_x)
+}
+
+/// Confines the OS cursor to the window on native builds. The web build uses its own pointer
+/// lock (see `set_pointer_lock`); macroquad's grab would request a second one there.
+fn set_native_cursor_grab(grab: bool) {
+    #[cfg(not(target_arch = "wasm32"))]
+    set_cursor_grab(grab);
+    #[cfg(target_arch = "wasm32")]
+    let _ = grab;
+}
+
 /// Input gestures that will make the pointer lock wanted from the given state (see
 /// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
 fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
@@ -277,7 +432,7 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
         .iter()
         .copied()
         .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
-        .chain(MENU_WORLD_TEXT_SIZE_MIN..=MENU_WORLD_TEXT_SIZE)
+        .chain(MENU_WORLD_TEXT_SIZE_FLOOR..=MENU_WORLD_TEXT_SIZE)
         .map(physical)
         .collect();
     for size in sizes {
@@ -388,6 +543,20 @@ async fn main() {
     world.high_score = saved_hs;
     world.max_unlocked_level = saved_unlocked.min(level_pack.levels.len().saturating_sub(1));
 
+    #[cfg(not(target_arch = "wasm32"))]
+    prevent_quit();
+    let mut save_tracker = SaveTracker::new(saved_hs);
+    let mut last_mouse_x: f32 = 0.0;
+    let mut virtual_cursor_x: f32 = 0.0;
+    // True once a grab has run in the current game session (reset when leaving the game screen).
+    let mut grab_session_live = false;
+    // Set when the pointer reports absolute coordinates: the grab is dropped for the process.
+    let mut grab_disabled = false;
+    #[cfg(not(target_arch = "wasm32"))]
+    let focus_subscriber = macroquad::input::utils::register_input_subscriber();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut focus_watcher = FocusWatcher::default();
+
     let mut screen = AppScreen::TitleMenu;
     let worlds = build_worlds(&level_pack.levels);
     let mut selected_world_pos: usize = 0;
@@ -414,8 +583,15 @@ async fn main() {
     };
 
     loop {
+        let now_sec = get_time();
+        let time = now_sec as f32;
+        #[cfg(not(target_arch = "wasm32"))]
+        if is_quit_requested() {
+            set_native_cursor_grab(false);
+            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+            break;
+        }
         let raw_dt = get_frame_time().min(MAX_FRAME_DT);
-        let time = get_time() as f32;
         if hit_stop_timer > 0.0 {
             hit_stop_timer = (hit_stop_timer - raw_dt).max(0.0);
         }
@@ -440,22 +616,12 @@ async fn main() {
         // Global hotkeys
         if is_key_pressed(KeyCode::F1) {
             theme_idx = (theme_idx + 1) % theme_reg.themes.len();
-            save_progress(
-                world.high_score,
-                world.max_unlocked_level,
-                theme_idx,
-                lang == Language::Fr,
-            );
+            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
         }
         if is_key_pressed(KeyCode::F2) {
             lang = lang.next();
             set_document_lang(lang == Language::Fr);
-            save_progress(
-                world.high_score,
-                world.max_unlocked_level,
-                theme_idx,
-                lang == Language::Fr,
-            );
+            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
         }
         if LEVEL_CHEAT_ENABLED && is_key_pressed(KeyCode::F3) {
             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
@@ -491,7 +657,31 @@ async fn main() {
         let (view_scale, view_ox, view_oy) =
             letterbox(screen_width(), screen_height(), arena_w, arena_h);
         let (mx, my) = mouse_position();
+        // With the native cursor grab, `mouse_position` accumulates raw deltas without bound: the
+        // paddle follows a virtual X clamped to the arena instead. The web build is untouched.
+        let cursor_min_x = view_ox;
+        let cursor_max_x = view_ox + arena_w * view_scale;
+        let mut native_grab_active =
+            cfg!(not(target_arch = "wasm32")) && last_lock_wanted && !grab_disabled;
+        if native_grab_active {
+            let delta = (mx - last_mouse_x) * NATIVE_RAW_MOUSE_SENSITIVITY;
+            if absolute_input_detected(delta, cursor_max_x - cursor_min_x) {
+                grab_disabled = true;
+                native_grab_active = false;
+                set_native_cursor_grab(false);
+            } else {
+                virtual_cursor_x =
+                    advance_virtual_cursor_x(virtual_cursor_x, delta, cursor_min_x, cursor_max_x);
+            }
+        }
+        last_mouse_x = mx;
+        let paddle_screen_x = if native_grab_active {
+            virtual_cursor_x
+        } else {
+            mx
+        };
         let (world_mx, world_my) = screen_to_arena(mx, my, view_scale, view_ox, view_oy);
+        let (paddle_mx, _) = screen_to_arena(paddle_screen_x, my, view_scale, view_ox, view_oy);
 
         // The browser can release the lock on its own (Esc, Alt-Tab, focus loss): pause then.
         // Only an active -> inactive transition counts (lock_was_active is false during the async
@@ -509,6 +699,27 @@ async fn main() {
         if last_pointer_bounds != Some(bounds) {
             set_pointer_bounds(bounds.0, bounds.1);
             last_pointer_bounds = Some(bounds);
+        }
+
+        // Native builds have no pointer-lock release: pause when the window loses focus so the
+        // grab is dropped and the cursor comes back.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            macroquad::input::utils::repeat_all_miniquad_input(
+                &mut focus_watcher,
+                focus_subscriber,
+            );
+            let focus_lost = std::mem::take(&mut focus_watcher.lost);
+            if focus_loss_pauses(
+                screen == AppScreen::InGame,
+                world.status == SessionStatus::Playing,
+                focus_lost,
+            ) {
+                world.status = SessionStatus::Paused;
+            }
+        }
+        if screen != AppScreen::InGame {
+            grab_session_live = false;
         }
 
         match screen {
@@ -662,7 +873,7 @@ async fn main() {
                     world.load_level(cur, &level_pack.levels);
                 }
 
-                world.set_paddle_target(world_mx);
+                world.set_paddle_target(paddle_mx);
 
                 let kb_speed = KEYBOARD_PADDLE_SPEED * dt;
                 if is_key_down(KeyCode::Left) || is_key_down(KeyCode::A) || is_key_down(KeyCode::Q)
@@ -700,20 +911,10 @@ async fn main() {
                         SessionStatus::Victory => {
                             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
                             world.load_level(next_lvl, &level_pack.levels);
-                            save_progress(
-                                world.high_score,
-                                world.max_unlocked_level,
-                                theme_idx,
-                                lang == Language::Fr,
-                            );
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                         }
                         SessionStatus::GameOver => {
-                            save_progress(
-                                world.high_score,
-                                world.max_unlocked_level,
-                                theme_idx,
-                                lang == Language::Fr,
-                            );
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                             world.lives = world.config.gameplay.initial_lives;
                             world.score = 0;
                             world.load_level(world.current_level_idx, &level_pack.levels);
@@ -725,15 +926,13 @@ async fn main() {
                 let prev_status = world.status;
                 world.update(dt, &mut events);
                 if prev_status == SessionStatus::Playing && world.status != SessionStatus::Playing {
-                    save_progress(
-                        world.high_score,
-                        world.max_unlocked_level,
-                        theme_idx,
-                        lang == Language::Fr,
-                    );
+                    save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                 }
             }
         }
+
+        // A new high score is persisted without waiting for pause / game over, throttled.
+        save_tracker.persist_if_due(&world, theme_idx, lang == Language::Fr, now_sec);
 
         // Lock the pointer exactly while the player is actually playing; evaluated after input and
         // world update so a start / resume takes effect in the same frame.
@@ -741,6 +940,18 @@ async fn main() {
         if lock_wanted != last_lock_wanted {
             set_pointer_lock(lock_wanted);
             show_mouse(!lock_wanted);
+            set_native_cursor_grab(lock_wanted && !grab_disabled);
+            if lock_wanted {
+                let paddle_screen = view_ox + world.paddle_x * view_scale;
+                virtual_cursor_x = seed_virtual_cursor_x(
+                    grab_session_live,
+                    paddle_screen,
+                    mx,
+                    cursor_min_x,
+                    cursor_max_x,
+                );
+                grab_session_live = true;
+            }
             last_lock_wanted = lock_wanted;
         }
         lock_was_active = lock_wanted && pointer_lock_active();
@@ -768,6 +979,7 @@ async fn main() {
                     color_idx,
                     destroyed,
                     points,
+                    multiplier,
                 } => {
                     sfx.play_brick(world.combo);
                     warp_grid.apply_impulse(x, y, 165.0, if destroyed { 320.0 } else { 140.0 });
@@ -821,7 +1033,7 @@ async fn main() {
                         popups.push(FloatingPopup {
                             x: x + BRICK_POPUP_DX,
                             y,
-                            text: format!("+{points}"),
+                            text: format_score_popup(points, multiplier),
                             life: BRICK_POPUP_LIFE,
                             color: base_col,
                         });
@@ -1209,17 +1421,22 @@ fn draw_title_menu(
         acc,
     );
 
+    let campaigns_line = substitute_count(
+        i18n.t("menu.campaigns"),
+        worlds.len().clamp(1, WORLD_SELECT_KEYS.len()),
+    );
     txt(
         font,
-        i18n.t("menu.campaigns"),
+        &campaigns_line,
         MENU_PANEL_X + MENU_LABEL_DX,
         MENU_CAMPAIGNS_Y,
         MENU_LABEL_SIZE,
         pri,
     );
-    for (pos, &(world_id, first_idx)) in worlds.iter().enumerate() {
+    let row_layout = world_row_layout(worlds.len());
+    for (pos, &(world_id, first_idx)) in worlds.iter().take(WORLD_SELECT_KEYS.len()).enumerate() {
         let unlocked = is_world_unlocked(first_idx, world.max_unlocked_level);
-        let y = MENU_WORLD_LIST_Y + pos as f32 * MENU_WORLD_ROW_STEP;
+        let y = MENU_WORLD_LIST_Y + pos as f32 * row_layout.step;
         let is_sel = selected_world_pos == pos;
         let pill_bg = if is_sel {
             Color::new(acc.r, acc.g, acc.b, MENU_PILL_SELECTED_ALPHA)
@@ -1230,8 +1447,8 @@ fn draw_title_menu(
             MENU_PANEL_X + MENU_WORLD_PILL_DX,
             y,
             MENU_WORLD_PILL_W,
-            MENU_WORLD_PILL_H,
-            MENU_WORLD_PILL_RADIUS,
+            row_layout.pill_h,
+            MENU_WORLD_PILL_RADIUS.min(row_layout.pill_h * 0.5),
             pill_bg,
         );
         let base_col = if is_sel { acc } else { pri };
@@ -1254,20 +1471,20 @@ fn draw_title_menu(
         let lock_w = if unlocked {
             0.0
         } else {
-            measure_text(lock_label, Some(font), MENU_WORLD_TEXT_SIZE, 1.0).width + MENU_LOCK_GAP
+            measure_text(lock_label, Some(font), row_layout.text_size, 1.0).width + MENU_LOCK_GAP
         };
         let text_limit = pill_right - MENU_LOCK_LABEL_PAD - lock_w - text_x;
         let row_size = fit_font_size(
             |size| measure_text(&row_text, Some(font), size, 1.0).width,
-            MENU_WORLD_TEXT_SIZE,
-            MENU_WORLD_TEXT_SIZE_MIN,
+            row_layout.text_size,
+            MENU_WORLD_TEXT_SIZE_MIN.min(row_layout.text_size),
             text_limit,
         );
         txt(
             font,
             &row_text,
             text_x,
-            y + MENU_WORLD_TEXT_DY,
+            y + row_layout.text_dy,
             row_size,
             col,
         );
@@ -1277,8 +1494,8 @@ fn draw_title_menu(
                 font,
                 lock_label,
                 pill_right - MENU_LOCK_LABEL_PAD - label_w,
-                y + MENU_WORLD_TEXT_DY,
-                MENU_WORLD_TEXT_SIZE,
+                y + row_layout.text_dy,
+                row_layout.text_size,
                 col,
             );
         }
@@ -2162,6 +2379,109 @@ fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_input_is_detected_by_oversized_deltas() {
+        assert!(!absolute_input_detected(120.0, 1000.0));
+        assert!(!absolute_input_detected(-1000.0, 1000.0));
+        assert!(absolute_input_detected(1500.0, 1000.0));
+        assert!(absolute_input_detected(-1500.0, 1000.0));
+    }
+
+    #[test]
+    fn focus_loss_pauses_only_while_playing_in_game() {
+        assert!(focus_loss_pauses(true, true, true));
+        assert!(!focus_loss_pauses(true, true, false));
+        assert!(!focus_loss_pauses(true, false, true));
+        assert!(!focus_loss_pauses(false, true, true));
+    }
+
+    #[test]
+    fn nine_world_rows_fit_and_extra_worlds_are_capped() {
+        let l = world_row_layout(WORLD_SELECT_KEYS.len());
+        let last_bottom =
+            MENU_WORLD_LIST_Y + (WORLD_SELECT_KEYS.len() - 1) as f32 * l.step + l.pill_h;
+        assert!(last_bottom <= MENU_WORLD_LIST_BOTTOM_Y + 0.01);
+        assert!(l.text_size <= l.pill_h as u16);
+        assert_eq!(world_row_layout(40), l);
+    }
+
+    #[test]
+    fn count_placeholder_is_substituted() {
+        assert_eq!(substitute_count("keys [1-{count}]", 5), "keys [1-5]");
+        assert_eq!(substitute_count("no placeholder", 5), "no placeholder");
+    }
+
+    #[test]
+    fn locale_campaign_strings_use_the_placeholder() {
+        for raw in [RAW_EN, RAW_FR] {
+            let catalog = I18nCatalog::from_json_str(raw).unwrap();
+            assert!(catalog.t("menu.campaigns").contains(COUNT_PLACEHOLDER));
+        }
+    }
+
+    #[test]
+    fn score_popup_shows_multiplier_only_above_one() {
+        assert_eq!(format_score_popup(150, 1), "+150");
+        assert_eq!(format_score_popup(300, 2), "+300 (x2)");
+    }
+
+    #[test]
+    fn world_rows_keep_reference_look_for_three_worlds() {
+        let l = world_row_layout(3);
+        assert_eq!(l.pill_h, MENU_WORLD_PILL_H);
+        assert_eq!(l.step, MENU_WORLD_PILL_H + MENU_WORLD_ROW_GAP);
+        assert_eq!(l.text_size, MENU_WORLD_TEXT_SIZE);
+        assert_eq!(l.text_dy, MENU_WORLD_TEXT_DY);
+    }
+
+    #[test]
+    fn world_rows_fit_above_the_sector_line() {
+        for count in 1..=WORLD_SELECT_KEYS.len() {
+            let l = world_row_layout(count);
+            let last_bottom = MENU_WORLD_LIST_Y + (count - 1) as f32 * l.step + l.pill_h;
+            assert!(
+                last_bottom <= MENU_WORLD_LIST_BOTTOM_Y + 0.01,
+                "count {count}"
+            );
+            assert!(last_bottom < MENU_SECTOR_Y);
+            assert!(l.pill_h >= MENU_WORLD_PILL_MIN_H);
+            assert!(l.text_size >= MENU_WORLD_TEXT_SIZE_FLOOR);
+        }
+        assert!(world_row_layout(6).pill_h < MENU_WORLD_PILL_H);
+        assert_eq!(world_row_layout(0), world_row_layout(1));
+    }
+
+    #[test]
+    fn virtual_cursor_seed_and_advance_are_clamped() {
+        // New session: seeded from the mouse. Running session: kept at the paddle.
+        assert_eq!(
+            seed_virtual_cursor_x(false, 700.0, 500.0, 100.0, 900.0),
+            500.0
+        );
+        assert_eq!(
+            seed_virtual_cursor_x(false, 700.0, -40.0, 100.0, 900.0),
+            100.0
+        );
+        assert_eq!(
+            seed_virtual_cursor_x(false, 700.0, 5000.0, 100.0, 900.0),
+            900.0
+        );
+        assert_eq!(
+            seed_virtual_cursor_x(true, 700.0, 5000.0, 100.0, 900.0),
+            700.0
+        );
+        assert_eq!(
+            seed_virtual_cursor_x(true, 50.0, 500.0, 100.0, 900.0),
+            100.0
+        );
+        assert_eq!(advance_virtual_cursor_x(500.0, 30.0, 100.0, 900.0), 530.0);
+        assert_eq!(
+            advance_virtual_cursor_x(500.0, -9999.0, 100.0, 900.0),
+            100.0
+        );
+        assert_eq!(advance_virtual_cursor_x(500.0, 9999.0, 100.0, 900.0), 900.0);
+    }
 
     const ARENA_W: f32 = 1920.0;
     const ARENA_H: f32 = 1080.0;

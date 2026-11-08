@@ -47,7 +47,24 @@ pub const MAX_ARCS: usize = 32;
 pub const MAX_POPUPS: usize = 48;
 pub const MAX_EVENTS: usize = 64;
 
+// ---- Persistence ----
+/// Minimum delay between two automatic saves triggered by a new high score.
+pub const HIGH_SCORE_SAVE_INTERVAL_SEC: f64 = 5.0;
+
+// ---- Score popups ----
+pub const POPUP_POINTS_PREFIX: &str = "+";
+pub const POPUP_MULTIPLIER_OPEN: &str = " (x";
+pub const POPUP_MULTIPLIER_CLOSE: &str = ")";
+/// Combo multiplier at or below which the popup shows the points only.
+pub const POPUP_MULTIPLIER_HIDDEN_MAX: u32 = 1;
+
+// ---- Menu placeholders ----
+/// Placeholder replaced by the number of selectable worlds in locale strings.
+pub const COUNT_PLACEHOLDER: &str = "{count}";
+
 // ---- Game feel ----
+/// Multiplier applied to the raw mouse delta while the native cursor grab is active.
+pub const NATIVE_RAW_MOUSE_SENSITIVITY: f32 = 1.0;
 /// Keyboard paddle speed, in arena units per second.
 pub const KEYBOARD_PADDLE_SPEED: f32 = 1350.0;
 /// Upper bound of the screen shake amplitude. Also the margin the backdrop extends past the
@@ -165,7 +182,14 @@ pub const MENU_LABEL_DX: f32 = 250.0;
 pub const MENU_CAMPAIGNS_Y: f32 = 445.0;
 pub const MENU_LABEL_SIZE: u16 = 28;
 pub const MENU_WORLD_LIST_Y: f32 = 475.0;
-pub const MENU_WORLD_ROW_STEP: f32 = 68.0;
+/// Vertical gap between two world rows at full size (row step 68 = pill height 54 + gap 14).
+pub const MENU_WORLD_ROW_GAP: f32 = 14.0;
+/// Lowest y a world row may reach; keeps the list clear of the sector line below it.
+pub const MENU_WORLD_LIST_BOTTOM_Y: f32 = 705.0;
+/// Smallest pill height the world list shrinks to when there are many worlds.
+pub const MENU_WORLD_PILL_MIN_H: f32 = 24.0;
+/// Smallest text size of a world row when the pills shrink with the world count.
+pub const MENU_WORLD_TEXT_SIZE_FLOOR: u16 = 16;
 pub const MENU_WORLD_PILL_DX: f32 = 200.0;
 pub const MENU_WORLD_PILL_W: f32 = 900.0;
 pub const MENU_WORLD_PILL_H: f32 = 54.0;
