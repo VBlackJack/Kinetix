@@ -2,7 +2,7 @@
 
 > [Read in English](README.md)
 
-**KINETIX** est un casse-briques moderne haute vélocité écrit en Rust, conçu pour dépasser les références du genre (*DX-Ball 2*, *Shatter*, *Ricochet*) avec une physique déterministe, des moteurs de rendu commutables à chaud et une architecture multi-plateforme (WebAssembly, Windows, Linux, Android).
+**KINETIX** est un casse-briques moderne haute vélocité écrit en Rust, avec une physique déterministe, des moteurs de rendu commutables à chaud et une architecture multi-plateforme (WebAssembly, Windows, Linux, Android).
 
 ## Architecture
 

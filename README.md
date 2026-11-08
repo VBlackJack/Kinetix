@@ -2,7 +2,7 @@
 
 > [Lire en francais](README.fr.md)
 
-**KINETIX** is a modern, high-velocity brick breaker written in Rust, designed to surpass classic arcade references (*DX-Ball 2*, *Shatter*, *Ricochet*) with deterministic physics, hot-swappable visual renderers, and multi-platform targets (WebAssembly, Windows, Linux, Android).
+**KINETIX** is a modern, high-velocity brick breaker written in Rust, with deterministic physics, hot-swappable visual renderers, and multi-platform targets (WebAssembly, Windows, Linux, Android).
 
 ## Architecture
 
