@@ -17,6 +17,8 @@
 //! Named layout anchors and game-feel tuning values. Layout values are in arena units
 //! (the 1920x1080 reference space); text inside a panel is positioned as `PANEL_X + offset`.
 
+use macroquad::prelude::KeyCode;
+
 // ---- Window ----
 pub const WINDOW_TITLE: &str = "KINETIX";
 pub const WINDOW_WIDTH: i32 = 1920;
@@ -342,3 +344,67 @@ pub const BUMPER_RING_RADIUS: f32 = 9.0;
 pub const BUMPER_RING_PULSE_AMP: f32 = 3.5;
 pub const BUMPER_RING_PULSE_RATE: f32 = 11.0;
 pub const BUMPER_RING_THICKNESS: f32 = 2.5;
+
+// ---- Hidden developer mode ----
+/// Letter key of the Ctrl+Shift toggle chord.
+pub const DEV_TOGGLE_KEY: KeyCode = KeyCode::D;
+/// Key that shows or hides the developer key help.
+pub const DEV_HELP_KEY: KeyCode = KeyCode::F9;
+/// Keys that select the previous / next power-up.
+pub const DEV_POWERUP_PREV_KEYS: [KeyCode; 2] = [KeyCode::LeftBracket, KeyCode::Up];
+pub const DEV_POWERUP_NEXT_KEYS: [KeyCode; 2] = [KeyCode::RightBracket, KeyCode::Down];
+/// Applies the selected power-up immediately, as a real pickup would.
+pub const DEV_APPLY_KEY: KeyCode = KeyCode::G;
+/// Drops the selected power-up as a falling capsule above the paddle.
+pub const DEV_DROP_KEY: KeyCode = KeyCode::H;
+/// Toggles the invulnerable ball loss.
+pub const DEV_INVULNERABLE_KEY: KeyCode = KeyCode::L;
+/// Clears the level instantly (counts as a developer win).
+pub const DEV_CLEAR_KEY: KeyCode = KeyCode::K;
+/// Level navigation while the mode is on (outside the title menu).
+pub const DEV_PREV_LEVEL_KEY: KeyCode = KeyCode::PageUp;
+pub const DEV_NEXT_LEVEL_KEY: KeyCode = KeyCode::PageDown;
+/// Digit keys of the sector number entry, with the character each one types.
+pub const DEV_DIGIT_KEYS: [(KeyCode, char); 10] = [
+    (KeyCode::Key0, '0'),
+    (KeyCode::Key1, '1'),
+    (KeyCode::Key2, '2'),
+    (KeyCode::Key3, '3'),
+    (KeyCode::Key4, '4'),
+    (KeyCode::Key5, '5'),
+    (KeyCode::Key6, '6'),
+    (KeyCode::Key7, '7'),
+    (KeyCode::Key8, '8'),
+    (KeyCode::Key9, '9'),
+];
+/// Maximum number of digits accepted in the sector number entry.
+pub const DEV_SECTOR_DIGITS_MAX: usize = 4;
+/// Placeholders of the developer locale strings.
+pub const DEV_NAME_PLACEHOLDER: &str = "{name}";
+pub const DEV_VALUE_PLACEHOLDER: &str = "{value}";
+pub const DEV_MAX_PLACEHOLDER: &str = "{max}";
+/// Vertical distance above the paddle at which a dropped capsule appears.
+pub const DEV_DROP_OFFSET_Y: f32 = 360.0;
+/// Developer panel layout (arena units): position, width, text sizes and line height.
+pub const DEV_PANEL_X: f32 = 48.0;
+pub const DEV_PANEL_Y: f32 = 150.0;
+pub const DEV_PANEL_W: f32 = 820.0;
+pub const DEV_PANEL_PAD: f32 = 16.0;
+pub const DEV_PANEL_RADIUS: f32 = 10.0;
+pub const DEV_PANEL_COLOR: [u8; 4] = [8, 10, 22, 215];
+pub const DEV_BADGE_SIZE: u16 = 30;
+pub const DEV_TEXT_SIZE: u16 = 22;
+pub const DEV_TEXT_SIZE_MIN: u16 = 14;
+pub const DEV_LINE_H: f32 = 30.0;
+/// Widest developer text line allowed inside the panel.
+pub const DEV_TEXT_MAX_W: f32 = DEV_PANEL_W - 2.0 * DEV_PANEL_PAD;
+/// Locale keys of the help lines, in display order.
+pub const DEV_HELP_KEYS: [&str; 7] = [
+    "dev.help.level",
+    "dev.help.step",
+    "dev.help.powerup_select",
+    "dev.help.powerup_apply",
+    "dev.help.helpers",
+    "dev.help.panel",
+    "dev.help.toggle",
+];

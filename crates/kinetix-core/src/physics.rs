@@ -45,7 +45,7 @@ const DEFAULT_SEED: u64 = 0x853C_49E6_748F_EA9B;
 const NONZERO_STATE_FALLBACK: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Maximum number of simultaneously falling capsules. The separation logic in `step_capsules`
 /// handles exactly two capsules, so this must stay at 2.
-const MAX_CAPSULES: usize = 2;
+pub const MAX_CAPSULES: usize = 2;
 /// Horizontal distance under which two falling capsules push each other apart.
 const CAPSULE_SEPARATION_DX: f32 = 210.0;
 /// Vertical distance under which two falling capsules push each other apart.
@@ -1461,7 +1461,7 @@ impl GameWorld {
     }
 
     /// Horizontal range in which a capsule centre may lie.
-    fn capsule_x_bounds(&self) -> (f32, f32) {
+    pub fn capsule_x_bounds(&self) -> (f32, f32) {
         let margin = self.config.gameplay.powerup_wall_margin;
         (
             self.config.arena.wall_side + margin,

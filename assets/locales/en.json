@@ -48,6 +48,32 @@
     "pause_hint": "[P / ESC] Pause",
     "restart_hint": "[R] Restart"
   },
+  "dev": {
+    "badge": "DEV",
+    "toast": {
+      "on": "DEV MODE ON (progress is not saved)",
+      "off": "DEV MODE OFF"
+    },
+    "level": {
+      "prompt": "Sector 1-{max}: {value}_"
+    },
+    "powerup": {
+      "selected": "Power-up: {name}"
+    },
+    "status": {
+      "invulnerable_on": "Invulnerable: ON",
+      "invulnerable_off": "Invulnerable: OFF"
+    },
+    "help": {
+      "level": "Digits + [Enter]: jump to sector  [Backspace] Edit  [Esc] Cancel",
+      "step": "[PgUp] / [PgDn]: previous / next sector",
+      "powerup_select": "[ [ ] / [ ] ] or [Up] / [Down]: select power-up",
+      "powerup_apply": "[G] Apply power-up  [H] Drop it as a capsule",
+      "helpers": "[L] Invulnerable ball  [K] Clear sector",
+      "panel": "[F9] Show / hide this help",
+      "toggle": "[Ctrl+Shift+D] Leave dev mode"
+    }
+  },
   "editor": {
     "banner": "SECTOR ARCHITECT (EDITOR MODE)",
     "instructions": "L-CLICK: Paint | R-CLICK: Erase | [1-6] Std [E] Expl [H] Steel [T] Portal [G] Ghost [V] Moving [U] Bumper [R] Regen | [X] Export [I] Import [C] Clear [F4] Play",
