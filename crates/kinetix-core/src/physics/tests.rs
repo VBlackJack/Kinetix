@@ -812,3 +812,55 @@ fn legacy_config_without_bumper_or_regen_fields_still_parses() {
     assert!(cfg.ball.bumper_boost_decay_sec > 0.0);
     assert!(cfg.gameplay.regen_delay_sec > 0.0);
 }
+
+#[test]
+fn load_level_matches_campaign_pack_rules() {
+    let lv = levels();
+    let mut a = world();
+    let mut b = world();
+    a.load_level(1, &lv);
+    b.load_pack_level(1, &lv, PackRules::CAMPAIGN);
+    assert!(a.is_campaign_board());
+    assert!(b.is_campaign_board());
+    assert_eq!(a.current_level_idx, b.current_level_idx);
+    assert_eq!(a.bricks.len(), b.bricks.len());
+    assert!(a.sudden_death_enabled && b.sudden_death_enabled);
+}
+
+#[test]
+fn non_campaign_victory_does_not_unlock() {
+    let lv = levels();
+    let mut w = world();
+    w.load_pack_level(0, &lv, PackRules::non_campaign(true));
+    assert!(!w.is_campaign_board());
+    assert_eq!(win_and_unlock(&mut w), 0);
+}
+
+fn sudden_death_strikes(rules: PackRules) -> bool {
+    let lv = levels();
+    let mut w = world();
+    w.load_pack_level(0, &lv, rules);
+    w.balls[0].stuck_offset = None;
+    w.balls[0].x = 960.0;
+    w.balls[0].y = 1000.0;
+    w.balls[0].vx = 0.0;
+    w.balls[0].vy = 0.0;
+    w.level_elapsed = w.config.gameplay.sudden_death_time_sec;
+    w.sudden_death_timer = w.config.gameplay.sudden_death_strike_interval_sec;
+    let mut events = Vec::new();
+    w.update(TINY_DT, &mut events);
+    events
+        .iter()
+        .any(|e| matches!(e, GameEvent::LightningBolt { .. }))
+}
+
+#[test]
+fn sudden_death_off_never_strikes() {
+    assert!(!sudden_death_strikes(PackRules::non_campaign(false)));
+}
+
+#[test]
+fn sudden_death_on_still_strikes() {
+    assert!(sudden_death_strikes(PackRules::CAMPAIGN));
+    assert!(sudden_death_strikes(PackRules::non_campaign(true)));
+}

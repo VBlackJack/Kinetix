@@ -498,6 +498,36 @@ pub enum SessionStatus {
     GameOver,
 }
 
+/// Rules attached to a board when it is loaded from a level pack.
+///
+/// `campaign` decides whether clearing the board can unlock campaign progress. `sudden_death`
+/// decides whether the lightning strikes start once `sudden_death_time_sec` has elapsed.
+/// Custom boards (editor painting, cleared boards, imported codes, `load_from_rows`) always
+/// keep sudden death enabled and never count as campaign boards.
+/// `high_score` is updated on every board regardless of the rules; the application decides
+/// whether to persist it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackRules {
+    pub campaign: bool,
+    pub sudden_death: bool,
+}
+
+impl PackRules {
+    /// Campaign sector: counts for progress, sudden death enabled.
+    pub const CAMPAIGN: Self = Self {
+        campaign: true,
+        sudden_death: true,
+    };
+
+    /// Non-campaign pack: never unlocks progress; sudden death is chosen by the caller.
+    pub const fn non_campaign(sudden_death: bool) -> Self {
+        Self {
+            campaign: false,
+            sudden_death,
+        }
+    }
+}
+
 pub struct GameWorld {
     pub config: GameConfig,
     pub status: SessionStatus,
@@ -524,6 +554,8 @@ pub struct GameWorld {
     /// True only while the board comes straight from a campaign sector; editing or importing
     /// turns it into a custom board, which can never unlock campaign progress.
     pub(crate) campaign_board: bool,
+    /// False only while a pack board loaded with `PackRules::sudden_death == false` is active.
+    sudden_death_enabled: bool,
     level_count: usize,
     pub lives: u32,
     pub combo: u32,
@@ -560,6 +592,7 @@ impl GameWorld {
             high_score: 0,
             max_unlocked_level: 0,
             campaign_board: false,
+            sudden_death_enabled: true,
             level_count: levels.len(),
             lives: config.gameplay.initial_lives,
             combo: 0,
@@ -599,13 +632,20 @@ impl GameWorld {
     }
 
     pub fn load_level(&mut self, idx: usize, levels: &[LevelDef]) {
+        self.load_pack_level(idx, levels, PackRules::CAMPAIGN);
+    }
+
+    /// Loads a level of any pack with explicit rules. A non-campaign board can never raise
+    /// `max_unlocked_level`, and sudden death only strikes when `rules.sudden_death` is set.
+    pub fn load_pack_level(&mut self, idx: usize, levels: &[LevelDef], rules: PackRules) {
         if levels.is_empty() {
             return;
         }
         self.current_level_idx = idx % levels.len();
         let level = &levels[self.current_level_idx];
         self.load_from_rows(&level.rows, level.boss, level.world);
-        self.campaign_board = true;
+        self.campaign_board = rules.campaign;
+        self.sudden_death_enabled = rules.sudden_death;
     }
 
     /// True when the current board is an untouched campaign sector.
@@ -617,9 +657,11 @@ impl GameWorld {
     pub fn clear_bricks(&mut self) {
         self.bricks.clear();
         self.campaign_board = false;
+        self.sudden_death_enabled = true;
     }
 
     pub fn load_from_rows(&mut self, rows: &[String], has_boss: bool, world_tier: usize) {
+        self.sudden_death_enabled = true;
         self.bricks.clear();
         self.capsules.clear();
         self.lasers.clear();
@@ -744,6 +786,7 @@ impl GameWorld {
 
     pub fn paint_brick_at(&mut self, world_x: f32, world_y: f32, kind: Option<BrickKind>) {
         self.campaign_board = false;
+        self.sudden_death_enabled = true;
         let grid = BrickGrid::new(&self.config.arena, EDITOR_COLS);
         let Some((c_idx, r_idx)) = grid.cell_at(world_x, world_y, EDITOR_ROWS) else {
             return;
@@ -823,7 +866,9 @@ impl GameWorld {
 
         if self.balls.iter().any(|b| b.stuck_offset.is_none()) {
             self.level_elapsed += dt;
-            if self.level_elapsed >= self.config.gameplay.sudden_death_time_sec {
+            if self.sudden_death_enabled
+                && self.level_elapsed >= self.config.gameplay.sudden_death_time_sec
+            {
                 self.sudden_death_timer += dt;
                 if self.sudden_death_timer >= self.config.gameplay.sudden_death_strike_interval_sec
                 {
