@@ -428,7 +428,9 @@ fn pick_regular(
             let mut names = used_names.clone();
             let level = match generate_sector(&request, &mut names) {
                 Ok(level) => level,
-                Err(SectorError::Name(message)) => return Err(message),
+                Err(SectorError::Name(message) | SectorError::MissingBossArena(message)) => {
+                    return Err(message)
+                }
                 Err(SectorError::Layout(message)) => {
                     local.reject("layout", &message);
                     continue;

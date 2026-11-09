@@ -19,7 +19,8 @@
 //! A regular level is composed from whole features, never from random cells:
 //! - a hand-authored motif (`motifs.rs`) picked by the block theme of its world,
 //! - an orientation: mirrored from a half motif for the symmetric sectors (`sector % 5` in
-//!   `{0, 2}`), flipped and offset inside its bounding box for the asymmetric ones,
+//!   `{0, 2}`), flipped, trimmed by whole edge columns and offset for the asymmetric ones (never cropped by
+//!   rows, so the motif stays intact),
 //! - a structural pass that turns a whole feature into a mechanic (steel flanks, explosive
 //!   cage, domino fuse, ghost band, conveyor lane, portal pair, bumpers, regenerating shield),
 //! - a colour and toughness style applied per row band or per feature, never per cell.
@@ -29,6 +30,7 @@
 
 use crate::bosses::boss_arena;
 use crate::motifs::{MotifFamily, MotifTemplate, MOTIFS};
+use crate::simulate::SECTORS_PER_BLOCK;
 use crate::validate::{
     colour_regions_per_cell, dust_and_components, is_destructible_cell, mirror_mismatch_cells,
     BOSS_STEM_MAX_LEN, BOSS_SUFFIX, DENSITY_MAX, DENSITY_MIN, FINAL_BOSS_SUFFIX,
@@ -126,12 +128,10 @@ const SAFE_DENSITY_MAX: usize = DENSITY_MAX - 4;
 const MID_BOSS_SECTOR: usize = 50;
 /// Final boss sector index within each 100-sector world.
 const WORLD_BOSS_SECTOR: usize = 100;
-/// Sectors per block in a world.
-const BLOCK_SIZE: usize = 10;
 /// Blocks per world.
 const BLOCKS_PER_WORLD: usize = 10;
 /// Position inside a block (0-based) of the set piece.
-const SET_PIECE_POS: usize = BLOCK_SIZE - 1;
+const SET_PIECE_POS: usize = SECTORS_PER_BLOCK - 1;
 /// Positions inside a block (0-based) of the two breathers.
 const BREATHER_POSITIONS: [usize; 2] = [3, 7];
 /// Sector residues modulo [`SYMMETRY_PERIOD`] that are mirror-symmetric (40% of the sectors).
@@ -147,13 +147,19 @@ const MAX_SHIFT: isize = 3;
 const FLIP_VERTICAL_ODDS: usize = 3;
 /// Largest number of empty rows above a motif.
 const MAX_TOP_PAD: usize = 2;
-/// Percent chance that a motif is cropped (rows, columns) before its feature is added.
+/// Percent chance that a symmetric motif is cropped (rows, columns) before its feature is added.
+/// Asymmetric motifs are never cropped by rows; they are only trimmed by whole edge columns.
 const CROP_PERCENT: usize = 50;
-/// Most rows cropped off the top or the bottom of a motif.
+/// Most rows cropped off the top or the bottom of a symmetric motif.
 const MAX_CROP_ROWS: usize = 2;
-/// Most columns cropped off one side of an asymmetric motif (a symmetric one loses at most one
-/// column per side).
-const MAX_CROP_COLS: usize = 2;
+/// Most whole edge columns trimmed off one side of an asymmetric motif.
+const MAX_TRIM_COLS: usize = 2;
+/// An asymmetric motif may lose at most this percent of its cells to the column trim, so the
+/// shape stays recognisable.
+const TRIM_MAX_CELL_PERCENT: usize = 15;
+/// Widest run of fully empty columns allowed between two parts of an asymmetric level (the
+/// widest gap of a hand-authored motif is 3): a wider one reads as two unrelated pieces.
+const MAX_INNER_GAP_COLS: usize = 3;
 
 /// Seed mixing constant for per-level RNG initialization.
 const LEVEL_SEED_SALT: u64 = 0x517C_C1B7_2722_0A95;
@@ -621,6 +627,8 @@ const BLOCK_FAMILIES: [[(MotifFamily, MotifFamily); BLOCKS_PER_WORLD]; 8] = [
 pub enum SectorError {
     /// No unique name is left: retrying with another seed cannot help.
     Name(String),
+    /// A boss sector has no hand-authored arena: retrying with another seed cannot help.
+    MissingBossArena(String),
     /// This seed produced a layout that misses a design rule: retry with another seed.
     Layout(String),
 }
@@ -628,7 +636,9 @@ pub enum SectorError {
 impl fmt::Display for SectorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SectorError::Name(m) | SectorError::Layout(m) => write!(f, "{m}"),
+            SectorError::Name(m) | SectorError::MissingBossArena(m) | SectorError::Layout(m) => {
+                write!(f, "{m}")
+            }
         }
     }
 }
@@ -737,8 +747,8 @@ struct SectorPlan {
 
 impl SectorPlan {
     fn new(world: usize, sector: usize) -> Self {
-        let block = sector.saturating_sub(1) / BLOCK_SIZE;
-        let pos = sector.saturating_sub(1) % BLOCK_SIZE;
+        let block = sector.saturating_sub(1) / SECTORS_PER_BLOCK;
+        let pos = sector.saturating_sub(1) % SECTORS_PER_BLOCK;
         let kind = if pos == SET_PIECE_POS {
             SectorKind::SetPiece
         } else if block == 0 {
@@ -888,7 +898,7 @@ pub fn generate_sector(
 
     if boss {
         return boss_level(request.id, request.world, request.sector_in_world, name)
-            .map_err(SectorError::Name);
+            .map_err(SectorError::MissingBossArena);
     }
 
     let mut rng = Rng::new(request.seed ^ (request.id as u64).wrapping_mul(LEVEL_SEED_SALT));
@@ -983,6 +993,77 @@ fn crop_columns(grid: &mut Grid, left: usize, right: usize) {
             *cell = T_EMPTY;
         }
     }
+}
+
+/// Number of non-empty cells in the `count` first (or last) columns of the grid.
+fn edge_cells(grid: &Grid, count: usize, from_left: bool) -> usize {
+    grid.iter()
+        .map(|row| {
+            let edge: Vec<&char> = if from_left {
+                row.iter().take(count).collect()
+            } else {
+                row.iter().skip(COLS.saturating_sub(count)).collect()
+            };
+            edge.into_iter().filter(|&&c| c != T_EMPTY).count()
+        })
+        .sum()
+}
+
+/// Gives a motif its asymmetric orientation with structured means only: an optional horizontal
+/// flip, an optional trim of whole edge columns (never more than [`TRIM_MAX_CELL_PERCENT`] of its
+/// cells, so no row is ever cut through), then an offset to one side inside its bounding box.
+fn orient_asymmetric(grid: &mut Grid, rng: &mut Rng) {
+    if rng.usize_below(2) == 1 {
+        for row in grid.iter_mut() {
+            row.reverse();
+        }
+    }
+    let total = count_tokens(grid, |c| c != T_EMPTY);
+    let from_left = rng.usize_below(2) == 0;
+    let wanted = rng.usize_below(MAX_TRIM_COLS + 1);
+    let amount = (0..=wanted)
+        .rev()
+        .find(|&k| edge_cells(grid, k, from_left) * 100 <= total * TRIM_MAX_CELL_PERCENT)
+        .unwrap_or(0);
+    if from_left {
+        crop_columns(grid, amount, 0);
+    } else {
+        crop_columns(grid, 0, amount);
+    }
+    let magnitude = 1 + rng.usize_below(MAX_SHIFT as usize) as isize;
+    let dx = if rng.usize_below(2) == 0 {
+        magnitude
+    } else {
+        -magnitude
+    };
+    shift_clamped(grid, dx);
+}
+
+/// Longest run of fully empty columns between the first and the last shape column (portals are
+/// not shape cells).
+fn inner_gap_cols(rows: &[String]) -> usize {
+    let occupied: Vec<bool> = (0..COLS)
+        .map(|c| {
+            rows.iter().any(|row| {
+                row.chars()
+                    .nth(c)
+                    .is_some_and(|ch| !matches!(ch, '0' | CELL_PORTAL))
+            })
+        })
+        .collect();
+    let (Some(first), Some(last)) = (
+        occupied.iter().position(|&o| o),
+        occupied.iter().rposition(|&o| o),
+    ) else {
+        return 0;
+    };
+    let mut best = 0usize;
+    let mut run = 0usize;
+    for &o in &occupied[first..=last] {
+        run = if o { 0 } else { run + 1 };
+        best = best.max(run);
+    }
+    best
 }
 
 /// Sets a cell, and its mirror counterpart on symmetric sectors.
@@ -1136,40 +1217,23 @@ fn pass_ghost(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
     } else {
         GHOST_MAX_CELLS
     };
-    // Asymmetric sectors first try one half of the band so the feature sits off-centre.
-    let half_choices: &[Option<bool>] = if ctx.symmetric {
-        &[None]
-    } else if rng.usize_below(2) == 0 {
-        &[Some(true), None]
-    } else {
-        &[Some(false), None]
-    };
-    for half in half_choices {
-        let in_half = |c: usize| match half {
-            None => true,
-            Some(left) => (c <= MID_COL) == *left,
-        };
-        let bands: Vec<(usize, Vec<(usize, usize)>)> = (0..rows
-            .saturating_sub(GHOST_BAND_ROWS - 1))
-            .map(|r0| {
-                let cells: Vec<(usize, usize)> = (r0..r0 + GHOST_BAND_ROWS)
-                    .flat_map(|r| (0..COLS).map(move |c| (r, c)))
-                    .filter(|&(r, c)| is_plain_token(grid[r][c]) && in_half(c))
-                    .collect();
-                (r0, cells)
-            })
-            .filter(|(_, cells)| (GHOST_MIN_CELLS..=max_cells).contains(&cells.len()))
-            .collect();
-        if bands.is_empty() {
-            continue;
-        }
-        let (_, cells) = &bands[rng.usize_below(bands.len())];
-        for &(r, c) in cells {
-            grid[r][c] = CELL_GHOST;
-        }
-        return true;
+    // The band spans the whole motif, so the ghost bricks frame it instead of cutting a half.
+    let bands: Vec<Vec<(usize, usize)>> = (0..rows.saturating_sub(GHOST_BAND_ROWS - 1))
+        .map(|r0| {
+            (r0..r0 + GHOST_BAND_ROWS)
+                .flat_map(|r| (0..COLS).map(move |c| (r, c)))
+                .filter(|&(r, c)| is_plain_token(grid[r][c]))
+                .collect::<Vec<_>>()
+        })
+        .filter(|cells| (GHOST_MIN_CELLS..=max_cells).contains(&cells.len()))
+        .collect();
+    if bands.is_empty() {
+        return false;
     }
-    false
+    for &(r, c) in &bands[rng.usize_below(bands.len())] {
+        grid[r][c] = CELL_GHOST;
+    }
+    true
 }
 
 /// Inserts a lane of moving bricks above, inside or below the motif. A moving brick only sits in
@@ -1188,7 +1252,15 @@ fn pass_conveyor(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
     };
     let above = at.checked_sub(1).and_then(|i| grid.get(i));
     let below = grid.get(at);
-    let eligible: Vec<usize> = (1..COLS - 1)
+    // The lane is mirrored around the centre of the motif (the grid centre on symmetric sectors),
+    // so it frames the shape instead of floating beside it.
+    let (lo, hi) = if ctx.symmetric {
+        (0, COLS - 1)
+    } else {
+        bbox_cols(grid).unwrap_or((0, COLS - 1))
+    };
+    let mirror_sum = lo + hi;
+    let eligible: Vec<usize> = (lo.max(1)..=hi.min(COLS - 2))
         .filter(|&c| touches(above, c) || touches(below, c))
         .collect();
     let wanted = if ctx.teaching {
@@ -1201,8 +1273,8 @@ fn pass_conveyor(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
     let mut pool = eligible;
     while placed < wanted && !pool.is_empty() {
         let c = pool.remove(rng.usize_below(pool.len()));
-        let mirror = COLS - 1 - c;
-        let cols: Vec<usize> = if ctx.symmetric && mirror != c {
+        let mirror = mirror_sum - c;
+        let cols: Vec<usize> = if mirror != c {
             vec![c, mirror]
         } else {
             vec![c]
@@ -1211,7 +1283,7 @@ fn pass_conveyor(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
             (col.saturating_sub(LANE_MIN_SPACING - 1)..=(col + LANE_MIN_SPACING - 1).min(COLS - 1))
                 .all(|k| lane[k] == T_EMPTY)
         });
-        if !clear || (ctx.symmetric && mirror != c && c.abs_diff(mirror) < LANE_MIN_SPACING) {
+        if !clear || (mirror != c && c.abs_diff(mirror) < LANE_MIN_SPACING) {
             continue;
         }
         for col in cols {
@@ -1563,6 +1635,9 @@ fn layout_issue(rows: &[String], plan: &SectorPlan, window: (usize, usize)) -> O
             ));
         }
     }
+    if !plan.symmetric && inner_gap_cols(rows) > MAX_INNER_GAP_COLS {
+        return Some("asymmetric level reads as two separate pieces".to_string());
+    }
     let (dust, components) = dust_and_components(rows);
     if dust > MAX_DUST {
         return Some(format!("{dust} dust fragments"));
@@ -1586,29 +1661,18 @@ fn build_regular_rows(
     let motif = pick_motif(plan, window, rng);
     let mut grid = motif_grid(motif);
 
-    // Orientation: symmetric sectors mirror one half of the motif; asymmetric ones flip and
-    // offset it inside its bounding box.
+    // Orientation: symmetric sectors mirror one half of the motif; asymmetric ones are flipped,
+    // trimmed by whole edge columns and offset inside the grid, but never cropped by rows.
     if plan.symmetric {
         mirror_half(&mut grid, rng.usize_below(2) == 0);
     } else {
-        if rng.usize_below(2) == 1 {
-            for row in grid.iter_mut() {
-                row.reverse();
-            }
-        }
-        let magnitude = 1 + rng.usize_below(MAX_SHIFT as usize) as isize;
-        let dx = if rng.usize_below(2) == 0 {
-            magnitude
-        } else {
-            -magnitude
-        };
-        shift_clamped(&mut grid, dx);
+        orient_asymmetric(&mut grid, rng);
     }
     if rng.usize_below(FLIP_VERTICAL_ODDS) == 0 {
         grid.reverse();
     }
-    if rng.chance(CROP_PERCENT) {
-        // Crop rows off one end and columns off the sides (equally on symmetric sectors).
+    if plan.symmetric && rng.chance(CROP_PERCENT) {
+        // Crop rows off one end and one column off each side.
         let spare_rows = grid
             .len()
             .saturating_sub(MIN_REGULAR_ROWS + 1)
@@ -1621,17 +1685,8 @@ fn build_regular_rows(
                 grid.truncate(grid.len() - crop);
             }
         }
-        if plan.symmetric {
-            let side = rng.usize_below(2);
-            crop_columns(&mut grid, side, side);
-        } else if rng.usize_below(2) == 0 {
-            let amount = rng.usize_below(MAX_CROP_COLS + 1);
-            if rng.usize_below(2) == 0 {
-                crop_columns(&mut grid, amount, 0);
-            } else {
-                crop_columns(&mut grid, 0, amount);
-            }
-        }
+        let side = rng.usize_below(2);
+        crop_columns(&mut grid, side, side);
     }
 
     let ctx = PassContext {
@@ -1703,6 +1758,113 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Number of seeds tried per motif by the orientation tests.
+    const ORIENTATION_SEEDS: u64 = 40;
+
+    #[test]
+    fn asymmetric_orientation_keeps_each_motif_intact() {
+        for motif in MOTIFS.iter() {
+            let original = motif_grid(motif);
+            let total = count_tokens(&original, |c| c != T_EMPTY);
+            for seed in 0..ORIENTATION_SEEDS {
+                let mut view = original.clone();
+                orient_asymmetric(&mut view, &mut Rng::new(seed));
+                assert_eq!(view.len(), original.len(), "{} lost a row", motif.name);
+                let kept = count_tokens(&view, |c| c != T_EMPTY);
+                assert!(
+                    kept * 100 >= total * (100 - TRIM_MAX_CELL_PERCENT),
+                    "{}: {kept} of {total} cells survive",
+                    motif.name
+                );
+                // The view is the motif (or its mirror image), shifted as a whole, with at most
+                // MAX_TRIM_COLS whole edge columns removed: no row is cut through.
+                let explained = [false, true].iter().any(|&flip| {
+                    (-(COLS as isize)..COLS as isize).any(|dx| {
+                        original.iter().zip(&view).all(|(src, got)| {
+                            let src: Vec<char> = if flip {
+                                src.iter().rev().copied().collect()
+                            } else {
+                                src.clone()
+                            };
+                            (0..COLS).all(|c| {
+                                let shown = got
+                                    .get((c as isize + dx) as usize)
+                                    .copied()
+                                    .filter(|_| (c as isize + dx) >= 0)
+                                    .unwrap_or(T_EMPTY);
+                                if shown != T_EMPTY {
+                                    shown == src[c]
+                                } else {
+                                    let in_view = (c as isize + dx) >= 0
+                                        && ((c as isize + dx) as usize) < COLS;
+                                    src[c] == T_EMPTY
+                                        || !in_view
+                                        || !(MAX_TRIM_COLS..COLS - MAX_TRIM_COLS).contains(&c)
+                                }
+                            })
+                        })
+                    })
+                });
+                assert!(explained, "{} (seed {seed}) was cut through", motif.name);
+            }
+        }
+    }
+
+    #[test]
+    fn ghost_band_takes_every_plain_brick_of_its_rows() {
+        let ctx = PassContext {
+            symmetric: false,
+            teaching: false,
+        };
+        let mut applied = 0usize;
+        for motif in MOTIFS.iter() {
+            for seed in 0..ORIENTATION_SEEDS {
+                let mut grid = motif_grid(motif);
+                if !pass_ghost(&mut grid, ctx, &mut Rng::new(seed)) {
+                    continue;
+                }
+                applied += 1;
+                for row in grid.iter().filter(|row| row.contains(&CELL_GHOST)) {
+                    assert!(
+                        !row.iter().any(|&c| is_plain_token(c)),
+                        "{}: a ghost row keeps plain bricks",
+                        motif.name
+                    );
+                }
+            }
+        }
+        assert!(applied > 0);
+    }
+
+    #[test]
+    fn asymmetric_levels_read_as_one_composition() {
+        let mut checked = 0usize;
+        for world in 1..=8 {
+            for (sector, level) in sample_world(world, 40) {
+                if is_symmetric_sector(sector) {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    is_asymmetric(&level),
+                    "world {world} sector {sector}: not asymmetric"
+                );
+                assert!(
+                    inner_gap_cols(&level.rows) <= MAX_INNER_GAP_COLS,
+                    "world {world} sector {sector} is a collage:
+{}",
+                    level.rows.join(
+                        "
+"
+                    )
+                );
+                let (dust, _) = dust_and_components(&level.rows);
+                assert_eq!(dust, 0, "world {world} sector {sector} has loose bricks");
+            }
+        }
+        assert!(checked > 200, "only {checked} asymmetric levels sampled");
     }
 
     #[test]
@@ -1813,7 +1975,8 @@ mod tests {
             assert!(
                 levels
                     .iter()
-                    .any(|(s, l)| *s <= BLOCK_SIZE && l.rows.iter().any(|r| r.contains(mechanic))),
+                    .any(|(s, l)| *s <= SECTORS_PER_BLOCK
+                        && l.rows.iter().any(|r| r.contains(mechanic))),
                 "mechanic {mechanic} missing from the first block of world {debut}"
             );
         }
@@ -1838,7 +2001,7 @@ mod tests {
         assert!(set_piece_index(4).is_none() && set_piece_index(9).is_none());
         // Sector 10 of a block is symmetric, so a showcase is always mirrored.
         for block in 0..BLOCKS_PER_WORLD {
-            assert!(is_symmetric_sector((block + 1) * BLOCK_SIZE));
+            assert!(is_symmetric_sector((block + 1) * SECTORS_PER_BLOCK));
         }
     }
 

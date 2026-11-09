@@ -697,11 +697,11 @@ fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
     errors
 }
 
-/// Whether a row is exempt from the reuse cap: blank, or its non-empty cells are one char in
-/// one contiguous run.
+/// Whether a row is exempt from the reuse cap: blank, or its shape cells (portals ignored, as in
+/// the shape metrics) are one char in one contiguous run.
 fn is_reuse_exempt(row: &str) -> bool {
     let cells: Vec<char> = row.chars().collect();
-    let is_set = |c: &char| !matches!(c, '0' | ' ');
+    let is_set = |c: &char| is_shape_cell(*c);
     let Some(start) = cells.iter().position(is_set) else {
         return true;
     };
@@ -1632,6 +1632,10 @@ mod tests {
         assert!(is_reuse_exempt("000333330000000"));
         assert!(!is_reuse_exempt("110011000000000"));
         assert!(!is_reuse_exempt("111222000000000"));
+        // A portal is not a shape cell: it neither breaks a blank row nor counts as a run.
+        assert!(is_reuse_exempt("T00000000000T00"));
+        assert!(is_reuse_exempt("T00333330000T00"));
+        assert!(!is_reuse_exempt("T0033T330000000"));
         let mut pack = extended_pack(MAX_ROW_REUSE + 2);
         for level in pack.iter_mut().skip(LEGACY_LEVEL_COUNT) {
             level.rows[1] = "000333330000000".to_string();
