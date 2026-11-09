@@ -33,10 +33,10 @@ use crate::motifs::{MotifFamily, MotifTemplate, MOTIFS};
 use crate::simulate::SECTORS_PER_BLOCK;
 use crate::validate::{
     colour_regions_per_cell, dust_and_components, inner_gap_cols, inner_gap_rows,
-    is_destructible_cell, mirror_mismatch_cells, BOSS_STEM_MAX_LEN, BOSS_SUFFIX, DENSITY_MAX,
-    DENSITY_MIN, FINAL_BOSS_SUFFIX, MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8, MAX_DUST,
-    MAX_INNER_GAP_COLS, MAX_INNER_GAP_ROWS, MAX_LEVEL_NAME_LEN, MECHANIC_DEBUTS,
-    MIN_ASYMMETRIC_CELLS,
+    is_destructible_cell, main_piece_share, mirror_mismatch_cells, BOSS_STEM_MAX_LEN, BOSS_SUFFIX,
+    DENSITY_MAX, DENSITY_MIN, FINAL_BOSS_SUFFIX, MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8,
+    MAX_DUST, MAX_INNER_GAP_COLS, MAX_INNER_GAP_ROWS, MAX_LEVEL_NAME_LEN, MECHANIC_DEBUTS,
+    MIN_ASYMMETRIC_CELLS, MIN_MAIN_PIECE_SHARE,
 };
 use kinetix_core::config::LevelDef;
 use kinetix_core::level_code::{EDITOR_COLS, EDITOR_ROWS};
@@ -461,7 +461,7 @@ pub const SET_PIECES: [SetPiece; 8] = [
         motifs: [
             "GLYPH_TRIDENT",
             "HOOK_ARROW",
-            "SHEAR_FAULT",
+            "EAST_CHEVRON",
             "CHECKERBOARD_7R",
         ],
     },
@@ -1617,6 +1617,12 @@ fn layout_issue(rows: &[String], plan: &SectorPlan, window: (usize, usize)) -> O
     if components > MAX_COMPONENTS_8 {
         return Some(format!("{components} connected components"));
     }
+    let main_share = main_piece_share(rows);
+    if main_share < MIN_MAIN_PIECE_SHARE {
+        return Some(format!(
+            "main piece holds only {main_share:.2} of the shape"
+        ));
+    }
     if colour_regions_per_cell(rows) > MAX_COLOUR_REGIONS_PER_CELL {
         return Some("colour fragmentation".to_string());
     }
@@ -1701,7 +1707,7 @@ fn build_regular_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validate::{is_asymmetric, is_mirror_symmetric};
+    use crate::validate::{is_asymmetric, is_mirror_symmetric, SECTORS_PER_WORLD};
 
     fn request(world: usize, sector: usize, seed: u64, hardness: usize) -> SectorRequest {
         SectorRequest {
@@ -1734,6 +1740,28 @@ mod tests {
 
     /// Number of seeds tried per motif by the orientation tests.
     const ORIENTATION_SEEDS: u64 = 40;
+
+    /// Seeds tried per sector by the buildability test.
+    const BUILDABILITY_SEEDS: u64 = 200;
+
+    #[test]
+    fn every_regular_sector_of_every_world_builds_a_compliant_level() {
+        for world in 1..=8usize {
+            for sector in 1..=SECTORS_PER_WORLD {
+                if is_boss_sector(sector) {
+                    continue;
+                }
+                let plan = SectorPlan::new(world, sector);
+                let window = density_window(world, sector);
+                let built = (0..BUILDABILITY_SEEDS).any(|seed| {
+                    let mut rng = Rng::new(seed.wrapping_mul(LEVEL_SEED_SALT) ^ sector as u64);
+                    build_regular_rows(&plan, 2, &mut rng)
+                        .is_ok_and(|rows| layout_issue(&rows, &plan, window).is_none())
+                });
+                assert!(built, "world {world} sector {sector} never builds");
+            }
+        }
+    }
 
     #[test]
     fn asymmetric_orientation_keeps_each_motif_intact() {

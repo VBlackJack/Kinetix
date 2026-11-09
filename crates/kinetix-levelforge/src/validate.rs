@@ -72,6 +72,13 @@ pub const MAX_INNER_GAP_COLS: usize = 3;
 /// regular levels of the previous pack has an empty row inside its shape (max 0); one empty row
 /// still reads as a deliberate band break, two split a 5..=9 row shape into two pieces.
 pub const MAX_INNER_GAP_ROWS: usize = 1;
+/// Smallest share of the shape cells that the largest 8-connected piece of a regular generated
+/// level must hold (symmetric or asymmetric). Measured 2026-11-09 with [`main_piece_share`]: the
+/// 15 legacy levels have min 0.828, p10 0.840, p50 1.000; the previous 769 generated regular
+/// levels had 126 of 471 asymmetric and 63 of 298 symmetric levels below 0.80 (and 110 and 51
+/// below 0.70), which read as two separate pieces. 0.80 is the legacy minimum minus a small
+/// margin. Bosses and the legacy levels are exempt.
+pub const MIN_MAIN_PIECE_SHARE: f32 = 0.80;
 /// A non-empty row string may appear in at most this many generated levels (about 2% of 800);
 /// a row whose non-empty cells are one char in one contiguous run is exempt.
 pub const MAX_ROW_REUSE: usize = 16;
@@ -329,6 +336,17 @@ pub fn dust_and_components(rows: &[String]) -> (usize, usize) {
     let sizes = region_sizes(rows, |_, _| true);
     let dust = sizes.iter().filter(|&&s| s <= DUST_MAX_CELLS).count();
     (dust, sizes.len())
+}
+
+/// Share of the shape cells held by the largest 8-connected component of shape cells (see
+/// `is_shape_cell`); 1 for a grid without shape cells.
+pub fn main_piece_share(rows: &[String]) -> f32 {
+    let sizes = region_sizes(rows, |_, _| true);
+    let total: usize = sizes.iter().sum();
+    match sizes.iter().max() {
+        Some(&largest) if total > 0 => largest as f32 / total as f32,
+        _ => 1.0,
+    }
 }
 
 /// Longest run of values `false` strictly between the first and the last `true`.
@@ -699,6 +717,16 @@ fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
                     &mut errors,
                     lid,
                     format!("{components} connected components, max {MAX_COMPONENTS_8}"),
+                );
+            }
+            let main_share = main_piece_share(&level.rows);
+            if main_share < MIN_MAIN_PIECE_SHARE {
+                push_error(
+                    &mut errors,
+                    lid,
+                    format!(
+                        "main piece holds {main_share:.2} of the shape, min {MIN_MAIN_PIECE_SHARE}"
+                    ),
                 );
             }
             if is_asymmetric(level) {
@@ -1607,6 +1635,80 @@ mod tests {
         assert!(!has_error(&validate_pack(&pack), "connected components"));
         pack[15].rows = blocks(MAX_COMPONENTS_8 + 1);
         assert!(has_error(&validate_pack(&pack), "connected components"));
+    }
+
+    /// Rows holding one piece of `main` cells and one detached piece of `stray` cells.
+    fn main_and_stray(main: usize, stray: usize) -> Vec<String> {
+        let piece = |count: usize, ch: char| -> String {
+            (0..EDITOR_COLS)
+                .map(|c| if c < count { ch } else { '0' })
+                .collect()
+        };
+        let mut rows = vec![piece(main, '1')];
+        rows.push("0".repeat(EDITOR_COLS));
+        rows.push("0".repeat(EDITOR_COLS));
+        rows.push(piece(stray, '2').chars().rev().collect());
+        rows
+    }
+
+    #[test]
+    fn main_piece_share_is_the_largest_eight_connected_piece_over_all_shape_cells() {
+        assert_eq!(main_piece_share(&[]), 1.0);
+        assert_eq!(main_piece_share(&rows_of(&["000000000000000"])), 1.0);
+        assert_eq!(main_piece_share(&main_and_stray(4, 1)), 0.8);
+        assert_eq!(main_piece_share(&main_and_stray(3, 1)), 0.75);
+        // A diagonal touch joins pieces; portals are not shape cells.
+        let diagonal = rows_of(&["110000000000000", "001000000000000", "T00000000000000"]);
+        assert_eq!(main_piece_share(&diagonal), 1.0);
+    }
+
+    #[test]
+    fn regular_level_below_the_main_piece_share_is_rejected_at_the_exact_boundary() {
+        let boundary = main_and_stray(4, 1);
+        assert_eq!(main_piece_share(&boundary), MIN_MAIN_PIECE_SHARE);
+        let mut pack = extended_pack(3);
+        pack[15].rows = boundary.clone();
+        assert!(!has_error(&validate_pack(&pack), "main piece"));
+        pack[15].rows = main_and_stray(3, 1);
+        assert!(has_error(&validate_pack(&pack), "main piece"));
+        // The same rule runs when a generator checks one candidate, symmetric or not.
+        let prefix = extended_pack(2);
+        let prefix = &prefix[..prefix.len() - 1];
+        let mut candidate = make_level(prefix.len(), "NEXT SECTOR", false, 4242);
+        candidate.rows = boundary;
+        let planned = prefix.len() + 1;
+        assert!(!has_error(
+            &validate_candidate(prefix, &candidate, false, planned),
+            "main piece"
+        ));
+        candidate.rows = main_and_stray(3, 1);
+        assert!(has_error(
+            &validate_candidate(prefix, &candidate, false, planned),
+            "main piece"
+        ));
+        candidate.rows = rows_of(&["110000000000011", "110000000000011"]);
+        assert!(is_mirror_symmetric(&candidate));
+        assert!(has_error(
+            &validate_candidate(prefix, &candidate, false, planned),
+            "main piece"
+        ));
+    }
+
+    #[test]
+    fn main_piece_gate_exempts_legacy_levels_and_bosses() {
+        let mut legacy = legacy_pack();
+        legacy[1].rows = main_and_stray(3, 3);
+        assert!(!has_error(&validate_pack(&legacy), "main piece"));
+        let mut pack = extended_pack(3);
+        pack[2].rows = main_and_stray(3, 3);
+        let boss_idx = pack.len() - 1;
+        assert!(pack[boss_idx].boss);
+        let mut boss_rows = vec!["0".repeat(EDITOR_COLS); BOSS_CLEAR_ROWS];
+        boss_rows.extend(main_and_stray(3, 3));
+        pack[boss_idx].rows = boss_rows;
+        assert!(main_piece_share(&pack[boss_idx].rows) < MIN_MAIN_PIECE_SHARE);
+        let errors = validate_pack(&pack);
+        assert!(!has_error(&errors, "main piece"), "{errors:#?}");
     }
 
     /// Asymmetric rows made of two blocks of `block_rows` rows separated by `gap_rows` empty rows.
