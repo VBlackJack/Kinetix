@@ -983,10 +983,12 @@ async fn main() {
                     && is_sector_unlocked(selected_sector_idx, max_unlocked)
                     && !dev_enter_consumed
                 {
-                    world.lives = world.config.gameplay.initial_lives;
-                    world.score = 0;
-                    world.load_level(selected_sector_idx, &level_pack.levels);
-                    dev_state.level_loaded_normally();
+                    start_run_from_title(
+                        &mut world,
+                        &mut dev_state,
+                        &level_pack.levels,
+                        selected_sector_idx,
+                    );
                     screen = AppScreen::InGame;
                 }
             }
@@ -1085,10 +1087,7 @@ async fn main() {
                     };
                 }
                 if is_key_pressed(KeyCode::R) {
-                    let cur = world.current_level_idx;
-                    world.lives = world.config.gameplay.initial_lives;
-                    world.score = 0;
-                    world.load_level(cur, &level_pack.levels);
+                    restart_level(&mut world, &mut dev_state, &level_pack.levels);
                 }
 
                 world.set_paddle_target(paddle_mx);
@@ -1127,15 +1126,12 @@ async fn main() {
                             world.status = SessionStatus::Playing;
                         }
                         SessionStatus::Victory => {
-                            let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
-                            world.load_level(next_lvl, &level_pack.levels);
+                            next_sector(&mut world, &mut dev_state, &level_pack.levels);
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                         }
                         SessionStatus::GameOver => {
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                            world.lives = world.config.gameplay.initial_lives;
-                            world.score = 0;
-                            world.load_level(world.current_level_idx, &level_pack.levels);
+                            restart_level(&mut world, &mut dev_state, &level_pack.levels);
                         }
                         SessionStatus::Paused => {}
                     }
@@ -2621,6 +2617,35 @@ fn build_sub_bar(i18n: &I18nCatalog, theme: &ThemeDef, lang: Language) -> String
     .join(HUD_SUB_BAR_SEPARATOR)
 }
 
+/// Starts a fresh run from the title menu: the only transition that ends a developer taint,
+/// because it is the only one that checks the sector against the saved unlock.
+fn start_run_from_title(
+    world: &mut GameWorld,
+    dev: &mut DevState,
+    levels: &[LevelDef],
+    sector_idx: usize,
+) {
+    world.lives = world.config.gameplay.initial_lives;
+    world.score = 0;
+    world.load_level(sector_idx, levels);
+    dev.level_loaded_normally();
+}
+
+/// Restarts the current sector (R key or game-over restart). It never clears a taint.
+fn restart_level(world: &mut GameWorld, dev: &mut DevState, levels: &[LevelDef]) {
+    debug_assert!(!dev.active || dev.tainted);
+    world.lives = world.config.gameplay.initial_lives;
+    world.score = 0;
+    world.load_level(world.current_level_idx, levels);
+}
+
+/// Moves on to the sector after a win. The score carries over and a taint is never cleared.
+fn next_sector(world: &mut GameWorld, dev: &mut DevState, levels: &[LevelDef]) {
+    debug_assert!(!dev.active || dev.tainted);
+    let next_lvl = (world.current_level_idx + 1) % levels.len();
+    world.load_level(next_lvl, levels);
+}
+
 /// Keeps the saved progress out of reach of developer mode: while the current level is tainted,
 /// the live high score and unlock marker are rolled back to the genuine ones.
 fn sync_progress(guard: &mut ProgressGuard, dev: &DevState, world: &mut GameWorld) {
@@ -3303,7 +3328,9 @@ mod tests {
     fn dev_test_world() -> (GameWorld, LevelPack) {
         let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
         let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        (GameWorld::new(config, &pack.levels), pack)
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.high_score = 1;
+        (world, pack)
     }
 
     fn win_current_level(world: &mut GameWorld) {
@@ -3313,37 +3340,60 @@ mod tests {
     }
 
     #[test]
-    fn a_dev_built_score_does_not_reach_the_high_score_on_the_next_sector() {
+    fn dev_score_then_next_sector_leaves_the_high_score_unchanged() {
         let (mut world, pack) = dev_test_world();
-        world.high_score = 1;
-        let mut guard = ProgressGuard::new(1, 0);
+        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
         let mut dev = DevState::default();
+        start_run_from_title(&mut world, &mut dev, &pack.levels, 0);
         dev.toggle();
-        world.load_level(0, &pack.levels);
         world.apply_powerup(kinetix_core::physics::PowerUpKind::ExtraLife);
+        dev.toggle();
         win_current_level(&mut world);
         sync_progress(&mut guard, &dev, &mut world);
-        // Next sector after the win: no title start, so the taint stays and the score carries over.
-        world.load_level(1, &pack.levels);
-        world.update(0.016, &mut Vec::new());
+        next_sector(&mut world, &mut dev, &pack.levels);
+        assert!(world.score > 1, "the dev score carries over");
+        win_current_level(&mut world);
         sync_progress(&mut guard, &dev, &mut world);
-        assert!(world.score > 1);
+        assert!(dev.tainted);
         assert_eq!(world.high_score, 1);
+        assert_eq!(world.max_unlocked_level, 0);
     }
 
     #[test]
-    fn a_dev_jump_to_a_locked_sector_never_unlocks_the_next_one() {
+    fn dev_jump_to_a_locked_sector_stays_locked_after_restart_or_game_over() {
+        for game_over_restart in [false, true] {
+            let (mut world, pack) = dev_test_world();
+            let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
+            let mut dev = DevState::default();
+            start_run_from_title(&mut world, &mut dev, &pack.levels, 0);
+            dev.toggle();
+            world.load_level(5, &pack.levels);
+            dev.toggle();
+            if game_over_restart {
+                world.status = SessionStatus::GameOver;
+            }
+            restart_level(&mut world, &mut dev, &pack.levels);
+            win_current_level(&mut world);
+            assert_eq!(world.max_unlocked_level, 6, "the core alone would unlock");
+            sync_progress(&mut guard, &dev, &mut world);
+            assert_eq!(world.max_unlocked_level, 0);
+        }
+    }
+
+    #[test]
+    fn only_a_title_start_clears_the_taint_and_then_wins_count() {
         let (mut world, pack) = dev_test_world();
         let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
         let mut dev = DevState::default();
         dev.toggle();
-        world.load_level(5, &pack.levels);
         dev.toggle();
-        // R / game over restart / next sector never clear the taint: only a title start does.
-        world.load_level(5, &pack.levels);
+        restart_level(&mut world, &mut dev, &pack.levels);
+        next_sector(&mut world, &mut dev, &pack.levels);
+        assert!(dev.tainted);
+        start_run_from_title(&mut world, &mut dev, &pack.levels, 0);
+        assert!(!dev.tainted);
         win_current_level(&mut world);
-        assert_eq!(world.max_unlocked_level, 6);
         sync_progress(&mut guard, &dev, &mut world);
-        assert_eq!(world.max_unlocked_level, 0);
+        assert_eq!(world.max_unlocked_level, 1);
     }
 }
