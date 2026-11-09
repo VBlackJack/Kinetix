@@ -184,6 +184,55 @@
             return 0;
           }
         };
+        importObject.env.kinetix_save_settings = function (packed) {
+          try {
+            localStorage.setItem("kinetix_sfx", String(packed & 1));
+            localStorage.setItem("kinetix_music", String((packed >> 1) & 1));
+          } catch (_) {}
+        };
+        importObject.env.kinetix_load_settings = function () {
+          // Both settings default to on when absent or storage is unavailable.
+          try {
+            const sfx = localStorage.getItem("kinetix_sfx");
+            const music = localStorage.getItem("kinetix_music");
+            const sfxOn = sfx === null ? 1 : (parseInt(sfx, 10) ? 1 : 0);
+            const musicOn = music === null ? 1 : (parseInt(music, 10) ? 1 : 0);
+            return sfxOn | (musicOn << 1);
+          } catch (_) {
+            return 3;
+          }
+        };
+        // Generic string storage: key and value cross the boundary as UTF-8 byte ranges.
+        importObject.env.kinetix_store_len = function (keyPtr, keyLen) {
+          try {
+            const value = localStorage.getItem(readUtf8(keyPtr, keyLen));
+            if (value === null) return -1;
+            return new TextEncoder().encode(value).length;
+          } catch (_) {
+            return -1;
+          }
+        };
+        importObject.env.kinetix_store_read = function (keyPtr, keyLen, bufPtr, bufCap) {
+          try {
+            const value = localStorage.getItem(readUtf8(keyPtr, keyLen));
+            if (value === null) return -1;
+            const encoded = new TextEncoder().encode(value);
+            if (encoded.length > bufCap) return -1;
+            new Uint8Array(wasm_memory.buffer, bufPtr, encoded.length).set(encoded);
+            return encoded.length;
+          } catch (_) {
+            return -1;
+          }
+        };
+        importObject.env.kinetix_store_write = function (keyPtr, keyLen, valPtr, valLen) {
+          // Quota and private-mode errors are reported to the game, not swallowed.
+          try {
+            localStorage.setItem(readUtf8(keyPtr, keyLen), readUtf8(valPtr, valLen));
+            return 1;
+          } catch (_) {
+            return 0;
+          }
+        };
         importObject.env.kinetix_share_level = function (codePtr, codeLen, msgPtr, msgLen) {
           try {
             const code = readUtf8(codePtr, codeLen);
@@ -287,6 +336,11 @@
       ensureAudio();
       requestLockInGesture(e.button === 0 ? RESUME_BIT_CLICK : 0);
     });
+
+    // Touch devices fire no mousedown before the first tap lands: unlock audio on touchend.
+    glCanvas.addEventListener("touchend", () => {
+      ensureAudio();
+    }, { passive: true });
 
     window.addEventListener("keydown", (e) => {
       requestLockInGesture(RESUME_KEY_BITS[e.code] || 0);

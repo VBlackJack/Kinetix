@@ -34,7 +34,9 @@ use kinetix_core::physics::{
     REGEN_BRICK_HP,
 };
 use macroquad::prelude::*;
-use persistence::{high_score_save_due, load_progress, save_progress};
+use persistence::{
+    high_score_save_due, load_progress, load_settings, save_progress, save_settings, Settings,
+};
 use std::collections::BTreeSet;
 use tuning::*;
 use vfx::{
@@ -637,6 +639,11 @@ async fn main() {
 
     let (saved_hs, saved_unlocked, saved_theme, saved_fr) = load_progress();
     let mut sfx = SoundBank::init().await;
+    let saved_settings = load_settings();
+    sfx.muted = !saved_settings.sfx_on;
+    sfx.music_enabled = saved_settings.music_on;
+    // Applies the saved music preference before the first frame (web: kinetix_set_music).
+    sfx.update_music(false, 0, true);
     let mut lang = if saved_fr { Language::Fr } else { Language::En };
     set_document_lang(lang == Language::Fr);
     let mut theme_idx: usize = saved_theme % theme_reg.themes.len();
@@ -750,9 +757,17 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::M) {
             sfx.muted = !sfx.muted;
+            save_settings(Settings {
+                sfx_on: !sfx.muted,
+                music_on: sfx.music_enabled,
+            });
         }
         if is_key_pressed(KeyCode::B) {
             sfx.music_enabled = !sfx.music_enabled;
+            save_settings(Settings {
+                sfx_on: !sfx.muted,
+                music_on: sfx.music_enabled,
+            });
         }
 
         // Hidden developer mode (Ctrl+Shift+D): never persisted, never advertised.
