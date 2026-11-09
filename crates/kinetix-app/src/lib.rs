@@ -20,3 +20,4 @@ pub mod library;
 pub mod menu;
 pub mod persistence;
 pub mod play_source;
+pub mod satisfaction;
