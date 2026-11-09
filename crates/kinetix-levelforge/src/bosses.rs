@@ -78,7 +78,8 @@ pub const BOSS_ARENAS: [BossArena; 16] = [
             "000001221000000",
         ],
     },
-    // Sector 200 (W2 S100): Twin Ghost Arches with Warp Flanks (8 rows, 2 portals)
+    // Sector 200 (W2 S100): Twin Ghost Arches around an explosive crown (8 rows, no portals:
+    // portals debut in world 4)
     BossArena {
         world: 2,
         sector_in_world: 100,
@@ -87,7 +88,7 @@ pub const BOSS_ARENAS: [BossArena; 16] = [
             "000000000000000",
             "000000000000000",
             "000000000000000",
-            "T000GGEEEGG000T",
+            "00GG0GEEEG0GG00",
             "00#2G00000G2#00",
             "0023E00000E3200",
             "000122000221000",
@@ -321,7 +322,7 @@ mod tests {
     use super::*;
     use crate::validate::{
         cell_similarity, check_reachability, is_destructible_cell, BOSS_CLEAR_ROWS,
-        BOSS_DENSITY_MAX, BOSS_DENSITY_MIN, BOSS_STEM_MAX_LEN, SIMILARITY_MAX,
+        BOSS_DENSITY_MAX, BOSS_DENSITY_MIN, BOSS_STEM_MAX_LEN, MECHANIC_DEBUTS, SIMILARITY_MAX,
     };
     use kinetix_core::config::LevelPack;
     use kinetix_core::level_code::{EDITOR_COLS, EDITOR_ROWS};
@@ -386,6 +387,12 @@ mod tests {
                 );
                 check_reachability(&rows)
                     .unwrap_or_else(|e| panic!("W{world} S{sector} unreachable: {e}"));
+                for &(mechanic, debut) in &MECHANIC_DEBUTS {
+                    assert!(
+                        world >= debut || !rows.iter().any(|r| r.contains(mechanic)),
+                        "W{world} S{sector} uses mechanic {mechanic:?} before its debut world {debut}"
+                    );
+                }
 
                 let shape = shape_grid_from_rows(&rows);
                 let label = format!("W{world} S{sector} ({})", arena.title_stem);

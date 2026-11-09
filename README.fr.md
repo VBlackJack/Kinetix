@@ -24,6 +24,8 @@ La campagne couvre 800 secteurs répartis sur 8 mondes de 100 secteurs chacun, a
 7. **Monde 7 : Horizon du Vide** (Secteurs 601-700) - synthèse multi-mécaniques dans des arènes asymétriques.
 8. **Monde 8 : Trône de Singularité** (Secteurs 701-800) - épreuve finale culminant face à `APEX ARCHON [FINAL BOSS]` au secteur 800.
 
+Les secteurs générés sont composés, pas éparpillés. Chacun est un motif dessiné à la main (48 icônes, glyphes, mandalas, damiers, diagonales, flèches, escaliers et spirales) portant une mécanique entière : flancs d'acier, cages explosives, mèches en dominos, bandes fantômes, voies de tapis roulant, paires de portails, propulseurs ou boucliers régénérants. Environ 40 % des secteurs ordinaires sont symétriques par construction, les autres sont des décalages asymétriques structurés, et le dernier secteur de chaque bloc qui ne se termine pas sur un boss est une pièce maîtresse. Les mécaniques débutent dans l'ordre (briques fantômes au monde 2, briques mobiles au 3, portails au 4, propulseurs au 5, briques régénérantes au 6). `levelforge simulate` vérifie que le taux de réussite du bot expert baisse d'environ 48 % au monde 1 à environ 37 % au monde 8.
+
 ## Moteurs de rendu visuel (commutables à chaud via `F1`)
 
 Le jeu embarque 8 moteurs de rendu, parcourus avec `F1` :

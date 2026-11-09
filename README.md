@@ -24,6 +24,8 @@ The campaign spans 800 sectors across 8 worlds of 100 sectors each, with mid-wor
 7. **World 7: Void Horizon** (Sectors 601-700) - multi-mechanic synthesis across asymmetric void arenas.
 8. **World 8: Singularity Throne** (Sectors 701-800) - endgame gauntlet culminating in `APEX ARCHON [FINAL BOSS]` at Sector 800.
 
+Generated sectors are composed, not scattered. Each one is a hand-authored motif (48 icons, glyphs, mandalas, checkerboards, diagonals, arrows, staircases and spirals) carrying one whole mechanic feature: steel flanks, explosive cages, domino fuses, ghost bands, conveyor lanes, portal pairs, bumpers or regenerating shields. About 40% of the regular sectors are mirror-symmetric by construction, the others are structured asymmetric offsets, and the last sector of each block that does not end on a boss is a showcase set piece. Mechanics debut in order (ghost bricks in world 2, moving bricks in 3, portals in 4, bumpers in 5, regenerating bricks in 6). `levelforge simulate` checks that the good-bot clear rate falls from about 48% in world 1 to about 37% in world 8.
+
 ## Visual Renderers (Hot-Swappable via `F1`)
 
 The game ships 8 renderers, cycled with `F1`:

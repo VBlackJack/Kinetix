@@ -931,6 +931,175 @@ pub fn block_stats(summaries: &[LevelSimSummary]) -> Vec<BlockStats> {
         .collect()
 }
 
+/// A generated sector whose good-bot clear rate is at or below this value is "hard".
+pub const HARD_GOOD_CLEAR_RATE: f32 = 0.375;
+/// Target mean good-bot clear rate of the regular generated levels of each world (the
+/// campaign gets harder world after world).
+pub const WORLD_GOOD_TARGET: [f32; 8] = [0.50, 0.48, 0.46, 0.44, 0.42, 0.40, 0.39, 0.38];
+/// A world mean may exceed its target by this much.
+pub const WORLD_GOOD_TOLERANCE: f32 = 0.03;
+/// A world mean may exceed the previous world mean by this much (non-increasing curve).
+pub const WORLD_MEAN_STEP_TOLERANCE: f32 = 0.02;
+/// The first generated world mean must exceed the last world mean by at least this much.
+pub const MIN_CAMPAIGN_DESCENT: f32 = 0.06;
+/// Longest allowed run of consecutive hard sectors (bosses counted).
+pub const MAX_CONSECUTIVE_HARD_SECTORS: usize = 2;
+/// Number of trailing levels of the previous world fed to the hard-run scan, so a run crossing
+/// a world boundary is caught.
+const HARD_RUN_LOOKBACK: usize = MAX_CONSECUTIVE_HARD_SECTORS;
+
+/// Whether a generated level's good-bot clear rate makes it a hard sector.
+fn is_hard(summary: &LevelSimSummary) -> bool {
+    summary.good.clear_rate <= HARD_GOOD_CLEAR_RATE
+}
+
+/// World a generated level id belongs to (`world = index / SECTORS_PER_WORLD + 1`).
+fn world_of_id(level_id: usize) -> usize {
+    (level_id - 1) / SECTORS_PER_WORLD + 1
+}
+
+/// Generated levels of `world` (ids beyond the legacy pack), ordered by id.
+fn generated_in_world(world: usize, summaries: &[LevelSimSummary]) -> Vec<&LevelSimSummary> {
+    let mut list: Vec<&LevelSimSummary> = summaries
+        .iter()
+        .filter(|s| s.level_id > LEGACY_LEVEL_COUNT && world_of_id(s.level_id) == world)
+        .collect();
+    list.sort_by_key(|s| s.level_id);
+    list
+}
+
+/// Mean good-bot clear rate over the regular generated levels of `world`, `None` when it has none.
+pub fn world_mean_good_clear(world: usize, summaries: &[LevelSimSummary]) -> Option<f32> {
+    let rates: Vec<f32> = generated_in_world(world, summaries)
+        .into_iter()
+        .filter(|s| !s.boss)
+        .map(|s| s.good.clear_rate)
+        .collect();
+    if rates.is_empty() {
+        None
+    } else {
+        Some(rates.iter().sum::<f32>() / rates.len() as f32)
+    }
+}
+
+/// Whether every generated sector of `world` is present in `summaries`.
+pub fn is_world_complete(world: usize, summaries: &[LevelSimSummary]) -> bool {
+    if world == 0 {
+        return false;
+    }
+    let start = ((world - 1) * SECTORS_PER_WORLD).max(LEGACY_LEVEL_COUNT);
+    let end = world * SECTORS_PER_WORLD;
+    let present = generated_in_world(world, summaries).len();
+    present > 0 && present == end - start
+}
+
+/// Target mean of a world; worlds past the table use the last entry.
+fn world_target(world: usize) -> f32 {
+    WORLD_GOOD_TARGET
+        .get(world - 1)
+        .copied()
+        .unwrap_or(WORLD_GOOD_TARGET[WORLD_GOOD_TARGET.len() - 1])
+}
+
+/// Difficulty-curve issues of one world: its mean against the target table, its mean against the
+/// previous world's mean (when that world is in `summaries`), and runs of consecutive hard
+/// sectors (bosses counted) ending in this world. `summaries` may hold the whole pack so far;
+/// only levels of `world` (and the previous world's trailing levels) are inspected. Meant to
+/// be called by a generator at each world boundary, and by [`campaign_curve_issues`].
+pub fn world_curve_issues(world: usize, summaries: &[LevelSimSummary]) -> Vec<String> {
+    let mut issues = Vec::new();
+    if world == 0 {
+        return issues;
+    }
+    if let Some(mean) = world_mean_good_clear(world, summaries) {
+        let target = world_target(world);
+        if mean > target + WORLD_GOOD_TOLERANCE {
+            issues.push(format!(
+                "world {world}: mean good clear rate {:.1}% exceeds the target {:.1}% by more than {:.1} points",
+                mean * 100.0,
+                target * 100.0,
+                WORLD_GOOD_TOLERANCE * 100.0
+            ));
+        }
+        if world > 1 {
+            if let Some(prev) = world_mean_good_clear(world - 1, summaries) {
+                if mean > prev + WORLD_MEAN_STEP_TOLERANCE {
+                    issues.push(format!(
+                        "world {world}: mean good clear rate {:.1}% rises above world {} ({:.1}%) by more than {:.1} points",
+                        mean * 100.0,
+                        world - 1,
+                        prev * 100.0,
+                        WORLD_MEAN_STEP_TOLERANCE * 100.0
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut sequence: Vec<&LevelSimSummary> = Vec::new();
+    if world > 1 {
+        let previous = generated_in_world(world - 1, summaries);
+        let skip = previous.len().saturating_sub(HARD_RUN_LOOKBACK);
+        sequence.extend(previous.into_iter().skip(skip));
+    }
+    let lookback_len = sequence.len();
+    sequence.extend(generated_in_world(world, summaries));
+    let mut run = 0usize;
+    let mut last_id = 0usize;
+    for (i, s) in sequence.iter().enumerate() {
+        if last_id != 0 && s.level_id != last_id + 1 {
+            run = 0;
+        }
+        last_id = s.level_id;
+        if is_hard(s) {
+            run += 1;
+            if run == MAX_CONSECUTIVE_HARD_SECTORS + 1 && i >= lookback_len {
+                issues.push(format!(
+                    "world {world}: more than {MAX_CONSECUTIVE_HARD_SECTORS} consecutive hard sectors ending at level {} ({})",
+                    s.level_id, s.name
+                ));
+            }
+        } else {
+            run = 0;
+        }
+    }
+    issues
+}
+
+/// Campaign difficulty-curve issues over the complete worlds of `summaries` (legacy levels are
+/// ignored; incomplete worlds are skipped, so partial runs and early generation stay quiet):
+/// per-world target, non-increasing world means within tolerance, no run of three hard sectors,
+/// and, once all `WORLD_GOOD_TARGET` worlds are complete, a first-to-last descent of at least
+/// `MIN_CAMPAIGN_DESCENT`. Empty means the curve is acceptable.
+pub fn campaign_curve_issues(summaries: &[LevelSimSummary]) -> Vec<String> {
+    let mut issues = Vec::new();
+    let worlds: Vec<usize> = (1..=WORLD_GOOD_TARGET.len())
+        .filter(|&w| is_world_complete(w, summaries))
+        .collect();
+    for &world in &worlds {
+        issues.extend(world_curve_issues(world, summaries));
+    }
+    if worlds.len() == WORLD_GOOD_TARGET.len() {
+        let first_world = worlds[0];
+        let last_world = worlds[worlds.len() - 1];
+        if let (Some(first), Some(last)) = (
+            world_mean_good_clear(first_world, summaries),
+            world_mean_good_clear(last_world, summaries),
+        ) {
+            if first - last < MIN_CAMPAIGN_DESCENT {
+                issues.push(format!(
+                    "campaign descent {:.1} points from world {first_world} ({:.1}%) to world {last_world} ({:.1}%) is below the minimum {:.1}",
+                    (first - last) * 100.0,
+                    first * 100.0,
+                    last * 100.0,
+                    MIN_CAMPAIGN_DESCENT * 100.0
+                ));
+            }
+        }
+    }
+    issues
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1167,5 +1336,154 @@ mod tests {
         assert!((blocks[1].casual_clear_rate - 0.25).abs() < f32::EPSILON);
         assert_eq!(blocks[2].good_median_clear_time, None);
         assert_eq!(block_stats(&sums), blocks);
+    }
+
+    /// Builds summaries for the given worlds from a template; `rate(id)` gives the good clear
+    /// rate of the generated level `id`, `boss(id)` flags bosses.
+    fn curve_summaries(
+        worlds: std::ops::RangeInclusive<usize>,
+        rate: impl Fn(usize) -> f32,
+        boss: impl Fn(usize) -> bool,
+    ) -> Vec<LevelSimSummary> {
+        let (config, levels) = legacy_non_boss();
+        let template = simulate_levels(&config, &levels[..1], &DEFAULT_SEEDS[..1])
+            .pop()
+            .expect("one summary");
+        let mut out = Vec::new();
+        for world in worlds {
+            let start = ((world - 1) * SECTORS_PER_WORLD).max(LEGACY_LEVEL_COUNT) + 1;
+            for id in start..=world * SECTORS_PER_WORLD {
+                let mut s = template.clone();
+                s.level_id = id;
+                s.world = world;
+                s.boss = boss(id);
+                s.good.clear_rate = rate(id);
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// Exactly the target of the world of generated level `id`.
+    fn on_target(id: usize) -> f32 {
+        WORLD_GOOD_TARGET[world_of_id(id) - 1]
+    }
+
+    #[test]
+    fn campaign_curve_accepts_a_descending_full_campaign() {
+        let sums = curve_summaries(1..=8, on_target, |_| false);
+        let issues = campaign_curve_issues(&sums);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn campaign_curve_rejects_a_world_mean_above_its_target() {
+        let sums = curve_summaries(
+            1..=2,
+            |id| {
+                if id > SECTORS_PER_WORLD {
+                    0.60
+                } else {
+                    on_target(id)
+                }
+            },
+            |_| false,
+        );
+        let issues = campaign_curve_issues(&sums);
+        assert!(
+            issues.iter().any(|i| i.contains("exceeds the target")),
+            "{issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains("rises above world 1")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn campaign_curve_rejects_a_flat_campaign() {
+        let sums = curve_summaries(1..=8, |_| 0.45, |_| false);
+        let issues = campaign_curve_issues(&sums);
+        assert!(
+            issues.iter().any(|i| i.contains("campaign descent")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn campaign_curve_skips_incomplete_worlds() {
+        let mut sums = curve_summaries(1..=1, on_target, |_| false);
+        sums.truncate(sums.len() - 1);
+        for s in &mut sums {
+            s.good.clear_rate = 1.0;
+        }
+        assert!(campaign_curve_issues(&sums).is_empty());
+        assert!(campaign_curve_issues(&[]).is_empty());
+    }
+
+    #[test]
+    fn three_consecutive_hard_sectors_are_rejected_and_bosses_count() {
+        let rate = |id: usize| {
+            if (30..=32).contains(&id) {
+                HARD_GOOD_CLEAR_RATE
+            } else {
+                on_target(id)
+            }
+        };
+        let sums = curve_summaries(1..=1, rate, |_| false);
+        let issues = world_curve_issues(1, &sums);
+        assert!(
+            issues.iter().any(|i| i.contains("consecutive hard")),
+            "{issues:?}"
+        );
+
+        // Two hard sectors are fine.
+        let two = |id: usize| {
+            if (30..=31).contains(&id) {
+                HARD_GOOD_CLEAR_RATE
+            } else {
+                on_target(id)
+            }
+        };
+        let sums = curve_summaries(1..=1, two, |_| false);
+        assert!(world_curve_issues(1, &sums).is_empty());
+
+        // A hard boss between two hard sectors counts toward the run.
+        let sums = curve_summaries(1..=1, rate, |id| id == 31);
+        assert!(world_curve_issues(1, &sums)
+            .iter()
+            .any(|i| i.contains("consecutive hard")));
+    }
+
+    #[test]
+    fn hard_run_crossing_a_world_boundary_is_rejected() {
+        let rate = |id: usize| {
+            if (99..=101).contains(&id) {
+                HARD_GOOD_CLEAR_RATE
+            } else {
+                on_target(id)
+            }
+        };
+        let sums = curve_summaries(1..=2, rate, |_| false);
+        let issues = campaign_curve_issues(&sums);
+        assert!(
+            issues.iter().any(|i| i.contains("consecutive hard")),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn bosses_do_not_move_the_world_mean() {
+        let mut sums = curve_summaries(1..=1, on_target, |id| id == 50);
+        for s in &mut sums {
+            if s.boss {
+                s.good.clear_rate = 0.0;
+            }
+        }
+        let mean = world_mean_good_clear(1, &sums).expect("mean");
+        assert!(
+            (mean - on_target(LEGACY_LEVEL_COUNT + 1)).abs() < 1e-4,
+            "{mean}"
+        );
     }
 }

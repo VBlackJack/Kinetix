@@ -44,7 +44,7 @@ pub enum MotifFamily {
     SpiralWave,
 }
 
-pub const MOTIFS: [MotifTemplate; 48] = [
+pub static MOTIFS: [MotifTemplate; 48] = [
     // =========================================================================
     // 1..=12: PIXEL ICONS (varied 5 to 8 rows, symmetric and asymmetric)
     // =========================================================================
@@ -224,7 +224,7 @@ pub const MOTIFS: [MotifTemplate; 48] = [
             "...YYYYYYYYY...",
             ".YYXXXXXXXXXYY.",
             "YXXY.......YXXY",
-            "YXXY...E...YXXY",
+            "YXXYE.....EYXXY",
             ".YXXY.....YXXY.",
             "..YYZZ...ZZYY..",
             "YYYYYY...YYYYYY",
@@ -415,7 +415,7 @@ pub const MOTIFS: [MotifTemplate; 48] = [
         rows: &[
             "XXX.YYY.YYY.XXX",
             "XEX.YZY.YZY.XEX",
-            "...............",
+            "XXXXYYYYYYYXXXX",
             "YYY.XXX.XXX.YYY",
             "YZY.XEX.XEX.YZY",
             "XXX.YYY.YYY.XXX",
@@ -482,7 +482,7 @@ pub const MOTIFS: [MotifTemplate; 48] = [
             "..YYYYY..ZZ....",
             "....YYEYY..ZZ..",
             "......YYYYY..ZZ",
-            "ZZ......YYYYY..",
+            "........YYYYYZZ",
         ],
     },
     MotifTemplate {
@@ -513,15 +513,15 @@ pub const MOTIFS: [MotifTemplate; 48] = [
         ],
     },
     MotifTemplate {
-        name: "WEST_CHEVRON",
+        name: "FUNNEL_VEES",
         family: MotifFamily::Arrow,
         rows: &[
-            "...YY...YY...YY",
-            "..YY...YY...YY.",
-            "ZYY..EYY..EYY..",
-            "ZYY..EYY..EYY..",
-            "..YY...YY...YY.",
-            "...YY...YY...YY",
+            "YYYYY.....YYYYY",
+            ".YXXXY...YXXXY.",
+            "..YXXXY.YXXXY..",
+            "...YXEXYXEXY...",
+            "....YXXZXXY....",
+            ".....YYYYY.....",
         ],
     },
     MotifTemplate {
@@ -578,16 +578,15 @@ pub const MOTIFS: [MotifTemplate; 48] = [
         ],
     },
     MotifTemplate {
-        name: "DESCENDING_STAIRS",
+        name: "TWIN_PEAKS",
         family: MotifFamily::Staircase,
         rows: &[
-            "ZZZ............",
-            "YYYYY..........",
-            "XXXXXXX........",
-            "YYYYEYYYY......",
-            "XXXXXXXXXXX....",
-            "..YYYYYEYYYYY..",
-            "....XXXXXXXXXXX",
+            "....Y.......Y..",
+            "...YXY.....YXY.",
+            "..YXXXY...YXXXY",
+            ".YXXEXXY.YXXEXX",
+            "YXXXXXXXYXXXXXX",
+            "YYYYYYYYYYYYYYY",
         ],
     },
     MotifTemplate {
@@ -651,11 +650,11 @@ pub const MOTIFS: [MotifTemplate; 48] = [
         name: "SINE_WAVE",
         family: MotifFamily::SpiralWave,
         rows: &[
-            "..YYYY.........",
-            ".YY..YY.......Y",
-            "YY....YY..E..YY",
-            ".......YY...YY.",
-            "........YYYYY..",
+            "..YYYYYY.......",
+            ".YXXXXXXYY....Y",
+            "YXXYY.YXXXYY.YY",
+            "YXY...YYXXXYYXY",
+            "YY.....YYXEXXXY",
         ],
     },
     MotifTemplate {
@@ -664,8 +663,8 @@ pub const MOTIFS: [MotifTemplate; 48] = [
         rows: &[
             "...YYYYYYYY....",
             ".YYXXXXXXXXYY..",
-            "YXXY....YXXXXY.",
-            "YXX..ZZ..YXXEXY",
+            "YXXY.ZZ.YXXXXY.",
+            "YXX......YXXEXY",
             ".YXX......YXXXY",
             "..YYYYYYYYYYYYY",
         ],
@@ -675,6 +674,9 @@ pub const MOTIFS: [MotifTemplate; 48] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validate::{
+        colour_regions_per_cell, dust_and_components, MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8,
+    };
     use kinetix_core::level_code::EDITOR_COLS;
     use std::collections::BTreeSet;
 
@@ -726,5 +728,64 @@ mod tests {
             asymmetric_count >= 24,
             "expected at least 24 asymmetric motifs, got {asymmetric_count}"
         );
+    }
+
+    /// The motif as level cells: body, trim and focal tokens become three different bricks.
+    fn motif_cells(motif: &MotifTemplate) -> Vec<String> {
+        motif
+            .rows
+            .iter()
+            .map(|r| {
+                r.chars()
+                    .map(|c| match c {
+                        '.' => '0',
+                        'X' => '1',
+                        'Y' => '2',
+                        'Z' => '3',
+                        other => other,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_motif_is_a_dust_free_shape_with_few_components_and_colour_regions() {
+        for m in &MOTIFS {
+            let cells = motif_cells(m);
+            let (dust, components) = dust_and_components(&cells);
+            assert_eq!(dust, 0, "motif {} has dust", m.name);
+            assert!(
+                components <= MAX_COMPONENTS_8,
+                "motif {} has {components} components",
+                m.name
+            );
+            let regions = colour_regions_per_cell(&cells);
+            assert!(
+                regions <= MAX_COLOUR_REGIONS_PER_CELL,
+                "motif {} has {regions:.2} colour regions per cell",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_motif_is_an_exact_mirror_image_of_another() {
+        let mirrored = |m: &MotifTemplate| -> Vec<String> {
+            m.rows
+                .iter()
+                .map(|r| r.chars().rev().collect::<String>())
+                .collect()
+        };
+        let upside_down = |m: &MotifTemplate| -> Vec<String> {
+            m.rows.iter().rev().map(|r| (*r).to_string()).collect()
+        };
+        for (i, a) in MOTIFS.iter().enumerate() {
+            for b in MOTIFS.iter().skip(i + 1) {
+                let plain: Vec<String> = b.rows.iter().map(|r| (*r).to_string()).collect();
+                assert_ne!(mirrored(a), plain, "{} mirrors {}", a.name, b.name);
+                assert_ne!(upside_down(a), plain, "{} flips into {}", a.name, b.name);
+            }
+        }
     }
 }

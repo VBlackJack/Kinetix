@@ -14,20 +14,31 @@
  * limitations under the License.
  */
 
-//! Deterministic campaign level generator combining a 48-template hand-authored motif library
-//! (`motifs.rs`), 16 hand-authored boss arenas (`bosses.rs`), and world-specific structural
-//! passes (steel corridors, explosive cages, paired portal shortcuts, ghost silhouettes,
-//! moving conveyor lanes, domino explosive fuses, bumper pinball bays, and regenerating shields).
+//! Deterministic campaign level generator.
+//!
+//! A regular level is composed from whole features, never from random cells:
+//! - a hand-authored motif (`motifs.rs`) picked by the block theme of its world,
+//! - an orientation: mirrored from a half motif for the symmetric sectors (`sector % 5` in
+//!   `{0, 2}`), flipped and offset inside its bounding box for the asymmetric ones,
+//! - a structural pass that turns a whole feature into a mechanic (steel flanks, explosive
+//!   cage, domino fuse, ghost band, conveyor lane, portal pair, bumpers, regenerating shield),
+//! - a colour and toughness style applied per row band or per feature, never per cell.
+//!
+//! Sector 10 of each block is a set piece from [`SET_PIECES`]. The 16 boss arenas are
+//! hand-authored in `bosses.rs`.
 
 use crate::bosses::boss_arena;
-use crate::motifs::MOTIFS;
+use crate::motifs::{MotifFamily, MotifTemplate, MOTIFS};
 use crate::validate::{
-    is_asymmetric, is_destructible_cell, BOSS_STEM_MAX_LEN, BOSS_SUFFIX, DENSITY_MAX, DENSITY_MIN,
-    FINAL_BOSS_SUFFIX, MAX_LEVEL_NAME_LEN,
+    colour_regions_per_cell, dust_and_components, is_destructible_cell, mirror_mismatch_cells,
+    BOSS_STEM_MAX_LEN, BOSS_SUFFIX, DENSITY_MAX, DENSITY_MIN, FINAL_BOSS_SUFFIX,
+    MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8, MAX_DUST, MAX_LEVEL_NAME_LEN, MECHANIC_DEBUTS,
+    MIN_ASYMMETRIC_CELLS,
 };
 use kinetix_core::config::LevelDef;
 use kinetix_core::level_code::{EDITOR_COLS, EDITOR_ROWS};
 use std::collections::BTreeSet;
+use std::fmt;
 
 const WORLD_ADJECTIVES: [&[&str]; 8] = [
     &[
@@ -84,7 +95,7 @@ const WORLD_ADJECTIVES: [&[&str]; 8] = [
         "PRIME",
         "SUPREME",
         "INFINITE",
-        "FINAL",
+        "OMNI",
         "ULTIMA",
     ],
 ];
@@ -97,15 +108,19 @@ const NOUNS: &[&str] = &[
     "ARENA", "WELL", "NODE",
 ];
 
-/// Name candidates tried for one sector before giving up.
-const NAME_ATTEMPT_BUDGET: usize = 500;
+/// Distance between the name-pair indices of two consecutive sectors (coprime with the number
+/// of adjective x noun pairs, so a world never repeats a pair).
+const NAME_PAIR_STRIDE: usize = 37;
+/// Shift of the first name-pair index per world, so worlds do not open on the same noun.
+const NAME_WORLD_OFFSET: usize = 5;
+
 /// Minimum row count of a generated regular level.
 const MIN_REGULAR_ROWS: usize = 4;
 /// Maximum row count of a generated regular level.
 const MAX_REGULAR_ROWS: usize = EDITOR_ROWS;
-/// Minimum destructible bricks kept after structural passes (with safety margin inside 30..=80).
+/// Minimum destructible bricks of a generated regular level (margin inside the validate band).
 const SAFE_DENSITY_MIN: usize = DENSITY_MIN + 2;
-/// Maximum destructible bricks kept after structural passes (with safety margin inside 30..=80).
+/// Maximum destructible bricks of a generated regular level (margin inside the validate band).
 const SAFE_DENSITY_MAX: usize = DENSITY_MAX - 4;
 /// Mid-boss sector index within each 100-sector world.
 const MID_BOSS_SECTOR: usize = 50;
@@ -113,6 +128,33 @@ const MID_BOSS_SECTOR: usize = 50;
 const WORLD_BOSS_SECTOR: usize = 100;
 /// Sectors per block in a world.
 const BLOCK_SIZE: usize = 10;
+/// Blocks per world.
+const BLOCKS_PER_WORLD: usize = 10;
+/// Position inside a block (0-based) of the set piece.
+const SET_PIECE_POS: usize = BLOCK_SIZE - 1;
+/// Positions inside a block (0-based) of the two breathers.
+const BREATHER_POSITIONS: [usize; 2] = [3, 7];
+/// Sector residues modulo [`SYMMETRY_PERIOD`] that are mirror-symmetric (40% of the sectors).
+const SYMMETRIC_RESIDUES: [usize; 2] = [0, 2];
+/// Period of the symmetric / asymmetric sector pattern.
+const SYMMETRY_PERIOD: usize = 5;
+/// An asymmetric sector must differ from its mirror by at least this many cells (the validate
+/// gate needs `MIN_ASYMMETRIC_CELLS`; the margin keeps it from sitting on the line).
+const ASYMMETRY_MIN_MISMATCH: usize = MIN_ASYMMETRIC_CELLS + 2;
+/// Largest horizontal offset of an asymmetric motif (columns), clamped to its bounding box.
+const MAX_SHIFT: isize = 3;
+/// One in this many non-teaching sectors flips its motif upside down.
+const FLIP_VERTICAL_ODDS: usize = 3;
+/// Largest number of empty rows above a motif.
+const MAX_TOP_PAD: usize = 2;
+/// Percent chance that a motif is cropped (rows, columns) before its feature is added.
+const CROP_PERCENT: usize = 50;
+/// Most rows cropped off the top or the bottom of a motif.
+const MAX_CROP_ROWS: usize = 2;
+/// Most columns cropped off one side of an asymmetric motif (a symmetric one loses at most one
+/// column per side).
+const MAX_CROP_COLS: usize = 2;
+
 /// Seed mixing constant for per-level RNG initialization.
 const LEVEL_SEED_SALT: u64 = 0x517C_C1B7_2722_0A95;
 /// SplitMix64 golden ratio increment.
@@ -123,6 +165,119 @@ const RNG_MIX_MUL_A: u64 = 0xBF58_476D_1CE4_E5B9;
 const RNG_MIX_MUL_B: u64 = 0x94D0_49BB_1331_11EB;
 /// Xorshift* output multiplier.
 const RNG_STAR_MUL: u64 = 0x2545_F491_4F6C_DD1D;
+
+// Density: the destructible brick target of a sector. Legacy levels measured 52..=77.
+/// Brick target of the first world before any rise.
+const DENSITY_BASE: f32 = 34.0;
+/// Brick target added per world.
+const DENSITY_PER_WORLD: f32 = 1.4;
+/// Brick target added per block of a world.
+const DENSITY_PER_BLOCK: f32 = 2.8;
+/// Brick target change on the first sector of a block (a gentle opener).
+const DENSITY_OPENER_DELTA: f32 = -4.0;
+/// Brick target change on the breather sectors of a block.
+const DENSITY_BREATHER_DELTA: f32 = -5.0;
+/// Brick target change on the set piece of a block.
+const DENSITY_SET_PIECE_DELTA: f32 = 3.0;
+/// A level may hold this many bricks fewer than its target.
+const DENSITY_WINDOW_BELOW: usize = 8;
+/// A level may hold this many bricks more than its target.
+const DENSITY_WINDOW_ABOVE: usize = 18;
+/// Fewest motifs of the block theme that must fit the density window; fewer and the whole
+/// library is searched instead.
+const MIN_THEMED_POOL: usize = 3;
+/// A pass may add or remove a few bricks (steel replaces some, a lane adds some), so motifs this
+/// many cells outside the density window are still considered.
+const PASS_SLACK: usize = 4;
+
+// Hardness dial (0 = softest, `MAX_HARDNESS` = hardest). It only selects whole features.
+/// Highest hardness step.
+pub const MAX_HARDNESS: usize = 5;
+/// Tough (two-hit) body bands per hardness step.
+const TOUGH_BANDS_BY_HARDNESS: [usize; MAX_HARDNESS + 1] = [0, 1, 1, 2, 3, 3];
+/// From this hardness the focal bricks (token `Z`) are tough.
+const TOUGH_FOCAL_FROM: usize = 2;
+/// From this hardness the trim bricks (token `Y`) are tough.
+const TOUGH_TRIM_FROM: usize = 4;
+/// From this hardness the explosives of the motif are defused into plain bricks.
+const DEFUSE_FROM: usize = 4;
+/// Hardness ceiling of teaching sectors.
+const TEACHING_MAX_HARDNESS: usize = 1;
+/// Hardness ceiling of breather sectors.
+const BREATHER_MAX_HARDNESS: usize = 2;
+
+// Colour styling.
+const NORMAL_COLOURS: [char; 4] = ['1', '2', '3', '4'];
+const TOUGH_COLOURS: [char; 2] = ['5', '6'];
+/// Candidate heights (rows) of a colour band.
+const BAND_ROW_CHOICES: [usize; 3] = [2, 2, 3];
+/// Offset of the trim colour from the body base colour.
+const TRIM_COLOUR_OFFSET: usize = 2;
+/// Offset of the focal colour from the body base colour.
+const FOCAL_COLOUR_OFFSET: usize = 3;
+
+// Structure pass parameters.
+/// Fewest cells a steel feature must replace.
+const STEEL_MIN_CELLS: usize = 4;
+/// Most cells of a steel girder, so a gap always remains at an edge of the row.
+const STEEL_GIRDER_MAX_CELLS: usize = COLS - 4;
+/// Longest run of a domino fuse.
+const FUSE_MAX_LEN: usize = 5;
+/// Shortest run of a domino fuse.
+const FUSE_MIN_LEN: usize = 4;
+/// Fewest cells of a ghost band.
+const GHOST_MIN_CELLS: usize = 4;
+/// Most cells of a ghost band in a teaching sector.
+const GHOST_TEACHING_MAX_CELLS: usize = 8;
+/// Most cells of a ghost band elsewhere.
+const GHOST_MAX_CELLS: usize = 20;
+/// Rows of a ghost band.
+const GHOST_BAND_ROWS: usize = 2;
+/// Moving bricks of a teaching conveyor lane.
+const LANE_TEACHING_BRICKS: usize = 3;
+/// Moving bricks of a conveyor lane elsewhere.
+const LANE_BRICKS: usize = 4;
+/// Fewest columns between two moving bricks of a lane, so they have room to travel.
+const LANE_MIN_SPACING: usize = 2;
+/// Widest border column probed for a portal.
+const PORTAL_MAX_INSET: usize = 3;
+/// Fewest and most focal bricks turned into bumpers.
+const BUMPER_FOCAL_RANGE: (usize, usize) = (2, 4);
+/// Column pairs probed for a bumper pair when the motif has no focal bricks.
+const BUMPER_COL_PAIRS: [(usize, usize); 3] = [(4, 10), (3, 11), (5, 9)];
+/// Asymmetric bumper pair spacing in columns.
+const BUMPER_ASYMMETRIC_GAP: usize = 5;
+/// Fewest contiguous body cells of a regenerating shield row.
+const SHIELD_MIN_RUN: usize = 3;
+/// Most cells of a regenerating shield.
+const SHIELD_MAX_RUN: usize = 7;
+/// Percent chance that a later block adds a second pass.
+const SECONDARY_PASS_PERCENT: usize = 33;
+/// First block whose sectors may carry a second pass.
+const SECONDARY_PASS_FROM_BLOCK: usize = 3;
+
+const COLS: usize = EDITOR_COLS;
+const MID_COL: usize = COLS / 2;
+/// Fraction scale: percent.
+const PERCENT: usize = 100;
+
+// Motif tokens.
+const T_EMPTY: char = '.';
+const T_BODY: char = 'X';
+const T_TRIM: char = 'Y';
+const T_FOCAL: char = 'Z';
+const T_EXPLOSIVE: char = 'E';
+/// Cage brick: a tough brick protecting an explosive.
+const T_CAGE: char = 'K';
+const CELL_EMPTY: char = '0';
+const CELL_STEEL: char = '#';
+const CELL_GHOST: char = 'G';
+const CELL_MOVING: char = 'M';
+const CELL_PORTAL: char = 'T';
+const CELL_BUMPER: char = 'B';
+const CELL_REGEN: char = 'R';
+
+type Grid = Vec<Vec<char>>;
 
 #[derive(Clone)]
 struct Rng(u64);
@@ -150,35 +305,358 @@ impl Rng {
             (self.next_u32() as usize) % bound
         }
     }
+
+    fn chance(&mut self, percent: usize) -> bool {
+        self.usize_below(PERCENT) < percent
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.usize_below(items.len())]
+    }
 }
 
 /// Structural pass applied on top of a placed motif.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StructurePass {
-    /// Open teaching or breather layout with clean angles.
-    OpenShowcase,
-    /// Indestructible `#` side tunnels or angled baffles that force bank shots.
-    SteelCorridors,
-    /// Partial `#` and tough-brick cage protecting an internal `E` chain core.
-    ExplosiveCage,
-    /// Exactly two `T` portals creating a shortcut around a barrier.
-    PortalShortcut,
-    /// Ghost `G` silhouette masking a inner pattern.
-    GhostSilhouette,
-    /// Horizontal conveyor row of `M` bricks with open travel space.
-    ConveyorLane,
-    /// Diagonal or stepped fuse of `E` bricks that chain-detonate across rows.
-    DominoFuse,
-    /// Upper/mid `B` bumper pinball bay surrounded by scoring targets.
-    BumperPinballBay,
-    /// Regenerating `R` shield line guarding key bricks behind it.
-    RegenShieldWall,
+    /// The motif as drawn.
+    Open,
+    /// Indestructible `#` flanks or girder.
+    Steel,
+    /// Tough bricks around the explosive cores.
+    Cage,
+    /// A diagonal run of `E` bricks that chain-detonates.
+    Fuse,
+    /// A band of `G` ghost bricks.
+    Ghost,
+    /// A lane of `M` moving bricks.
+    Conveyor,
+    /// Exactly two `T` portals.
+    Portals,
+    /// `B` bumpers.
+    Bumper,
+    /// An `R` regenerating shield row.
+    Regen,
+}
+
+impl StructurePass {
+    /// The mechanic cell this pass introduces, if any.
+    fn mechanic(self) -> Option<char> {
+        match self {
+            StructurePass::Ghost => Some(CELL_GHOST),
+            StructurePass::Conveyor => Some(CELL_MOVING),
+            StructurePass::Portals => Some(CELL_PORTAL),
+            StructurePass::Bumper => Some(CELL_BUMPER),
+            StructurePass::Regen => Some(CELL_REGEN),
+            StructurePass::Open
+            | StructurePass::Steel
+            | StructurePass::Cage
+            | StructurePass::Fuse => None,
+        }
+    }
+
+    /// First world in which the pass may be used.
+    fn debut_world(self) -> usize {
+        self.mechanic()
+            .and_then(|m| {
+                MECHANIC_DEBUTS
+                    .iter()
+                    .find(|(cell, _)| *cell == m)
+                    .map(|(_, w)| *w)
+            })
+            .unwrap_or(1)
+    }
+}
+
+use StructurePass::{Bumper, Cage, Conveyor, Fuse, Ghost, Open, Portals, Regen, Steel};
+
+/// Pass of every teaching sector (block 1) of each world: the debut mechanic alone, or a mix of
+/// the known features in the worlds that introduce nothing new.
+const TEACHING_PASSES: [&[StructurePass]; 8] = [
+    &[Open, Fuse, Cage],
+    &[Ghost],
+    &[Conveyor],
+    &[Portals],
+    &[Bumper],
+    &[Regen],
+    &[Cage, Steel, Fuse],
+    &[Fuse, Steel, Cage],
+];
+
+/// Pass mix of the later blocks of each world (a pass listed twice is drawn twice as often).
+const WORLD_PASS_MIX: [&[StructurePass]; 8] = [
+    &[Open, Steel, Cage, Fuse, Steel, Cage],
+    &[Ghost, Ghost, Steel, Cage, Fuse, Open],
+    &[Conveyor, Conveyor, Steel, Steel, Ghost, Cage, Fuse],
+    &[Portals, Portals, Cage, Ghost, Conveyor, Steel],
+    &[Bumper, Bumper, Fuse, Fuse, Portals, Cage, Conveyor],
+    &[Regen, Regen, Ghost, Bumper, Portals, Cage],
+    &[Ghost, Ghost, Steel, Steel, Portals, Regen, Cage, Conveyor],
+    &[Bumper, Regen, Fuse, Conveyor, Portals, Ghost, Bumper, Regen],
+];
+
+/// Signature pass of each world, used by the set pieces.
+const SIGNATURE_PASSES: [StructurePass; 8] =
+    [Cage, Ghost, Conveyor, Portals, Bumper, Regen, Ghost, Bumper];
+
+/// Pass added to a set piece on top of the signature pass of its world.
+const SET_PIECE_SECONDARY: [Option<StructurePass>; 8] = [
+    Some(Steel),
+    Some(Fuse),
+    Some(Steel),
+    Some(Cage),
+    Some(Fuse),
+    Some(Cage),
+    Some(Steel),
+    Some(Regen),
+];
+
+/// Motifs a set piece cycles through: world `w` uses entry `(w - 1) % SET_PIECE_VARIANTS`, so two
+/// worlds only share a motif four worlds apart.
+const SET_PIECE_VARIANTS: usize = 4;
+
+/// A showcase layout: sector 10 of a block is one of these icons with the signature pass of its
+/// world.
+#[derive(Debug, Clone, Copy)]
+pub struct SetPiece {
+    /// Block theme the set piece closes.
+    pub theme: &'static str,
+    /// Names of the motifs (see `motifs.rs`), one per group of worlds.
+    pub motifs: [&'static str; SET_PIECE_VARIANTS],
+}
+
+/// One set piece per block that does not end on a boss (blocks 1..=4 and 6..=9 of a world).
+pub const SET_PIECES: [SetPiece; 8] = [
+    SetPiece {
+        theme: "LOTUS BLOOM",
+        motifs: [
+            "LOTUS_MANDALA",
+            "SUNBURST_HALO",
+            "ROSE_COMPASS",
+            "GLYPH_INFINITY",
+        ],
+    },
+    SetPiece {
+        theme: "SKULL GATE",
+        motifs: [
+            "PIXEL_SKULL",
+            "SPACE_INVADER",
+            "PIXEL_SWORD",
+            "TWIN_SPEARHEAD",
+        ],
+    },
+    SetPiece {
+        theme: "LAUNCH PAD",
+        motifs: [
+            "PIXEL_ROCKET",
+            "UPWARD_VECTORS",
+            "GLYPH_OMEGA",
+            "ZIGGURAT_PYRAMID",
+        ],
+    },
+    SetPiece {
+        theme: "TRIDENT WATCH",
+        motifs: [
+            "GLYPH_TRIDENT",
+            "HOOK_ARROW",
+            "SHEAR_FAULT",
+            "CHECKERBOARD_7R",
+        ],
+    },
+    SetPiece {
+        theme: "DEEP ANCHORAGE",
+        motifs: [
+            "PIXEL_ANCHOR",
+            "OFFSET_BRICKWORK",
+            "GLYPH_K_X",
+            "TWIN_PEAKS",
+        ],
+    },
+    SetPiece {
+        theme: "WATCHFUL EYE",
+        motifs: [
+            "ALL_SEEING_EYE",
+            "TSUNAMI_CREST",
+            "RINGED_PLANET",
+            "GLYPH_SIGMA_DELTA",
+        ],
+    },
+    SetPiece {
+        theme: "STAR WHEEL",
+        motifs: [
+            "STAR_MANDALA",
+            "VORTEX_COIL",
+            "FALLING_RIBBONS",
+            "COMET_STREAK",
+        ],
+    },
+    SetPiece {
+        theme: "FUNNEL HALL",
+        motifs: ["FUNNEL_VEES", "SWITCHBACK_RAMP", "CROSS_SASH", "PIXEL_KEY"],
+    },
+];
+
+/// Index into [`SET_PIECES`] of the set piece closing `block`, or `None` for the blocks that end
+/// on a boss (the 5th and the 10th).
+fn set_piece_index(block: usize) -> Option<usize> {
+    match block {
+        0..=3 => Some(block),
+        5..=8 => Some(block - 1),
+        _ => None,
+    }
+}
+
+use MotifFamily::{Arrow, Checker, Diagonal, Glyph, Icon, Mandala, SpiralWave, Staircase};
+
+/// Block theme of every block of every world: the motif family used for most sectors and the
+/// family used for the third sector of each triple.
+const BLOCK_FAMILIES: [[(MotifFamily, MotifFamily); BLOCKS_PER_WORLD]; 8] = [
+    // World 1: icons, glyphs and terraces.
+    [
+        (Icon, Glyph),
+        (Icon, Staircase),
+        (Glyph, Arrow),
+        (Staircase, Diagonal),
+        (Icon, Glyph),
+        (Arrow, Checker),
+        (Diagonal, Icon),
+        (Glyph, Staircase),
+        (Icon, Arrow),
+        (Staircase, Icon),
+    ],
+    // World 2: phase mirrors, spirals and mandalas.
+    [
+        (Mandala, SpiralWave),
+        (SpiralWave, Diagonal),
+        (Diagonal, Mandala),
+        (Mandala, Glyph),
+        (SpiralWave, Arrow),
+        (Diagonal, Checker),
+        (Mandala, Icon),
+        (SpiralWave, Staircase),
+        (Diagonal, SpiralWave),
+        (Mandala, Diagonal),
+    ],
+    // World 3: forged blocks and masonry.
+    [
+        (Checker, Staircase),
+        (Staircase, Glyph),
+        (Checker, Icon),
+        (Glyph, Checker),
+        (Staircase, Arrow),
+        (Checker, Mandala),
+        (Icon, Staircase),
+        (Glyph, Diagonal),
+        (Checker, Staircase),
+        (Staircase, Checker),
+    ],
+    // World 4: cold lattices and arrows.
+    [
+        (Arrow, Mandala),
+        (Mandala, Checker),
+        (Arrow, Glyph),
+        (Checker, Arrow),
+        (Mandala, SpiralWave),
+        (Arrow, Icon),
+        (Glyph, Mandala),
+        (Arrow, Staircase),
+        (Mandala, Arrow),
+        (Checker, Diagonal),
+    ],
+    // World 5: solar icons and bursts.
+    [
+        (Icon, Mandala),
+        (Mandala, Arrow),
+        (Icon, SpiralWave),
+        (Arrow, Icon),
+        (Mandala, Glyph),
+        (Icon, Diagonal),
+        (SpiralWave, Mandala),
+        (Icon, Staircase),
+        (Arrow, Mandala),
+        (Mandala, Icon),
+    ],
+    // World 6: crystal facets and diagonals.
+    [
+        (Diagonal, Checker),
+        (Checker, Mandala),
+        (Diagonal, Arrow),
+        (Mandala, Diagonal),
+        (Checker, Glyph),
+        (Diagonal, SpiralWave),
+        (Arrow, Checker),
+        (Diagonal, Mandala),
+        (Checker, Icon),
+        (Mandala, Diagonal),
+    ],
+    // World 7: voids, spirals and staircases.
+    [
+        (SpiralWave, Staircase),
+        (Staircase, Diagonal),
+        (SpiralWave, Glyph),
+        (Diagonal, SpiralWave),
+        (Staircase, Mandala),
+        (SpiralWave, Arrow),
+        (Glyph, Staircase),
+        (Diagonal, Staircase),
+        (SpiralWave, Icon),
+        (Staircase, SpiralWave),
+    ],
+    // World 8: crowns, thrones and grand glyphs.
+    [
+        (Icon, Staircase),
+        (Glyph, Icon),
+        (Arrow, Glyph),
+        (Icon, Mandala),
+        (Staircase, Arrow),
+        (Glyph, Diagonal),
+        (Icon, Checker),
+        (Mandala, Icon),
+        (Arrow, Staircase),
+        (Glyph, Mandala),
+    ],
+];
+
+/// Why a candidate could not be produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectorError {
+    /// No unique name is left: retrying with another seed cannot help.
+    Name(String),
+    /// This seed produced a layout that misses a design rule: retry with another seed.
+    Layout(String),
+}
+
+impl fmt::Display for SectorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SectorError::Name(m) | SectorError::Layout(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Parameters of one candidate.
+#[derive(Debug, Clone, Copy)]
+pub struct SectorRequest {
+    pub id: usize,
+    pub world: usize,
+    /// Sector within its world, `1..=100`.
+    pub sector_in_world: usize,
+    /// The last level of the pack, named as the final boss.
+    pub is_last: bool,
+    pub seed: u64,
+    /// Difficulty dial, `0..=MAX_HARDNESS` (see [`hardness_for_rate`]).
+    pub hardness: usize,
+}
+
+/// Whether a sector of a world holds a boss arena.
+pub fn is_boss_sector(sector_in_world: usize) -> bool {
+    sector_in_world == MID_BOSS_SECTOR || sector_in_world == WORLD_BOSS_SECTOR
 }
 
 /// Generates a unique uppercase name of at most `MAX_LEVEL_NAME_LEN` chars for a sector.
 /// Boss names use the hand-authored boss title stem when available and end with `BOSS_SUFFIX`,
 /// or `FINAL_BOSS_SUFFIX` for the last level of the pack; their stem is at most
-/// `BOSS_STEM_MAX_LEN` chars and never depends on the suffix.
+/// `BOSS_STEM_MAX_LEN` chars and never depends on the suffix. Regular names walk every
+/// adjective x noun pair of the world from a per-sector offset, so they never need a number.
 pub fn generate_unique_name(
     world: usize,
     sector_in_world: usize,
@@ -205,700 +683,1027 @@ pub fn generate_unique_name(
 
     let w_idx = world.saturating_sub(1).min(WORLD_ADJECTIVES.len() - 1);
     let adjs = WORLD_ADJECTIVES[w_idx];
-    for attempt in 0..NAME_ATTEMPT_BUDGET {
-        let a = adjs[(sector_in_world * 3 + attempt * 7 + w_idx * 5) % adjs.len()];
-        let n = NOUNS[(sector_in_world * 5 + attempt * 11 + w_idx * 3) % NOUNS.len()];
+    let pairs = adjs.len() * NOUNS.len();
+    let start = (sector_in_world * NAME_PAIR_STRIDE + w_idx * NAME_WORLD_OFFSET) % pairs;
+    for step in 0..pairs {
+        let pair = (start + step) % pairs;
+        let adjective = adjs[pair % adjs.len()];
+        let noun = NOUNS[pair / adjs.len()];
+        if adjective == noun {
+            continue;
+        }
         let candidate = if boss {
-            let stem = format!("{a} {n}");
+            let stem = format!("{adjective} {noun}");
             if stem.len() <= BOSS_STEM_MAX_LEN {
                 format!("{stem}{suffix}")
             } else {
-                format!("{a}{suffix}")
+                format!("{adjective}{suffix}")
             }
-        } else if attempt == 0 {
-            format!("{a} {n}")
         } else {
-            let num = attempt + 1;
-            format!("{a} {n} {num}")
+            format!("{adjective} {noun}")
         };
         if candidate.len() <= MAX_LEVEL_NAME_LEN && used.insert(candidate.clone()) {
             return Ok(candidate);
         }
     }
     Err(format!(
-        "no unique level name found for world {world}, sector {sector_in_world} after {NAME_ATTEMPT_BUDGET} attempts"
+        "no unique level name left for world {world}, sector {sector_in_world} among {pairs} pairs"
     ))
 }
 
-/// Target destructible brick count for `(world, sector_in_world)`.
-/// Starts light in Block 1 of each world (teaching block) and rises across blocks 1..=10,
-/// with breather dips on sectors 4 and 8 of each block.
+/// Role of a sector inside its block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectorKind {
+    /// Block 1 of a world: the debut mechanic, alone, in an easy layout.
+    Teaching,
+    /// Sectors 4 and 8 of a block: lighter.
+    Breather,
+    /// Everything else.
+    Standard,
+    /// Sector 10 of a block.
+    SetPiece,
+}
+
+/// Everything about a sector that does not depend on the seed.
+#[derive(Debug, Clone, Copy)]
+struct SectorPlan {
+    world: usize,
+    sector: usize,
+    block: usize,
+    pos: usize,
+    kind: SectorKind,
+    symmetric: bool,
+}
+
+impl SectorPlan {
+    fn new(world: usize, sector: usize) -> Self {
+        let block = sector.saturating_sub(1) / BLOCK_SIZE;
+        let pos = sector.saturating_sub(1) % BLOCK_SIZE;
+        let kind = if pos == SET_PIECE_POS {
+            SectorKind::SetPiece
+        } else if block == 0 {
+            SectorKind::Teaching
+        } else if BREATHER_POSITIONS.contains(&pos) {
+            SectorKind::Breather
+        } else {
+            SectorKind::Standard
+        };
+        Self {
+            world,
+            sector,
+            block,
+            pos,
+            kind,
+            symmetric: is_symmetric_sector(sector),
+        }
+    }
+
+    fn world_idx(&self) -> usize {
+        self.world.saturating_sub(1).min(WORLD_ADJECTIVES.len() - 1)
+    }
+
+    fn max_hardness(&self) -> usize {
+        match self.kind {
+            SectorKind::Teaching => TEACHING_MAX_HARDNESS,
+            SectorKind::Breather => BREATHER_MAX_HARDNESS,
+            SectorKind::Standard | SectorKind::SetPiece => MAX_HARDNESS,
+        }
+    }
+}
+
+/// Whether a sector is built mirror-symmetric (40% of the sectors); the others are asymmetric.
+pub fn is_symmetric_sector(sector_in_world: usize) -> bool {
+    SYMMETRIC_RESIDUES.contains(&(sector_in_world % SYMMETRY_PERIOD))
+}
+
+/// Target destructible brick count for `(world, sector_in_world)`: light in the first block of a
+/// world, rising block by block, with a gentle opener and breathers in each block.
 pub fn target_brick_count(world: usize, sector_in_world: usize) -> usize {
-    let block_idx = sector_in_world.saturating_sub(1) / BLOCK_SIZE;
-    let pos_in_block = sector_in_world.saturating_sub(1) % BLOCK_SIZE;
-    let world_base = 34.0 + (world.saturating_sub(1) as f32) * 1.4;
-    let block_rise = (block_idx as f32) * 2.8;
-    let wave = match pos_in_block {
-        0 => -4.0,
-        3 | 7 => -5.0,
-        9 => 3.0,
-        _ => 0.0,
+    let plan = SectorPlan::new(world, sector_in_world);
+    let wave = if plan.pos == 0 {
+        DENSITY_OPENER_DELTA
+    } else if BREATHER_POSITIONS.contains(&plan.pos) {
+        DENSITY_BREATHER_DELTA
+    } else if plan.pos == SET_PIECE_POS {
+        DENSITY_SET_PIECE_DELTA
+    } else {
+        0.0
     };
-    (world_base + block_rise + wave)
+    let target = DENSITY_BASE
+        + world.saturating_sub(1) as f32 * DENSITY_PER_WORLD
+        + plan.block as f32 * DENSITY_PER_BLOCK
+        + wave;
+    target
         .round()
         .clamp(SAFE_DENSITY_MIN as f32, SAFE_DENSITY_MAX as f32) as usize
 }
 
-/// Target good-bot clear rate (`0.0..=1.0`) for `(world, sector_in_world)` used by
-/// `cmd_generate` to select candidates that form a smooth non-increasing block curve
-/// within each world and a clear breather reset at the start of the next world.
-pub fn target_good_clear_rate(world: usize, sector_in_world: usize) -> f32 {
-    let block_idx = sector_in_world.saturating_sub(1) / BLOCK_SIZE;
-    let pos_in_block = sector_in_world.saturating_sub(1) % BLOCK_SIZE;
-    // World 1 prologue (sectors 1..=15) measures 65.6% good clear rate, so World 1 blocks
-    // step smoothly from 0.65 down to 0.46; Worlds 2..=8 start high (0.88) in Block 1
-    // (teaching block) and step down ~0.04 per block to ~0.50 in Block 10.
-    let (start_rate, step_per_block) = if world == 1 {
-        (0.68, 0.024)
-    } else {
-        let w_offset = (world.saturating_sub(2) as f32) * 0.006;
-        (0.88 - w_offset, 0.040)
-    };
-    let block_target = start_rate - (block_idx as f32) * step_per_block;
-    let breather_bonus = if pos_in_block == 3 || pos_in_block == 7 {
-        0.08
-    } else if pos_in_block == 9 {
-        -0.04
-    } else {
-        0.0
-    };
-    (block_target + breather_bonus).clamp(0.42, 0.95)
+/// Allowed destructible-brick window of a sector. Set pieces are showcases of large icons, so
+/// they may use the whole safe band.
+fn density_window(world: usize, sector_in_world: usize) -> (usize, usize) {
+    if SectorPlan::new(world, sector_in_world).kind == SectorKind::SetPiece {
+        return (SAFE_DENSITY_MIN, SAFE_DENSITY_MAX);
+    }
+    let target = target_brick_count(world, sector_in_world);
+    (
+        target
+            .saturating_sub(DENSITY_WINDOW_BELOW)
+            .max(SAFE_DENSITY_MIN),
+        (target + DENSITY_WINDOW_ABOVE).min(SAFE_DENSITY_MAX),
+    )
 }
 
-/// Generates a single candidate level for `(id, world, sector_in_world)` where `sector_in_world`
-/// is `1..=100`. `is_last` marks the last level of the pack, named as the final boss.
-pub fn generate_sector(
+/// Hardness step that aims at a good-bot clear rate: 0.75 and above is the softest step, each
+/// 0.125 lower (one seed of eight) is one step harder.
+pub fn hardness_for_rate(desired_rate: f32) -> usize {
+    const SOFTEST_RATE: f32 = 0.75;
+    const RATE_PER_STEP: f32 = 0.125;
+    let steps = ((SOFTEST_RATE - desired_rate) / RATE_PER_STEP).round();
+    steps.clamp(0.0, MAX_HARDNESS as f32) as usize
+}
+
+/// Offset of the wanted good-bot clear rate of a sector from the target of its world, in rate
+/// units: teaching sectors and breathers are softer, set pieces and the end of a world harder.
+/// The offsets of one world sum to about zero so the world mean stays on its target.
+pub fn difficulty_shape(world: usize, sector_in_world: usize) -> f32 {
+    const TEACHING_BONUS: f32 = 0.12;
+    const BREATHER_BONUS: f32 = 0.08;
+    const SET_PIECE_PENALTY: f32 = -0.06;
+    const BLOCK_SLOPE: f32 = 0.016;
+    let plan = SectorPlan::new(world, sector_in_world);
+    let slope = (BLOCKS_PER_WORLD as f32 / 2.0 - plan.block as f32) * BLOCK_SLOPE;
+    let role = match plan.kind {
+        SectorKind::Teaching => TEACHING_BONUS,
+        SectorKind::Breather => BREATHER_BONUS,
+        SectorKind::SetPiece => SET_PIECE_PENALTY,
+        SectorKind::Standard => 0.0,
+    };
+    slope + role
+}
+
+/// Theme of the set piece that `sector_in_world` of `world` is, `None` for any other sector.
+pub fn set_piece_theme(world: usize, sector_in_world: usize) -> Option<&'static str> {
+    let plan = SectorPlan::new(world, sector_in_world);
+    if plan.kind != SectorKind::SetPiece {
+        return None;
+    }
+    set_piece_index(plan.block)
+        .and_then(|i| SET_PIECES.get(i))
+        .map(|piece| piece.theme)
+}
+
+/// Builds the boss level of `(world, sector_in_world)` from its hand-authored arena.
+fn boss_level(
     id: usize,
     world: usize,
     sector_in_world: usize,
-    is_last: bool,
-    seed: u64,
-    used_names: &mut BTreeSet<String>,
+    name: String,
 ) -> Result<LevelDef, String> {
-    let boss = sector_in_world == MID_BOSS_SECTOR || sector_in_world == WORLD_BOSS_SECTOR;
-    let name = generate_unique_name(world, sector_in_world, boss, boss && is_last, used_names)?;
-
-    if boss {
-        let arena = boss_arena(world, sector_in_world).ok_or_else(|| {
-            format!("missing hand-authored boss arena for world {world} sector {sector_in_world}")
-        })?;
-        let rows = arena.rows.iter().map(|r| (*r).to_string()).collect();
-        return Ok(LevelDef {
-            id,
-            world,
-            name,
-            boss: true,
-            rows,
-        });
-    }
-
-    let mut rng = Rng::new(seed ^ (id as u64).wrapping_mul(LEVEL_SEED_SALT));
-    let rows = build_regular_rows(world, sector_in_world, &mut rng);
-
+    let arena = boss_arena(world, sector_in_world).ok_or_else(|| {
+        format!("missing hand-authored boss arena for world {world} sector {sector_in_world}")
+    })?;
     Ok(LevelDef {
         id,
         world,
+        name,
+        boss: true,
+        rows: arena.rows.iter().map(|r| (*r).to_string()).collect(),
+    })
+}
+
+/// Generates a single candidate level for `request`.
+pub fn generate_sector(
+    request: &SectorRequest,
+    used_names: &mut BTreeSet<String>,
+) -> Result<LevelDef, SectorError> {
+    let boss = is_boss_sector(request.sector_in_world);
+    let name = generate_unique_name(
+        request.world,
+        request.sector_in_world,
+        boss,
+        boss && request.is_last,
+        used_names,
+    )
+    .map_err(SectorError::Name)?;
+
+    if boss {
+        return boss_level(request.id, request.world, request.sector_in_world, name)
+            .map_err(SectorError::Name);
+    }
+
+    let mut rng = Rng::new(request.seed ^ (request.id as u64).wrapping_mul(LEVEL_SEED_SALT));
+    let plan = SectorPlan::new(request.world, request.sector_in_world);
+    let hardness = request.hardness.min(plan.max_hardness());
+    let rows = build_regular_rows(&plan, hardness, &mut rng).map_err(SectorError::Layout)?;
+    Ok(LevelDef {
+        id: request.id,
+        world: request.world,
         name,
         boss: false,
         rows,
     })
 }
 
-/// Chooses the structural pass for `(world, sector_in_world)` following the "teach before
-/// testing" progression:
-/// - World 1: SteelCorridors, ExplosiveCage, DominoFuse, OpenShowcase
-/// - World 2: introduces GhostSilhouette (teaching block S1-10)
-/// - World 3: introduces ConveyorLane (teaching block S1-10)
-/// - World 4: introduces PortalShortcut (teaching block S1-10)
-/// - World 5: introduces BumperPinballBay (teaching block S1-10)
-/// - World 6: introduces RegenShieldWall (teaching block S1-10)
-/// - Worlds 7-8: combine all structural passes
-fn choose_structure_pass(world: usize, sector_in_world: usize, rng: &mut Rng) -> StructurePass {
-    let block_idx = sector_in_world.saturating_sub(1) / BLOCK_SIZE;
-    let pos_in_block = sector_in_world.saturating_sub(1) % BLOCK_SIZE;
-    let is_breather = pos_in_block == 3 || pos_in_block == 7;
+// ---------------------------------------------------------------------------------------------
+// Grid helpers
+// ---------------------------------------------------------------------------------------------
 
-    // Block 1 (sectors 1..=10) is the teaching block of each world.
-    if block_idx == 0 {
-        return match world {
-            1 => StructurePass::OpenShowcase,
-            2 => StructurePass::GhostSilhouette,
-            3 => StructurePass::ConveyorLane,
-            4 => StructurePass::PortalShortcut,
-            5 => StructurePass::BumperPinballBay,
-            6 => StructurePass::RegenShieldWall,
-            _ => StructurePass::DominoFuse,
-        };
-    }
-
-    if is_breather {
-        return if rng.usize_below(2) == 0 {
-            StructurePass::DominoFuse
-        } else {
-            StructurePass::OpenShowcase
-        };
-    }
-
-    let roll = (sector_in_world + rng.usize_below(7)) % 7;
-    match world {
-        1 => match roll % 4 {
-            0 => StructurePass::SteelCorridors,
-            1 => StructurePass::ExplosiveCage,
-            2 => StructurePass::DominoFuse,
-            _ => StructurePass::OpenShowcase,
-        },
-        2 => match roll % 5 {
-            0 | 1 => StructurePass::GhostSilhouette,
-            2 => StructurePass::SteelCorridors,
-            3 => StructurePass::ExplosiveCage,
-            _ => StructurePass::DominoFuse,
-        },
-        3 => match roll % 6 {
-            0 | 1 => StructurePass::ConveyorLane,
-            2 => StructurePass::SteelCorridors,
-            3 => StructurePass::GhostSilhouette,
-            4 => StructurePass::ExplosiveCage,
-            _ => StructurePass::DominoFuse,
-        },
-        4 => match roll % 6 {
-            0 | 1 => StructurePass::PortalShortcut,
-            2 => StructurePass::SteelCorridors,
-            3 => StructurePass::GhostSilhouette,
-            4 => StructurePass::ConveyorLane,
-            _ => StructurePass::ExplosiveCage,
-        },
-        5 => match roll % 7 {
-            0 | 1 => StructurePass::BumperPinballBay,
-            2 => StructurePass::PortalShortcut,
-            3 => StructurePass::ConveyorLane,
-            4 => StructurePass::ExplosiveCage,
-            5 => StructurePass::GhostSilhouette,
-            _ => StructurePass::DominoFuse,
-        },
-        6 => match roll % 7 {
-            0 | 1 => StructurePass::RegenShieldWall,
-            2 => StructurePass::PortalShortcut,
-            3 => StructurePass::BumperPinballBay,
-            4 => StructurePass::GhostSilhouette,
-            5 => StructurePass::ConveyorLane,
-            _ => StructurePass::ExplosiveCage,
-        },
-        _ => match roll {
-            0 => StructurePass::RegenShieldWall,
-            1 => StructurePass::PortalShortcut,
-            2 => StructurePass::BumperPinballBay,
-            3 => StructurePass::ConveyorLane,
-            4 => StructurePass::GhostSilhouette,
-            5 => StructurePass::ExplosiveCage,
-            _ => StructurePass::SteelCorridors,
-        },
-    }
+fn motif_grid(motif: &MotifTemplate) -> Grid {
+    motif.rows.iter().map(|r| r.chars().collect()).collect()
 }
 
-/// Parameters passed to the structural overlay pass.
-struct PassContext {
-    pass: StructurePass,
-    world: usize,
-    sector_in_world: usize,
-    is_teaching_block: bool,
-    want_asymmetric: bool,
+fn is_body_token(ch: char) -> bool {
+    matches!(ch, T_BODY | T_TRIM | T_FOCAL)
 }
 
-fn build_regular_rows(world: usize, sector_in_world: usize, rng: &mut Rng) -> Vec<String> {
-    let block_idx = sector_in_world.saturating_sub(1) / BLOCK_SIZE;
-    let pos_in_block = sector_in_world.saturating_sub(1) % BLOCK_SIZE;
-    let is_teaching_block = block_idx == 0;
-    let is_breather = pos_in_block == 3 || pos_in_block == 7;
-    let is_set_piece = pos_in_block == 9;
+/// Body or trim brick: the plain bricks a feature may turn into a mechanic.
+fn is_plain_token(ch: char) -> bool {
+    matches!(ch, T_BODY | T_TRIM)
+}
 
-    // Make ~60% of sectors intentionally asymmetric so every world easily exceeds 30%.
-    let want_asymmetric = !sector_in_world.is_multiple_of(3) || rng.usize_below(3) != 0;
+fn count_tokens(grid: &Grid, pred: impl Fn(char) -> bool) -> usize {
+    grid.iter().flatten().filter(|&&c| pred(c)).count()
+}
 
-    // Pick a motif from the 48-template library; vary choice by world, sector, and RNG.
-    let motif_idx =
-        (world * 7 + sector_in_world * 5 + rng.usize_below(MOTIFS.len())) % MOTIFS.len();
-    let motif = &MOTIFS[motif_idx];
-
-    // Vary row count between 4 and 10 rows based on motif height, block progression, and RNG.
-    let base_rows = motif.rows.len();
-    let extra_rows = if is_teaching_block || is_breather {
-        rng.usize_below(2)
-    } else if is_set_piece || block_idx >= 6 {
-        1 + rng.usize_below(3)
-    } else {
-        rng.usize_below(3)
-    };
-    let row_count = (base_rows + extra_rows).clamp(MIN_REGULAR_ROWS, MAX_REGULAR_ROWS);
-    let top_pad = if row_count > base_rows {
-        rng.usize_below(row_count - base_rows + 1)
-    } else {
-        0
-    };
-
-    // Horizontal shift and optional flip to diversify footprint and shape.
-    let flip_h = rng.usize_below(2) == 1;
-    let flip_v = !is_teaching_block && rng.usize_below(3) == 1;
-    let shift_x: isize = if want_asymmetric {
-        let mag = 1 + (rng.usize_below(3) as isize);
-        if rng.usize_below(2) == 0 {
-            mag
-        } else {
-            -mag
-        }
-    } else {
-        0
-    };
-
-    // Colour gradient palette for this sector.
-    let base_color = ((world + sector_in_world + rng.usize_below(4)) % 4) as u32 + 1;
-    let sec_color = ((base_color as usize + 1 + rng.usize_below(3)) % 4) as u32 + 1;
-    let tough_chance = if is_teaching_block {
-        0.04
-    } else if is_breather {
-        0.08 + (block_idx as f32) * 0.015
-    } else {
-        0.10 + (block_idx as f32) * 0.032 + (world.saturating_sub(1) as f32) * 0.018
-    };
-
-    let mut grid = vec![vec!['0'; EDITOR_COLS]; row_count];
-
-    for (r_idx, row_cells) in grid.iter_mut().enumerate() {
-        if r_idx < top_pad || r_idx >= top_pad + base_rows {
-            continue;
-        }
-        let m_row_idx = r_idx - top_pad;
-        let src_r = if flip_v {
-            base_rows - 1 - m_row_idx
-        } else {
-            m_row_idx
-        };
-        let src_chars: Vec<char> = motif.rows[src_r].chars().collect();
-        for (c_idx, dst) in row_cells.iter_mut().enumerate().take(EDITOR_COLS) {
-            let shifted = c_idx as isize - shift_x;
-            let src_c = shifted.rem_euclid(EDITOR_COLS as isize) as usize;
-            let src_c = if flip_h {
-                EDITOR_COLS - 1 - src_c
-            } else {
-                src_c
-            };
-            let token = src_chars[src_c];
-            let cell = match token {
-                '.' => '0',
-                'E' => 'E',
-                'Z' => {
-                    if !is_teaching_block
-                        && ((rng.next_u32() % 100) as f32 / 100.0) < tough_chance * 1.5
-                    {
-                        if (r_idx + c_idx).is_multiple_of(2) {
-                            '5'
-                        } else {
-                            '6'
-                        }
-                    } else {
-                        char::from_digit(((base_color + r_idx as u32) % 4) + 1, 10).unwrap_or('3')
-                    }
-                }
-                'Y' => {
-                    if ((rng.next_u32() % 100) as f32 / 100.0) < tough_chance {
-                        '5'
-                    } else {
-                        char::from_digit(((sec_color + (c_idx / 4) as u32) % 4) + 1, 10)
-                            .unwrap_or('2')
-                    }
-                }
-                'X' => {
-                    if ((rng.next_u32() % 100) as f32 / 100.0) < tough_chance * 0.85 {
-                        '6'
-                    } else {
-                        char::from_digit(((base_color + (r_idx / 2) as u32) % 4) + 1, 10)
-                            .unwrap_or('1')
-                    }
-                }
-                _ => '0',
-            };
-            *dst = cell;
-        }
-    }
-
-    // Apply structural pass on top of the motif.
-    let pass = choose_structure_pass(world, sector_in_world, rng);
-    apply_structure_pass(
-        &mut grid,
-        &PassContext {
-            pass,
-            world,
-            sector_in_world,
-            is_teaching_block,
-            want_asymmetric,
-        },
-        rng,
-    );
-
-    // Tune explosive ('E') count according to block position so early blocks chain-clear
-    // briskly and late blocks demand precision.
-    let target_explosives = if is_teaching_block || is_breather {
-        5 + rng.usize_below(3)
-    } else if block_idx <= 3 {
-        4 + rng.usize_below(3)
-    } else if block_idx <= 6 {
-        3 + rng.usize_below(2)
-    } else {
-        2 + rng.usize_below(2)
-    };
-    tune_explosive_nodes(&mut grid, target_explosives, rng);
-
-    // Balance destructible density toward `target_brick_count(world, sector_in_world)`.
-    let target_bricks = target_brick_count(world, sector_in_world);
-    balance_density(&mut grid, target_bricks, base_color, want_asymmetric, rng);
-
-    // Ensure at least 4 destructible bricks on the bottom-most row so ball launches engage bricks immediately.
-    let last_r = grid.len() - 1;
-    let bottom_destructibles = grid[last_r]
+/// Leftmost and rightmost non-empty columns.
+fn bbox_cols(grid: &Grid) -> Option<(usize, usize)> {
+    let mut cols = grid
         .iter()
-        .filter(|&&ch| is_destructible_cell(ch))
-        .count();
-    if bottom_destructibles < 4 {
-        let start_col = 1 + rng.usize_below(4);
-        for step in 0..4 {
-            let col = (start_col + step * 3) % EDITOR_COLS;
-            if grid[last_r][col] == '0' {
-                grid[last_r][col] = char::from_digit((step as u32 % 4) + 1, 10).unwrap_or('1');
+        .flat_map(|row| row.iter().enumerate())
+        .filter(|(_, &ch)| ch != T_EMPTY)
+        .map(|(c, _)| c);
+    let first = cols.next()?;
+    let (min, max) = cols.fold((first, first), |(lo, hi), c| (lo.min(c), hi.max(c)));
+    Some((min, max))
+}
+
+/// Keeps one half of the grid and mirrors it onto the other, so the result is exactly symmetric.
+fn mirror_half(grid: &mut Grid, keep_left: bool) {
+    for row in grid.iter_mut() {
+        for c in 0..MID_COL {
+            if keep_left {
+                row[COLS - 1 - c] = row[c];
+            } else {
+                row[c] = row[COLS - 1 - c];
             }
         }
     }
+}
 
-    // If this sector is designated asymmetric, guarantee at least 8 mirror-mismatch cells.
-    if want_asymmetric {
-        enforce_asymmetry(&mut grid, base_color, rng);
+/// Shifts the grid horizontally by up to `dx` columns, clamped to the bounding box so no cell
+/// leaves the grid and none wraps around.
+fn shift_clamped(grid: &mut Grid, dx: isize) {
+    let Some((min, max)) = bbox_cols(grid) else {
+        return;
+    };
+    let room_left = min as isize;
+    let room_right = (COLS - 1 - max) as isize;
+    let dx = dx.clamp(-room_left, room_right);
+    if dx == 0 {
+        return;
     }
+    for row in grid.iter_mut() {
+        let mut shifted = vec![T_EMPTY; COLS];
+        for (c, &ch) in row.iter().enumerate() {
+            if ch != T_EMPTY {
+                shifted[(c as isize + dx) as usize] = ch;
+            }
+        }
+        *row = shifted;
+    }
+}
 
-    grid.into_iter()
-        .map(|r| r.into_iter().collect::<String>())
+/// Empties the first `left` and last `right` columns.
+fn crop_columns(grid: &mut Grid, left: usize, right: usize) {
+    for row in grid.iter_mut() {
+        for cell in row.iter_mut().take(left) {
+            *cell = T_EMPTY;
+        }
+        for cell in row.iter_mut().skip(COLS.saturating_sub(right)) {
+            *cell = T_EMPTY;
+        }
+    }
+}
+
+/// Sets a cell, and its mirror counterpart on symmetric sectors.
+fn put(grid: &mut Grid, r: usize, c: usize, ch: char, symmetric: bool) {
+    grid[r][c] = ch;
+    if symmetric {
+        grid[r][COLS - 1 - c] = ch;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Structure passes
+// ---------------------------------------------------------------------------------------------
+
+/// Context shared by every structure pass.
+#[derive(Debug, Clone, Copy)]
+struct PassContext {
+    symmetric: bool,
+    teaching: bool,
+}
+
+/// Applies `pass` to a token grid; false when the motif offers no room for the feature.
+fn apply_pass(pass: StructurePass, grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    match pass {
+        Open => true,
+        Steel => pass_steel(grid, ctx, rng),
+        Cage => pass_cage(grid, ctx),
+        Fuse => pass_fuse(grid, ctx, rng),
+        Ghost => pass_ghost(grid, ctx, rng),
+        Conveyor => pass_conveyor(grid, ctx, rng),
+        Portals => pass_portals(grid, ctx, rng),
+        Bumper => pass_bumper(grid, ctx, rng),
+        Regen => pass_regen(grid, ctx, rng),
+    }
+}
+
+/// Steel flanks (the outermost column of the shape) or a steel girder (the widest trim row).
+fn pass_steel(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    let rows = grid.len();
+    if rng.usize_below(2) == 0 {
+        let Some((min, max)) = bbox_cols(grid) else {
+            return false;
+        };
+        let right_only = !ctx.symmetric && rng.usize_below(2) == 1;
+        let left_only = !ctx.symmetric && !right_only;
+        let mut cells = Vec::new();
+        for (r, row) in grid.iter().enumerate() {
+            if !right_only && is_body_token(row[min]) {
+                cells.push((r, min));
+            }
+            if !left_only && max != min && is_body_token(row[max]) {
+                cells.push((r, max));
+            }
+        }
+        if cells.len() < STEEL_MIN_CELLS {
+            return false;
+        }
+        for (r, c) in cells {
+            grid[r][c] = CELL_STEEL;
+        }
+        true
+    } else {
+        let best = (0..rows)
+            .map(|r| (r, grid[r].iter().filter(|&&c| c == T_TRIM).count()))
+            .max_by_key(|&(_, n)| n);
+        let Some((r, n)) = best else {
+            return false;
+        };
+        if !(STEEL_MIN_CELLS..=STEEL_GIRDER_MAX_CELLS).contains(&n) {
+            return false;
+        }
+        for ch in grid[r].iter_mut() {
+            if *ch == T_TRIM {
+                *ch = CELL_STEEL;
+            }
+        }
+        true
+    }
+}
+
+/// Turns the body bricks next to every explosive into tough cage bricks.
+fn pass_cage(grid: &mut Grid, _ctx: PassContext) -> bool {
+    let rows = grid.len();
+    let mut cage = Vec::new();
+    for r in 0..rows {
+        for c in 0..COLS {
+            if grid[r][c] != T_EXPLOSIVE {
+                continue;
+            }
+            for (dr, dc) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
+                let (nr, nc) = (r as isize + dr, c as isize + dc);
+                if nr < 0 || nc < 0 || nr >= rows as isize || nc >= COLS as isize {
+                    continue;
+                }
+                let (nr, nc) = (nr as usize, nc as usize);
+                if is_body_token(grid[nr][nc]) {
+                    cage.push((nr, nc));
+                }
+            }
+        }
+    }
+    if cage.is_empty() {
+        return false;
+    }
+    for (r, c) in cage {
+        grid[r][c] = T_CAGE;
+    }
+    true
+}
+
+/// Turns a diagonal run of body bricks into a chain of explosives.
+fn pass_fuse(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    let rows = grid.len();
+    let mut runs: Vec<(usize, usize, isize, usize)> = Vec::new();
+    for r in 0..rows {
+        for c in 0..COLS {
+            for dir in [1isize, -1] {
+                let mut len = 0usize;
+                loop {
+                    let (nr, nc) = (r + len, c as isize + dir * len as isize);
+                    if nr >= rows || nc < 0 || nc >= COLS as isize {
+                        break;
+                    }
+                    if !is_body_token(grid[nr][nc as usize]) {
+                        break;
+                    }
+                    len += 1;
+                }
+                if len >= FUSE_MIN_LEN {
+                    runs.push((r, c, dir, len));
+                }
+            }
+        }
+    }
+    if runs.is_empty() {
+        return false;
+    }
+    let (r, c, dir, len) = runs[rng.usize_below(runs.len())];
+    for i in 0..len.min(FUSE_MAX_LEN) {
+        let col = (c as isize + dir * i as isize) as usize;
+        put(grid, r + i, col, T_EXPLOSIVE, ctx.symmetric);
+    }
+    true
+}
+
+/// Turns the plain bricks of a two-row band into ghost bricks.
+fn pass_ghost(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    let rows = grid.len();
+    let max_cells = if ctx.teaching {
+        GHOST_TEACHING_MAX_CELLS
+    } else {
+        GHOST_MAX_CELLS
+    };
+    // Asymmetric sectors first try one half of the band so the feature sits off-centre.
+    let half_choices: &[Option<bool>] = if ctx.symmetric {
+        &[None]
+    } else if rng.usize_below(2) == 0 {
+        &[Some(true), None]
+    } else {
+        &[Some(false), None]
+    };
+    for half in half_choices {
+        let in_half = |c: usize| match half {
+            None => true,
+            Some(left) => (c <= MID_COL) == *left,
+        };
+        let bands: Vec<(usize, Vec<(usize, usize)>)> = (0..rows
+            .saturating_sub(GHOST_BAND_ROWS - 1))
+            .map(|r0| {
+                let cells: Vec<(usize, usize)> = (r0..r0 + GHOST_BAND_ROWS)
+                    .flat_map(|r| (0..COLS).map(move |c| (r, c)))
+                    .filter(|&(r, c)| is_plain_token(grid[r][c]) && in_half(c))
+                    .collect();
+                (r0, cells)
+            })
+            .filter(|(_, cells)| (GHOST_MIN_CELLS..=max_cells).contains(&cells.len()))
+            .collect();
+        if bands.is_empty() {
+            continue;
+        }
+        let (_, cells) = &bands[rng.usize_below(bands.len())];
+        for &(r, c) in cells {
+            grid[r][c] = CELL_GHOST;
+        }
+        return true;
+    }
+    false
+}
+
+/// Inserts a lane of moving bricks above, inside or below the motif. A moving brick only sits in
+/// a column that touches the shape above or below the lane, so it is never a stray cell.
+fn pass_conveyor(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    if grid.len() + 1 > MAX_REGULAR_ROWS {
+        return false;
+    }
+    let at = match rng.usize_below(3) {
+        0 => 0,
+        1 => grid.len() / 2,
+        _ => grid.len(),
+    };
+    let touches = |row: Option<&Vec<char>>, c: usize| {
+        row.is_some_and(|r| (c.saturating_sub(1)..=(c + 1).min(COLS - 1)).any(|k| r[k] != T_EMPTY))
+    };
+    let above = at.checked_sub(1).and_then(|i| grid.get(i));
+    let below = grid.get(at);
+    let eligible: Vec<usize> = (1..COLS - 1)
+        .filter(|&c| touches(above, c) || touches(below, c))
+        .collect();
+    let wanted = if ctx.teaching {
+        LANE_TEACHING_BRICKS
+    } else {
+        LANE_BRICKS
+    };
+    let mut lane = vec![T_EMPTY; COLS];
+    let mut placed = 0usize;
+    let mut pool = eligible;
+    while placed < wanted && !pool.is_empty() {
+        let c = pool.remove(rng.usize_below(pool.len()));
+        let mirror = COLS - 1 - c;
+        let cols: Vec<usize> = if ctx.symmetric && mirror != c {
+            vec![c, mirror]
+        } else {
+            vec![c]
+        };
+        let clear = cols.iter().all(|&col| {
+            (col.saturating_sub(LANE_MIN_SPACING - 1)..=(col + LANE_MIN_SPACING - 1).min(COLS - 1))
+                .all(|k| lane[k] == T_EMPTY)
+        });
+        if !clear || (ctx.symmetric && mirror != c && c.abs_diff(mirror) < LANE_MIN_SPACING) {
+            continue;
+        }
+        for col in cols {
+            lane[col] = CELL_MOVING;
+            placed += 1;
+        }
+    }
+    if placed < LANE_TEACHING_BRICKS - 1 {
+        return false;
+    }
+    grid.insert(at, lane);
+    true
+}
+
+/// Places exactly two portals on empty cells next to the shape.
+fn pass_portals(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    let rows = grid.len();
+    if ctx.symmetric {
+        let candidates: Vec<(usize, usize)> = (0..rows)
+            .flat_map(|r| (0..=PORTAL_MAX_INSET).map(move |c| (r, c)))
+            .filter(|&(r, c)| grid[r][c] == T_EMPTY && grid[r][COLS - 1 - c] == T_EMPTY)
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        let (r, c) = candidates[rng.usize_below(candidates.len())];
+        put(grid, r, c, CELL_PORTAL, true);
+        true
+    } else {
+        let left: Vec<(usize, usize)> = (0..rows.div_ceil(2))
+            .flat_map(|r| (0..=PORTAL_MAX_INSET).map(move |c| (r, c)))
+            .filter(|&(r, c)| grid[r][c] == T_EMPTY)
+            .collect();
+        let right: Vec<(usize, usize)> = (rows / 2..rows)
+            .flat_map(|r| (0..=PORTAL_MAX_INSET).map(move |c| (r, COLS - 1 - c)))
+            .filter(|&(r, c)| grid[r][c] == T_EMPTY)
+            .collect();
+        if left.is_empty() || right.is_empty() {
+            return false;
+        }
+        let (r1, c1) = left[rng.usize_below(left.len())];
+        let (r2, c2) = right[rng.usize_below(right.len())];
+        grid[r1][c1] = CELL_PORTAL;
+        grid[r2][c2] = CELL_PORTAL;
+        true
+    }
+}
+
+/// Turns the focal bricks (or a pair of body bricks on the centre row) into bumpers.
+fn pass_bumper(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    let focal = count_tokens(grid, |c| c == T_FOCAL);
+    if (BUMPER_FOCAL_RANGE.0..=BUMPER_FOCAL_RANGE.1).contains(&focal) {
+        for ch in grid.iter_mut().flatten() {
+            if *ch == T_FOCAL {
+                *ch = CELL_BUMPER;
+            }
+        }
+        return true;
+    }
+    let rows = grid.len();
+    let r = rows / 2;
+    let pairs: Vec<(usize, usize)> = if ctx.symmetric {
+        BUMPER_COL_PAIRS.to_vec()
+    } else {
+        let a = 3 + rng.usize_below(3);
+        vec![(a, a + BUMPER_ASYMMETRIC_GAP)]
+    };
+    for (a, b) in pairs {
+        if is_body_token(grid[r][a]) && is_body_token(grid[r][b]) {
+            grid[r][a] = CELL_BUMPER;
+            grid[r][b] = CELL_BUMPER;
+            return true;
+        }
+    }
+    false
+}
+
+/// Turns a contiguous run of plain bricks of one row into a regenerating shield.
+fn pass_regen(grid: &mut Grid, ctx: PassContext, rng: &mut Rng) -> bool {
+    let rows = grid.len();
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    for (r, row) in grid.iter().enumerate() {
+        let mut c = 0;
+        while c < COLS {
+            if is_plain_token(row[c]) {
+                let start = c;
+                while c < COLS && is_plain_token(row[c]) {
+                    c += 1;
+                }
+                if c - start >= SHIELD_MIN_RUN {
+                    runs.push((r, start, c - start));
+                }
+            } else {
+                c += 1;
+            }
+        }
+    }
+    if runs.is_empty() || rows == 0 {
+        return false;
+    }
+    let (r, start, len) = runs[rng.usize_below(runs.len())];
+    let take = len.min(SHIELD_MAX_RUN);
+    let from = start + (len - take) / 2;
+    for c in from..from + take {
+        put(grid, r, c, CELL_REGEN, ctx.symmetric);
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------------------------
+// Style: colours and toughness, per band or feature
+// ---------------------------------------------------------------------------------------------
+
+/// Colour and toughness choices of a sector, all made per feature or per row band.
+#[derive(Debug, Clone, Copy)]
+struct Style {
+    band_rows: usize,
+    base: usize,
+    tough_bands: usize,
+    tough_from_bottom: bool,
+    tough_focal: bool,
+    tough_trim: bool,
+    defuse: bool,
+}
+
+fn style_for(plan: &SectorPlan, hardness: usize, rng: &mut Rng) -> Style {
+    Style {
+        band_rows: rng.pick(&BAND_ROW_CHOICES),
+        base: (plan.world + plan.sector + rng.usize_below(NORMAL_COLOURS.len()))
+            % NORMAL_COLOURS.len(),
+        tough_bands: TOUGH_BANDS_BY_HARDNESS[hardness.min(MAX_HARDNESS)],
+        tough_from_bottom: rng.usize_below(2) == 0,
+        tough_focal: hardness >= TOUGH_FOCAL_FROM,
+        tough_trim: hardness >= TOUGH_TRIM_FROM,
+        defuse: hardness >= DEFUSE_FROM,
+    }
+}
+
+fn normal_colour(index: usize) -> char {
+    NORMAL_COLOURS[index % NORMAL_COLOURS.len()]
+}
+
+fn tough_colour(index: usize) -> char {
+    TOUGH_COLOURS[index % TOUGH_COLOURS.len()]
+}
+
+/// Turns the motif tokens into level cells: body bricks take one colour per row band, trim and
+/// focal bricks one colour each, tough features one tough digit.
+fn colourise(grid: &Grid, style: &Style) -> Vec<String> {
+    let first_row = grid
+        .iter()
+        .position(|row| row.iter().any(|&c| c != T_EMPTY))
+        .unwrap_or(0);
+    let band_of = |r: usize| r.saturating_sub(first_row) / style.band_rows;
+    let mut body_bands: Vec<usize> = grid
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains(&T_BODY))
+        .map(|(r, _)| band_of(r))
+        .collect();
+    body_bands.dedup();
+    let tough: BTreeSet<usize> = if style.tough_from_bottom {
+        body_bands
+            .iter()
+            .rev()
+            .take(style.tough_bands)
+            .copied()
+            .collect()
+    } else {
+        body_bands.iter().take(style.tough_bands).copied().collect()
+    };
+    let body_colour = |r: usize| {
+        let band = band_of(r);
+        if tough.contains(&band) {
+            tough_colour(band)
+        } else {
+            normal_colour(style.base + band)
+        }
+    };
+    grid.iter()
+        .enumerate()
+        .map(|(r, row)| {
+            row.iter()
+                .map(|&ch| match ch {
+                    T_EMPTY => CELL_EMPTY,
+                    T_BODY => body_colour(r),
+                    T_TRIM if style.tough_trim => tough_colour(style.base + band_of(r)),
+                    T_TRIM => normal_colour(style.base + TRIM_COLOUR_OFFSET + band_of(r)),
+                    T_FOCAL if style.tough_focal => tough_colour(style.base + 1),
+                    T_FOCAL => normal_colour(style.base + FOCAL_COLOUR_OFFSET),
+                    T_CAGE => tough_colour(style.base),
+                    T_EXPLOSIVE if style.defuse => body_colour(r),
+                    other => other,
+                })
+                .collect()
+        })
         .collect()
 }
 
-fn apply_structure_pass(grid: &mut [Vec<char>], ctx: &PassContext, rng: &mut Rng) {
-    let pass = ctx.pass;
-    let world = ctx.world;
-    let sector_in_world = ctx.sector_in_world;
-    let is_teaching_block = ctx.is_teaching_block;
-    let want_asymmetric = ctx.want_asymmetric;
-    let rows = grid.len();
-    if rows < MIN_REGULAR_ROWS {
-        return;
-    }
+// ---------------------------------------------------------------------------------------------
+// Level assembly
+// ---------------------------------------------------------------------------------------------
 
-    match pass {
-        StructurePass::OpenShowcase => {
-            // Keep lanes open; add a small diagonal accent of standard/explosive cells.
-            let r = rows / 2;
-            let c = (sector_in_world + rng.usize_below(7)) % (EDITOR_COLS - 4) + 2;
-            grid[r][c] = 'E';
-        }
-        StructurePass::SteelCorridors => {
-            // Place non-sealing '#' corridor baffles that create angled bank-shot channels.
-            let r1 = (rows / 2).clamp(1, rows - 2);
-            let left_col = 1 + rng.usize_below(3);
-            let right_col = if want_asymmetric {
-                (EDITOR_COLS - 2 - rng.usize_below(4)).max(left_col + 4)
-            } else {
-                EDITOR_COLS - 1 - left_col
-            };
-            grid[r1][left_col] = '#';
-            grid[r1][right_col] = '#';
-            if rows >= 6 && !is_teaching_block {
-                let r2 = (r1 + 2).min(rows - 2);
-                let mid_col = if want_asymmetric {
-                    5 + rng.usize_below(5)
-                } else {
-                    7
-                };
-                grid[r2][mid_col] = '#';
-            }
-        }
-        StructurePass::ExplosiveCage => {
-            // Partial cage around an 'E' core at an offset position (never sealed).
-            let cr = (rows / 2).clamp(1, rows - 2);
-            let cc = if want_asymmetric {
-                3 + rng.usize_below(EDITOR_COLS - 7)
-            } else {
-                7
-            };
-            grid[cr][cc] = 'E';
-            if cc >= 2 && cc + 2 < EDITOR_COLS {
-                grid[cr][cc - 1] = '5';
-                grid[cr][cc + 1] = '5';
-                if cr + 1 < rows && !is_teaching_block {
-                    grid[cr + 1][cc - 1] = '#';
-                    grid[cr + 1][cc + 1] = if want_asymmetric { '6' } else { '#' };
-                    grid[cr + 1][cc] = '2';
-                }
-            }
-        }
-        StructurePass::PortalShortcut => {
-            // Clear any pre-existing 'T' and place exactly 2 paired portals ('T').
-            for r in grid.iter_mut() {
-                for ch in r.iter_mut() {
-                    if *ch == 'T' {
-                        *ch = '2';
-                    }
-                }
-            }
-            let top_r = rng.usize_below((rows / 2).max(1));
-            let bot_r = (rows - 2).max(top_r + 1).min(rows - 1);
-            let (c_top, c_bot) = if want_asymmetric {
-                let a = rng.usize_below(4);
-                let b = EDITOR_COLS - 1 - rng.usize_below(4);
-                (a, b)
-            } else {
-                let a = rng.usize_below(3);
-                (a, EDITOR_COLS - 1 - a)
-            };
-            grid[top_r][c_top] = 'T';
-            if want_asymmetric {
-                grid[bot_r][c_bot] = 'T';
-            } else {
-                grid[top_r][c_bot] = 'T';
-            }
-        }
-        StructurePass::GhostSilhouette => {
-            // Place a readable silhouette/ribbon of 'G' ghost bricks (4 to 8 cells).
-            let gr = (1 + rng.usize_below(rows.saturating_sub(2).max(1))).min(rows - 2);
-            let start_c = if want_asymmetric {
-                1 + rng.usize_below(5)
-            } else {
-                3
-            };
-            let count = if is_teaching_block { 5 } else { 7 };
-            for i in 0..count {
-                let c = (start_c + i) % EDITOR_COLS;
-                let r = if want_asymmetric && i % 2 == 1 {
-                    (gr + 1).min(rows - 2)
-                } else {
-                    gr
-                };
-                if grid[r][c] != 'T' && grid[r][c] != '#' {
-                    grid[r][c] = 'G';
-                }
-            }
-        }
-        StructurePass::ConveyorLane => {
-            // Dedicate one interior row mostly to '0' with 3 to 5 moving 'M' bricks so they sweep freely.
-            let mr = (rows / 2).clamp(1, rows - 2);
-            for cell in grid[mr].iter_mut() {
-                if *cell != 'T' {
-                    *cell = '0';
-                }
-            }
-            let m_count = if is_teaching_block { 3 } else { 4 };
-            let offset = rng.usize_below(3);
-            for k in 0..m_count {
-                let c = (offset + 1 + k * 3) % (EDITOR_COLS - 1);
-                grid[mr][c] = 'M';
-            }
-        }
-        StructurePass::DominoFuse => {
-            // Diagonal fuse of 'E' cells separated by 1-2 standard bricks.
-            let start_c = 2 + rng.usize_below(EDITOR_COLS - 6);
-            let dir: isize = if rng.usize_below(2) == 0 { 2 } else { -2 };
-            let mut c = start_c as isize;
-            for (step, row) in grid.iter_mut().enumerate().take(rows.min(5)) {
-                let col = c.rem_euclid(EDITOR_COLS as isize) as usize;
-                if row[col] != 'T' && row[col] != '#' {
-                    row[col] = if step % 2 == 0 { 'E' } else { '2' };
-                }
-                c += dir;
-            }
-        }
-        StructurePass::BumperPinballBay => {
-            // Place 2 or 3 'B' bumpers in the upper/mid rows (never on the bottom row) so
-            // they create pinball rebounds inside the brick field without draining balls.
-            let br = (rows / 3).clamp(1, rows.saturating_sub(3).max(1));
-            let c1 = 3 + rng.usize_below(3);
-            let c2 = if want_asymmetric {
-                (c1 + 4 + rng.usize_below(4)).min(EDITOR_COLS - 2)
-            } else {
-                EDITOR_COLS - 1 - c1
-            };
-            if grid[br][c1] != 'T' {
-                grid[br][c1] = 'B';
-            }
-            if grid[br][c2] != 'T' {
-                grid[br][c2] = 'B';
-            }
-            if !is_teaching_block && rows >= 6 && world >= 5 {
-                let br2 = (br + 1).min(rows - 3);
-                let cm = (c1 + c2) / 2;
-                if grid[br2][cm] != 'T' {
-                    grid[br2][cm] = 'E';
-                }
-            }
-        }
-        StructurePass::RegenShieldWall => {
-            // Place 2 to 4 'R' regenerating bricks as a shield in front of an 'E' core.
-            let rr = (rows / 2).clamp(1, rows - 2);
-            let center_c = if want_asymmetric {
-                4 + rng.usize_below(7)
-            } else {
-                7
-            };
-            if grid[rr.saturating_sub(1)][center_c] != 'T' {
-                grid[rr.saturating_sub(1)][center_c] = 'E';
-            }
-            for dc in [-1isize, 0, 1] {
-                let c = (center_c as isize + dc).clamp(1, (EDITOR_COLS - 2) as isize) as usize;
-                if grid[rr][c] != 'T' && grid[rr][c] != '#' {
-                    grid[rr][c] = 'R';
-                }
-            }
-        }
-    }
-
-    // Secondary world seasoning outside teaching blocks so worlds 4..=8 blend mechanics.
-    if !is_teaching_block {
-        if world >= 4 && pass != StructurePass::PortalShortcut && sector_in_world.is_multiple_of(4)
-        {
-            let has_portals = grid.iter().flatten().any(|&c| c == 'T');
-            if !has_portals {
-                let r_top = 0;
-                let r_bot = (rows / 2).min(rows - 2);
-                let c_left = rng.usize_below(2);
-                let c_right = EDITOR_COLS - 1 - rng.usize_below(2);
-                grid[r_top][c_left] = 'T';
-                grid[r_bot][c_right] = 'T';
-            }
-        }
-        if world >= 6 && pass != StructurePass::RegenShieldWall && sector_in_world.is_multiple_of(3)
-        {
-            let r = (rows / 2).clamp(1, rows - 2);
-            let c = 2 + rng.usize_below(EDITOR_COLS - 4);
-            if matches!(grid[r][c], '1'..='6') {
-                grid[r][c] = 'R';
-            }
-        }
-    }
+fn find_motif(name: &str) -> Option<&'static MotifTemplate> {
+    MOTIFS.iter().find(|m| m.name == name)
 }
 
-fn tune_explosive_nodes(grid: &mut [Vec<char>], target_e: usize, rng: &mut Rng) {
-    let rows = grid.len();
-    let mut e_positions: Vec<(usize, usize)> = Vec::new();
-    for (r, row) in grid.iter().enumerate() {
-        for (c, &ch) in row.iter().enumerate() {
-            if ch == 'E' {
-                e_positions.push((r, c));
-            }
-        }
-    }
-
-    while e_positions.len() > target_e {
-        let remove_idx = rng.usize_below(e_positions.len());
-        let (r, c) = e_positions.swap_remove(remove_idx);
-        grid[r][c] = char::from_digit(((r + c) % 4) as u32 + 1, 10).unwrap_or('2');
-    }
-
-    let mut attempts = 0usize;
-    while e_positions.len() < target_e && attempts < 40 {
-        attempts += 1;
-        let r = rng.usize_below(rows);
-        let c = 1 + rng.usize_below(EDITOR_COLS - 2);
-        if matches!(grid[r][c], '1'..='6') {
-            grid[r][c] = 'E';
-            e_positions.push((r, c));
-        }
-    }
+fn token_count(motif: &MotifTemplate) -> usize {
+    motif
+        .rows
+        .iter()
+        .flat_map(|r| r.chars())
+        .filter(|&c| c != T_EMPTY)
+        .count()
 }
 
-fn balance_density(
-    grid: &mut [Vec<char>],
-    target_bricks: usize,
-    base_color: u32,
-    want_asymmetric: bool,
-    rng: &mut Rng,
-) {
-    let rows = grid.len();
-    let count_destructible = |g: &[Vec<char>]| -> usize {
-        g.iter()
-            .flat_map(|r| r.iter())
-            .filter(|&&ch| is_destructible_cell(ch))
-            .count()
+/// Whether a motif can become asymmetric: it already differs from its mirror by enough cells, or
+/// it leaves room to be offset inside the grid.
+fn can_be_asymmetric(motif: &MotifTemplate) -> bool {
+    let mismatch: usize = motif
+        .rows
+        .iter()
+        .map(|row| {
+            let cells: Vec<char> = row.chars().collect();
+            cells
+                .iter()
+                .zip(cells.iter().rev())
+                .filter(|(a, b)| a != b)
+                .count()
+        })
+        .sum();
+    mismatch >= ASYMMETRY_MIN_MISMATCH
+        || bbox_cols(&motif_grid(motif)).is_some_and(|(lo, hi)| lo + (COLS - 1 - hi) >= 2)
+}
+
+/// Picks the motif of a sector: the set piece of its block, or a motif of the block theme whose
+/// size fits the density window of the sector.
+fn pick_motif(plan: &SectorPlan, window: (usize, usize), rng: &mut Rng) -> &'static MotifTemplate {
+    if plan.kind == SectorKind::SetPiece {
+        if let Some(motif) = set_piece_index(plan.block)
+            .and_then(|i| SET_PIECES.get(i))
+            .and_then(|piece| find_motif(piece.motifs[(plan.world - 1) % SET_PIECE_VARIANTS]))
+        {
+            return motif;
+        }
+    }
+    let (primary, secondary) =
+        BLOCK_FAMILIES[plan.world_idx()][plan.block.min(BLOCKS_PER_WORLD - 1)];
+    let family = if plan.pos % 3 == 2 {
+        secondary
+    } else {
+        primary
     };
-
-    // Add standard bricks if below target.
-    let mut guard = 0usize;
-    while count_destructible(grid) < target_bricks && guard < 200 {
-        guard += 1;
-        let r = rng.usize_below(rows);
-        let c = rng.usize_below(EDITOR_COLS);
-        if grid[r][c] == '0' {
-            let d = char::from_digit(((base_color + (r + c) as u32) % 4) + 1, 10).unwrap_or('1');
-            grid[r][c] = d;
-            if !want_asymmetric && count_destructible(grid) < target_bricks {
-                let mc = EDITOR_COLS - 1 - c;
-                if grid[r][mc] == '0' {
-                    grid[r][mc] = d;
-                }
-            }
-        }
+    let fits = |m: &&MotifTemplate| {
+        let cells = token_count(m);
+        cells + PASS_SLACK >= window.0
+            && cells <= window.1 + PASS_SLACK
+            && (plan.symmetric || can_be_asymmetric(m))
+    };
+    let themed: Vec<&MotifTemplate> = MOTIFS
+        .iter()
+        .filter(|m| m.family == family)
+        .filter(fits)
+        .collect();
+    if themed.len() >= MIN_THEMED_POOL {
+        return themed[rng.usize_below(themed.len())];
     }
+    let any: Vec<&MotifTemplate> = MOTIFS.iter().filter(fits).collect();
+    if any.is_empty() {
+        &MOTIFS[rng.usize_below(MOTIFS.len())]
+    } else {
+        any[rng.usize_below(any.len())]
+    }
+}
 
-    // Remove standard bricks ('1'..='6') if above target.
-    guard = 0;
-    while count_destructible(grid) > target_bricks + 2 && guard < 250 {
-        guard += 1;
-        let r = rng.usize_below(rows);
-        let c = rng.usize_below(EDITOR_COLS);
-        if matches!(grid[r][c], '1'..='6') {
-            grid[r][c] = '0';
-            if !want_asymmetric && count_destructible(grid) > target_bricks {
-                let mc = EDITOR_COLS - 1 - c;
-                if matches!(grid[r][mc], '1'..='6') {
-                    grid[r][mc] = '0';
-                }
-            }
+/// Picks the primary and the optional secondary pass of a sector.
+fn pick_passes(plan: &SectorPlan, rng: &mut Rng) -> (StructurePass, Option<StructurePass>) {
+    let w = plan.world_idx();
+    match plan.kind {
+        SectorKind::Teaching => (rng.pick(TEACHING_PASSES[w]), None),
+        SectorKind::SetPiece => (SIGNATURE_PASSES[w], SET_PIECE_SECONDARY[w]),
+        SectorKind::Breather | SectorKind::Standard => {
+            let primary = rng.pick(WORLD_PASS_MIX[w]);
+            let secondary = if plan.block >= SECONDARY_PASS_FROM_BLOCK
+                && plan.kind == SectorKind::Standard
+                && rng.chance(SECONDARY_PASS_PERCENT)
+            {
+                Some(rng.pick(WORLD_PASS_MIX[w])).filter(|p| *p != primary && *p != Open)
+            } else {
+                None
+            };
+            (primary, secondary)
         }
     }
 }
 
-fn enforce_asymmetry(grid: &mut [Vec<char>], base_color: u32, rng: &mut Rng) {
-    let rows = grid.len();
-    for step in 0..8 {
-        let probe = LevelDef {
-            id: 1,
-            world: 1,
-            name: String::new(),
-            boss: false,
-            rows: grid.iter().map(|r| r.iter().collect()).collect(),
-        };
-        if is_asymmetric(&probe) {
-            return;
+/// Why a rendered level misses a design rule (`None` when it satisfies all of them).
+fn layout_issue(rows: &[String], plan: &SectorPlan, window: (usize, usize)) -> Option<String> {
+    if !(MIN_REGULAR_ROWS..=MAX_REGULAR_ROWS).contains(&rows.len()) {
+        return Some(format!("{} rows", rows.len()));
+    }
+    let cells = rows
+        .iter()
+        .flat_map(|r| r.chars())
+        .filter(|&c| is_destructible_cell(c))
+        .count();
+    if cells < window.0 || cells > window.1 {
+        return Some(format!(
+            "{cells} destructible bricks outside the window {}..={}",
+            window.0, window.1
+        ));
+    }
+    let level = LevelDef {
+        id: 0,
+        world: plan.world,
+        name: String::new(),
+        boss: false,
+        rows: rows.to_vec(),
+    };
+    let mismatch = mirror_mismatch_cells(&level);
+    if plan.symmetric && mismatch != 0 {
+        return Some(format!("symmetric sector has {mismatch} mismatching cells"));
+    }
+    if !plan.symmetric && mismatch < ASYMMETRY_MIN_MISMATCH {
+        return Some(format!(
+            "asymmetric sector has only {mismatch} mismatching cells"
+        ));
+    }
+    let portals = rows
+        .iter()
+        .flat_map(|r| r.chars())
+        .filter(|&c| c == CELL_PORTAL)
+        .count();
+    if portals != 0 && portals != 2 {
+        return Some(format!("{portals} portals"));
+    }
+    for &(mechanic, debut) in &MECHANIC_DEBUTS {
+        if plan.world < debut && rows.iter().any(|r| r.contains(mechanic)) {
+            return Some(format!(
+                "mechanic {mechanic} before its debut world {debut}"
+            ));
         }
-        let r = (step + rng.usize_below(rows)) % rows;
-        let c = (step + rng.usize_below(EDITOR_COLS / 2)) % (EDITOR_COLS / 2);
-        let mc = EDITOR_COLS - 1 - c;
-        let d = char::from_digit(((base_color + step as u32) % 4) + 1, 10).unwrap_or('1');
-        if grid[r][c] == grid[r][mc] {
-            if grid[r][c] == '0' {
-                grid[r][c] = d;
-            } else if matches!(grid[r][c], '1'..='6') {
-                grid[r][mc] = '0';
+        if plan.world == debut
+            && matches!(plan.kind, SectorKind::Teaching)
+            && !rows.iter().any(|r| r.contains(mechanic))
+        {
+            return Some(format!(
+                "teaching sector without the debut mechanic {mechanic}"
+            ));
+        }
+    }
+    let (dust, components) = dust_and_components(rows);
+    if dust > MAX_DUST {
+        return Some(format!("{dust} dust fragments"));
+    }
+    if components > MAX_COMPONENTS_8 {
+        return Some(format!("{components} connected components"));
+    }
+    if colour_regions_per_cell(rows) > MAX_COLOUR_REGIONS_PER_CELL {
+        return Some("colour fragmentation".to_string());
+    }
+    None
+}
+
+fn build_regular_rows(
+    plan: &SectorPlan,
+    hardness: usize,
+    rng: &mut Rng,
+) -> Result<Vec<String>, String> {
+    let window = density_window(plan.world, plan.sector);
+    let teaching = plan.kind == SectorKind::Teaching;
+    let motif = pick_motif(plan, window, rng);
+    let mut grid = motif_grid(motif);
+
+    // Orientation: symmetric sectors mirror one half of the motif; asymmetric ones flip and
+    // offset it inside its bounding box.
+    if plan.symmetric {
+        mirror_half(&mut grid, rng.usize_below(2) == 0);
+    } else {
+        if rng.usize_below(2) == 1 {
+            for row in grid.iter_mut() {
+                row.reverse();
             }
         }
+        let magnitude = 1 + rng.usize_below(MAX_SHIFT as usize) as isize;
+        let dx = if rng.usize_below(2) == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+        shift_clamped(&mut grid, dx);
+    }
+    if rng.usize_below(FLIP_VERTICAL_ODDS) == 0 {
+        grid.reverse();
+    }
+    if rng.chance(CROP_PERCENT) {
+        // Crop rows off one end and columns off the sides (equally on symmetric sectors).
+        let spare_rows = grid
+            .len()
+            .saturating_sub(MIN_REGULAR_ROWS + 1)
+            .min(MAX_CROP_ROWS);
+        let crop = rng.usize_below(spare_rows + 1);
+        if crop > 0 {
+            if rng.usize_below(2) == 0 {
+                grid.drain(..crop);
+            } else {
+                grid.truncate(grid.len() - crop);
+            }
+        }
+        if plan.symmetric {
+            let side = rng.usize_below(2);
+            crop_columns(&mut grid, side, side);
+        } else if rng.usize_below(2) == 0 {
+            let amount = rng.usize_below(MAX_CROP_COLS + 1);
+            if rng.usize_below(2) == 0 {
+                crop_columns(&mut grid, amount, 0);
+            } else {
+                crop_columns(&mut grid, 0, amount);
+            }
+        }
+    }
+
+    let ctx = PassContext {
+        symmetric: plan.symmetric,
+        teaching,
+    };
+    let (primary, secondary) = pick_passes(plan, rng);
+    if primary.debut_world() > plan.world {
+        return Err(format!("pass {primary:?} before its debut world"));
+    }
+    if !apply_pass(primary, &mut grid, ctx, rng) {
+        return Err(format!(
+            "pass {primary:?} does not fit motif {}",
+            motif.name
+        ));
+    }
+    if let Some(second) = secondary.filter(|p| p.debut_world() <= plan.world) {
+        // The second pass is a garnish: a motif without room for it keeps its first pass.
+        let mut garnished = grid.clone();
+        if apply_pass(second, &mut garnished, ctx, rng) {
+            grid = garnished;
+        }
+    }
+
+    // Empty rows above the shape move the whole feature down.
+    let spare = MAX_REGULAR_ROWS.saturating_sub(grid.len()).min(MAX_TOP_PAD);
+    let pad = rng.usize_below(spare + 1);
+    for _ in 0..pad {
+        grid.insert(0, vec![T_EMPTY; COLS]);
+    }
+
+    let style = style_for(plan, hardness, rng);
+    let rows = colourise(&grid, &style);
+    match layout_issue(&rows, plan, window) {
+        Some(issue) => Err(issue),
+        None => Ok(rows),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validate::{is_asymmetric, is_mirror_symmetric};
+
+    fn request(world: usize, sector: usize, seed: u64, hardness: usize) -> SectorRequest {
+        SectorRequest {
+            id: (world - 1) * 100 + sector,
+            world,
+            sector_in_world: sector,
+            is_last: false,
+            seed,
+            hardness,
+        }
+    }
+
+    /// Candidate levels of a world over a handful of seeds.
+    fn sample_world(world: usize, seeds: u64) -> Vec<(usize, LevelDef)> {
+        let mut out = Vec::new();
+        for sector in 1..=100 {
+            if is_boss_sector(sector) {
+                continue;
+            }
+            for seed in 0..seeds {
+                let mut used = BTreeSet::new();
+                if let Ok(level) = generate_sector(&request(world, sector, seed, 2), &mut used) {
+                    out.push((sector, level));
+                    break;
+                }
+            }
+        }
+        out
+    }
 
     #[test]
     fn boss_stem_fits_the_final_suffix_and_never_depends_on_the_suffix() {
@@ -925,18 +1730,132 @@ mod tests {
     }
 
     #[test]
-    fn generated_sectors_vary_row_counts_and_exceed_asymmetry_threshold() {
+    fn all_785_names_are_unique_short_and_free_of_digits_and_final() {
         let mut used = BTreeSet::new();
-        let mut row_counts = BTreeSet::new();
-        let mut asym = 0usize;
-        for s in 16..=100 {
-            let lvl = generate_sector(s, 1, s, s == 100, 12345, &mut used).expect("sector");
-            row_counts.insert(lvl.rows.len());
-            if is_asymmetric(&lvl) {
-                asym += 1;
+        let mut count = 0usize;
+        for world in 1..=8 {
+            for sector in 1..=100 {
+                if world == 1 && sector <= 15 {
+                    continue;
+                }
+                let boss = is_boss_sector(sector);
+                let last = world == 8 && sector == 100;
+                let name =
+                    generate_unique_name(world, sector, boss, last, &mut used).expect("name");
+                assert!(name.len() <= MAX_LEVEL_NAME_LEN, "{name}");
+                assert!(!name.chars().any(|c| c.is_ascii_digit()), "{name}");
+                assert!(last || !name.starts_with("FINAL"), "{name}");
+                count += 1;
             }
         }
-        assert!(row_counts.len() >= 4, "row counts: {row_counts:?}");
-        assert!(asym >= 30, "expected >= 30 asymmetric in W1, got {asym}");
+        assert_eq!(count, 785);
+        assert_eq!(used.len(), 785);
+    }
+
+    #[test]
+    fn symmetric_sectors_are_forty_percent_and_exactly_mirrored() {
+        let symmetric = (1..=100)
+            .filter(|&s| !is_boss_sector(s) && is_symmetric_sector(s))
+            .count();
+        assert!((38..=40).contains(&symmetric), "{symmetric}");
+        for world in [1usize, 4, 8] {
+            for (sector, level) in sample_world(world, 40) {
+                if is_symmetric_sector(sector) {
+                    assert!(is_mirror_symmetric(&level), "w{world} s{sector}");
+                } else {
+                    assert!(is_asymmetric(&level), "w{world} s{sector}");
+                    assert!(
+                        mirror_mismatch_cells(&level) >= ASYMMETRY_MIN_MISMATCH,
+                        "w{world} s{sector}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generation_is_deterministic() {
+        for world in [1usize, 5] {
+            let a = sample_world(world, 40);
+            let b = sample_world(world, 40);
+            assert_eq!(a.len(), b.len());
+            for ((_, x), (_, y)) in a.iter().zip(&b) {
+                assert_eq!(x.rows, y.rows);
+                assert_eq!(x.name, y.name);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_levels_vary_row_counts_and_obey_the_mechanic_order() {
+        for world in 1..=8usize {
+            let levels = sample_world(world, 60);
+            assert!(levels.len() >= 80, "world {world}: {} levels", levels.len());
+            let row_counts: BTreeSet<usize> = levels.iter().map(|(_, l)| l.rows.len()).collect();
+            assert!(row_counts.len() >= 4, "world {world}: {row_counts:?}");
+            for (sector, level) in &levels {
+                for &(mechanic, debut) in &MECHANIC_DEBUTS {
+                    if world < debut {
+                        assert!(
+                            !level.rows.iter().any(|r| r.contains(mechanic)),
+                            "w{world} s{sector} uses {mechanic}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debut_mechanics_appear_in_the_teaching_block() {
+        for &(mechanic, debut) in &MECHANIC_DEBUTS {
+            let levels = sample_world(debut, 60);
+            assert!(
+                levels
+                    .iter()
+                    .any(|(s, l)| *s <= BLOCK_SIZE && l.rows.iter().any(|r| r.contains(mechanic))),
+                "mechanic {mechanic} missing from the first block of world {debut}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_pieces_name_existing_motifs_and_cover_every_non_boss_block() {
+        let mut all = BTreeSet::new();
+        for piece in &SET_PIECES {
+            assert!(!piece.theme.is_empty());
+            for name in piece.motifs {
+                let motif = find_motif(name).expect(name);
+                assert!(
+                    (SAFE_DENSITY_MIN..=SAFE_DENSITY_MAX).contains(&token_count(motif)),
+                    "set piece {name} does not fit the density band"
+                );
+                assert!(all.insert(name), "set piece motif {name} is used twice");
+            }
+        }
+        let covered: Vec<usize> = (0..BLOCKS_PER_WORLD).filter_map(set_piece_index).collect();
+        assert_eq!(covered, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(set_piece_index(4).is_none() && set_piece_index(9).is_none());
+        // Sector 10 of a block is symmetric, so a showcase is always mirrored.
+        for block in 0..BLOCKS_PER_WORLD {
+            assert!(is_symmetric_sector((block + 1) * BLOCK_SIZE));
+        }
+    }
+
+    #[test]
+    fn shift_never_wraps_and_stays_inside_the_bounding_box() {
+        let mut grid: Grid = vec![".XX............".chars().collect()];
+        shift_clamped(&mut grid, -3);
+        assert_eq!(grid[0].iter().collect::<String>(), "XX.............");
+        shift_clamped(&mut grid, 30);
+        assert_eq!(grid[0].iter().collect::<String>(), ".............XX");
+    }
+
+    #[test]
+    fn hardness_follows_the_wanted_rate() {
+        assert_eq!(hardness_for_rate(0.9), 0);
+        assert_eq!(hardness_for_rate(0.5), 2);
+        assert_eq!(hardness_for_rate(0.25), 4);
+        assert_eq!(hardness_for_rate(0.0), MAX_HARDNESS);
     }
 }
