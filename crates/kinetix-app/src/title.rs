@@ -17,25 +17,14 @@
 //! Title screen: world / sector selection logic, keyboard input and drawing.
 
 use crate::tuning::*;
-use crate::vfx::{draw_rounded_rect, fit_font_size};
-use crate::{rgba, txt};
-use kinetix_core::config::{LevelDef, LevelPack, ThemeDef};
-use kinetix_core::i18n::I18nCatalog;
-use kinetix_core::physics::GameWorld;
+use kinetix_app::library::{Library, MAX_LIBRARY_LEVELS};
+use kinetix_app::menu::{
+    LibraryEntry as MenuLibraryEntry, LibraryId, MenuInput, MenuModel, SectorRow, WorldRow,
+};
+use kinetix_core::config::LevelDef;
+use kinetix_core::i18n::{I18nCatalog, Language};
+use macroquad::input::{Touch, TouchPhase};
 use macroquad::prelude::*;
-
-/// Keys that jump straight to the n-th world of the title menu (Key1 is the first world).
-pub(crate) const WORLD_SELECT_KEYS: [KeyCode; 9] = [
-    KeyCode::Key1,
-    KeyCode::Key2,
-    KeyCode::Key3,
-    KeyCode::Key4,
-    KeyCode::Key5,
-    KeyCode::Key6,
-    KeyCode::Key7,
-    KeyCode::Key8,
-    KeyCode::Key9,
-];
 
 /// Worlds in campaign order as `(world id, index of the first level)`; a new entry starts
 /// whenever the world id changes along the level list.
@@ -49,23 +38,6 @@ pub(crate) fn build_worlds(levels: &[LevelDef]) -> Vec<(usize, usize)> {
     worlds
 }
 
-/// Position in `worlds` of the world owning level `level_idx` (`fallback` when unknown).
-pub(crate) fn world_pos_for_level(
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    level_idx: usize,
-    fallback: usize,
-) -> usize {
-    levels
-        .get(level_idx)
-        .and_then(|level| {
-            worlds
-                .iter()
-                .rposition(|&(id, first)| id == level.world && first <= level_idx)
-        })
-        .unwrap_or(fallback)
-}
-
 /// A sector can be started when its index is not above the highest unlocked one.
 pub(crate) fn is_sector_unlocked(sector_idx: usize, max_unlocked: usize) -> bool {
     sector_idx <= max_unlocked
@@ -74,87 +46,6 @@ pub(crate) fn is_sector_unlocked(sector_idx: usize, max_unlocked: usize) -> bool
 /// A world is playable once its first sector is unlocked.
 pub(crate) fn is_world_unlocked(first_level_idx: usize, max_unlocked: usize) -> bool {
     is_sector_unlocked(first_level_idx, max_unlocked)
-}
-
-/// Keeps a menu sector selection on an existing, unlocked sector.
-pub(crate) fn clamp_sector(selected: usize, max_unlocked: usize, last_sector: usize) -> usize {
-    selected.min(max_unlocked).min(last_sector)
-}
-
-/// Direction / jump kind for start-sector navigation in the title menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SectorNav {
-    Prev,
-    Next,
-    PagePrev,
-    PageNext,
-    WorldHome,
-    WorldEnd,
-}
-
-/// Pure start-sector navigation: computes the new `(selected_world_pos, selected_sector_idx)`,
-/// clamped to unlocked sectors. `WorldHome` and `WorldEnd` jump to the first / last unlocked
-/// sector belonging to the currently selected world.
-pub(crate) fn navigate_sector(
-    nav: SectorNav,
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    world_pos: usize,
-    sector_idx: usize,
-    max_unlocked: usize,
-) -> (usize, usize) {
-    if levels.is_empty() {
-        return (world_pos, 0);
-    }
-    let last_sector = levels.len() - 1;
-    let target = match nav {
-        SectorNav::Next => sector_idx.saturating_add(1),
-        SectorNav::Prev => sector_idx.saturating_sub(1),
-        SectorNav::PageNext => sector_idx.saturating_add(MENU_SECTOR_PAGE_STEP),
-        SectorNav::PagePrev => sector_idx.saturating_sub(MENU_SECTOR_PAGE_STEP),
-        SectorNav::WorldHome => worlds.get(world_pos).map(|&(_, first)| first).unwrap_or(0),
-        SectorNav::WorldEnd => {
-            if let Some(&(_, first)) = worlds.get(world_pos) {
-                let next_first = worlds
-                    .get(world_pos + 1)
-                    .map(|&(_, nf)| nf)
-                    .unwrap_or(levels.len());
-                next_first.saturating_sub(1).max(first)
-            } else {
-                last_sector
-            }
-        }
-    };
-    let new_sector = clamp_sector(target, max_unlocked, last_sector);
-    let new_world_pos = world_pos_for_level(worlds, levels, new_sector, world_pos);
-    (new_world_pos, new_sector)
-}
-
-/// Position of the next unlocked world after `from` in the given direction, wrapping around and
-/// skipping locked worlds; `from` itself when no other world is unlocked.
-pub(crate) fn step_unlocked_world(
-    worlds: &[(usize, usize)],
-    from: usize,
-    forward: bool,
-    max_unlocked: usize,
-) -> usize {
-    let count = worlds.len();
-    for step in 1..count {
-        let pos = if forward {
-            (from + step) % count
-        } else {
-            (from + count - step) % count
-        };
-        if is_world_unlocked(worlds[pos].1, max_unlocked) {
-            return pos;
-        }
-    }
-    from
-}
-
-/// Replaces the count placeholder of a locale string with the number of worlds.
-pub(crate) fn substitute_count(template: &str, count: usize) -> String {
-    template.replace(COUNT_PLACEHOLDER, &count.to_string())
 }
 
 /// Ids of the first and last sector of the world at `pos` in `worlds`.
@@ -205,356 +96,245 @@ pub(crate) fn world_row_label(
     }
 }
 
-/// Geometry of the title menu world list, derived from the number of worlds.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct WorldRowLayout {
-    pub(crate) step: f32,
-    pub(crate) pill_h: f32,
-    pub(crate) text_dy: f32,
-    pub(crate) text_size: u16,
-}
-
-/// Fits `count` world rows between `MENU_WORLD_LIST_Y` and `MENU_WORLD_LIST_BOTTOM_Y`. While
-/// they fit at full size the rows keep their reference look; past that the pills shrink down to
-/// `MENU_WORLD_PILL_MIN_H` and the gaps absorb the remainder.
-pub(crate) fn world_row_layout(count: usize) -> WorldRowLayout {
-    let count = count.min(WORLD_SELECT_KEYS.len());
-    let n = count.max(1) as f32;
-    let available = MENU_WORLD_LIST_BOTTOM_Y - MENU_WORLD_LIST_Y;
-    let full_needed = n * MENU_WORLD_PILL_H + (n - 1.0) * MENU_WORLD_ROW_GAP;
-    let pill_h = if full_needed <= available {
-        MENU_WORLD_PILL_H
-    } else {
-        let scale = available / full_needed;
-        (MENU_WORLD_PILL_H * scale).clamp(MENU_WORLD_PILL_MIN_H, MENU_WORLD_PILL_H)
-    };
-    let gap = if count <= 1 {
-        MENU_WORLD_ROW_GAP
-    } else {
-        ((available - n * pill_h) / (n - 1.0)).clamp(0.0, MENU_WORLD_ROW_GAP)
-    };
-    let ratio = pill_h / MENU_WORLD_PILL_H;
-    let text_size = ((f32::from(MENU_WORLD_TEXT_SIZE) * ratio).round() as u16)
-        .clamp(MENU_WORLD_TEXT_SIZE_FLOOR, MENU_WORLD_TEXT_SIZE);
-    WorldRowLayout {
-        step: pill_h + gap,
-        pill_h,
-        text_dy: MENU_WORLD_TEXT_DY * ratio,
-        text_size,
-    }
-}
-
-/// Highlighted world and start sector of the title screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TitleSelection {
-    pub(crate) world_pos: usize,
-    pub(crate) sector_idx: usize,
-}
-
-/// Applies this frame's navigation keys (world digits, Left / Right, Up / Down, PageUp / PageDown,
-/// Home / End) to the title selection, keeping it on an existing, unlocked sector.
-pub(crate) fn update_title_selection(
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    max_unlocked: usize,
-    selection: TitleSelection,
-) -> TitleSelection {
-    let TitleSelection {
-        mut world_pos,
-        mut sector_idx,
-    } = selection;
-    if !worlds.is_empty() {
-        for (n, key) in WORLD_SELECT_KEYS.iter().enumerate() {
-            if is_key_pressed(*key) {
-                if let Some(&(_, first_idx)) = worlds.get(n) {
-                    if is_world_unlocked(first_idx, max_unlocked) {
-                        world_pos = n;
-                        sector_idx = first_idx;
-                    }
-                }
-            }
-        }
-        if is_key_pressed(KeyCode::Left) {
-            world_pos = step_unlocked_world(worlds, world_pos, false, max_unlocked);
-            sector_idx = worlds[world_pos].1;
-        }
-        if is_key_pressed(KeyCode::Right) {
-            world_pos = step_unlocked_world(worlds, world_pos, true, max_unlocked);
-            sector_idx = worlds[world_pos].1;
-        }
-    }
-    let last_sector = levels.len().saturating_sub(1);
-    for (key, nav) in [
-        (KeyCode::Up, SectorNav::Next),
-        (KeyCode::Down, SectorNav::Prev),
-        (KeyCode::PageUp, SectorNav::PageNext),
-        (KeyCode::PageDown, SectorNav::PagePrev),
-        (KeyCode::Home, SectorNav::WorldHome),
-        (KeyCode::End, SectorNav::WorldEnd),
-    ] {
-        if is_key_pressed(key) {
-            (world_pos, sector_idx) =
-                navigate_sector(nav, worlds, levels, world_pos, sector_idx, max_unlocked);
-        }
-    }
-    sector_idx = clamp_sector(sector_idx, max_unlocked, last_sector);
-    TitleSelection {
-        world_pos,
-        sector_idx,
-    }
-}
-
-/// True when this frame's input starts the highlighted sector: Enter, Space or a left click on an
-/// unlocked sector, unless developer mode consumed the Enter key.
-pub(crate) fn title_start_requested(
-    sector_idx: usize,
-    max_unlocked: usize,
-    dev_enter_consumed: bool,
-) -> bool {
-    (is_key_pressed(KeyCode::Enter)
-        || is_key_pressed(KeyCode::Space)
-        || is_mouse_button_pressed(MouseButton::Left))
-        && is_sector_unlocked(sector_idx, max_unlocked)
-        && !dev_enter_consumed
-}
-
-/// Title menu selection state: the world list and the highlighted world / start sector.
-pub(crate) struct MenuSelection<'a> {
+/// Everything `build_menu_model` needs to describe the campaign and the settings to the menu.
+pub(crate) struct MenuModelSource<'a> {
+    pub(crate) i18n: &'a I18nCatalog,
+    pub(crate) levels: &'a [LevelDef],
     pub(crate) worlds: &'a [(usize, usize)],
-    pub(crate) world_pos: usize,
-    pub(crate) sector_idx: usize,
+    pub(crate) max_unlocked: usize,
+    /// Sector started last, focused first when its world is opened again.
+    pub(crate) preferred_sector: Option<usize>,
+    pub(crate) satisfaction_names: &'a [String],
+    pub(crate) library: &'a Library,
+    pub(crate) quit_supported: bool,
+    pub(crate) language: Language,
+    pub(crate) renderer_name: String,
+    pub(crate) sfx_on: bool,
+    pub(crate) music_on: bool,
 }
 
-pub(crate) fn draw_title_menu(
-    world: &GameWorld,
-    levels: &LevelPack,
-    theme: &ThemeDef,
-    i18n: &I18nCatalog,
-    font: &Font,
-    selection: &MenuSelection,
-) {
-    let MenuSelection {
+/// Row text of a sector: its id and name, without the title screen prefix.
+pub(crate) fn sector_row_label(sector: &LevelDef) -> String {
+    sector_line("", sector).trim_start().to_owned()
+}
+
+/// Offset inside a world (of `count` sectors starting at level `first`) focused when it opens:
+/// the sector started last when it belongs to the world and is unlocked, else the furthest
+/// unlocked sector of the world.
+pub(crate) fn focus_offset(
+    first: usize,
+    count: usize,
+    max_unlocked: usize,
+    preferred: Option<usize>,
+) -> usize {
+    let last_offset = count.saturating_sub(1);
+    if let Some(sector) = preferred {
+        if sector >= first && sector - first < count && is_sector_unlocked(sector, max_unlocked) {
+            return sector - first;
+        }
+    }
+    max_unlocked.saturating_sub(first).min(last_offset)
+}
+
+/// Builds the data the menu shows from the campaign, the library and the settings.
+pub(crate) fn build_menu_model(source: &MenuModelSource) -> MenuModel {
+    let worlds = source
+        .worlds
+        .iter()
+        .enumerate()
+        .map(|(pos, &(world_id, first))| {
+            let end = source
+                .worlds
+                .get(pos + 1)
+                .map_or(source.levels.len(), |&(_, next_first)| next_first);
+            let sectors: Vec<SectorRow> = (first..end)
+                .filter_map(|index| {
+                    source.levels.get(index).map(|level| SectorRow {
+                        index,
+                        label: sector_row_label(level),
+                        unlocked: is_sector_unlocked(index, source.max_unlocked),
+                    })
+                })
+                .collect();
+            let total = sectors.len();
+            WorldRow {
+                name: world_row_label(source.i18n, world_id, source.worlds, source.levels, pos),
+                unlocked: is_world_unlocked(first, source.max_unlocked),
+                cleared: source.max_unlocked.saturating_sub(first).min(total),
+                total,
+                focus_offset: focus_offset(
+                    first,
+                    total,
+                    source.max_unlocked,
+                    source.preferred_sector,
+                ),
+                sectors,
+            }
+        })
+        .collect();
+    MenuModel {
         worlds,
-        world_pos: selected_world_pos,
-        sector_idx: selected_sector_idx,
-    } = *selection;
-    let w = world.config.arena.width;
-    let h = world.config.arena.height;
-    draw_rectangle(0.0, 0.0, w, h, rgba(MENU_DIM_COLOR));
-    let pri = rgba(theme.text_primary);
-    let acc = rgba(theme.text_accent);
-    let border = rgba(theme.border_color);
+        satisfaction_levels: source.satisfaction_names.to_vec(),
+        library: source
+            .library
+            .entries
+            .iter()
+            .map(|entry| MenuLibraryEntry {
+                id: LibraryId::from(entry.id),
+                name: entry.name.clone(),
+            })
+            .collect(),
+        library_max: MAX_LIBRARY_LEVELS,
+        quit_supported: source.quit_supported,
+        language: source.language,
+        renderer_name: source.renderer_name.clone(),
+        sfx_on: source.sfx_on,
+        music_on: source.music_on,
+    }
+}
 
-    // Modern Glassmorphic Modal Panel
-    draw_rounded_rect(
-        MENU_PANEL_X,
-        MENU_PANEL_Y,
-        MENU_PANEL_W,
-        MENU_PANEL_H,
-        MENU_PANEL_RADIUS,
-        border,
-    );
-    draw_rounded_rect(
-        MENU_PANEL_X + MENU_PANEL_BORDER,
-        MENU_PANEL_Y + MENU_PANEL_BORDER,
-        MENU_PANEL_W - 2.0 * MENU_PANEL_BORDER,
-        MENU_PANEL_H - 2.0 * MENU_PANEL_BORDER,
-        MENU_PANEL_RADIUS - MENU_PANEL_BORDER,
-        rgba(MENU_PANEL_COLOR),
-    );
-    draw_rounded_rect(
-        MENU_PANEL_X + MENU_HEADER_INSET_X,
-        MENU_PANEL_Y + MENU_HEADER_INSET_Y,
-        MENU_PANEL_W - 2.0 * MENU_HEADER_INSET_X,
-        MENU_HEADER_H,
-        MENU_HEADER_RADIUS,
-        Color::new(1.0, 1.0, 1.0, 0.05),
-    );
+/// What the cached menu model depends on: the model is rebuilt only when this changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MenuModelKey {
+    pub(crate) language: Language,
+    pub(crate) max_unlocked: usize,
+    pub(crate) preferred_sector: Option<usize>,
+    pub(crate) theme_idx: usize,
+    pub(crate) sfx_on: bool,
+    pub(crate) music_on: bool,
+    pub(crate) library_len: usize,
+    pub(crate) library_next_id: u32,
+}
 
-    txt(
-        font,
-        i18n.t("app.title"),
-        MENU_PANEL_X + MENU_TITLE_DX,
-        MENU_TITLE_Y,
-        MENU_TITLE_SIZE,
-        acc,
-    );
-    txt(
-        font,
-        i18n.t("app.subtitle"),
-        MENU_PANEL_X + MENU_SUBTITLE_DX,
-        MENU_SUBTITLE_Y,
-        MENU_SUBTITLE_SIZE,
-        pri,
-    );
+/// The last built menu model and the key it was built for.
+pub(crate) struct MenuModelCache {
+    key: Option<MenuModelKey>,
+    model: MenuModel,
+}
 
-    draw_rounded_rect(
-        MENU_PANEL_X + MENU_BEST_PILL_DX,
-        MENU_BEST_PILL_Y,
-        MENU_BEST_PILL_W,
-        MENU_BEST_PILL_H,
-        MENU_BEST_PILL_RADIUS,
-        Color::new(acc.r, acc.g, acc.b, MENU_BEST_PILL_ALPHA),
-    );
-    let best_line = format!("{}: {:07}", i18n.t("menu.best_score"), world.high_score);
-    txt(
-        font,
-        &best_line,
-        MENU_PANEL_X + MENU_BEST_TEXT_DX,
-        MENU_BEST_TEXT_Y,
-        MENU_BEST_TEXT_SIZE,
-        acc,
-    );
-
-    let campaigns_line = substitute_count(
-        i18n.t("menu.campaigns"),
-        worlds.len().clamp(1, WORLD_SELECT_KEYS.len()),
-    );
-    txt(
-        font,
-        &campaigns_line,
-        MENU_PANEL_X + MENU_LABEL_DX,
-        MENU_CAMPAIGNS_Y,
-        MENU_LABEL_SIZE,
-        pri,
-    );
-    let row_layout = world_row_layout(worlds.len());
-    for (pos, &(world_id, first_idx)) in worlds.iter().take(WORLD_SELECT_KEYS.len()).enumerate() {
-        let unlocked = is_world_unlocked(first_idx, world.max_unlocked_level);
-        let y = MENU_WORLD_LIST_Y + pos as f32 * row_layout.step;
-        let is_sel = selected_world_pos == pos;
-        let pill_bg = if is_sel {
-            Color::new(acc.r, acc.g, acc.b, MENU_PILL_SELECTED_ALPHA)
-        } else {
-            rgba(MENU_PILL_IDLE_COLOR)
-        };
-        draw_rounded_rect(
-            MENU_PANEL_X + MENU_WORLD_PILL_DX,
-            y,
-            MENU_WORLD_PILL_W,
-            row_layout.pill_h,
-            MENU_WORLD_PILL_RADIUS.min(row_layout.pill_h * 0.5),
-            pill_bg,
-        );
-        let base_col = if is_sel { acc } else { pri };
-        let col = if unlocked {
-            base_col
-        } else {
-            Color::new(base_col.r, base_col.g, base_col.b, MENU_LOCKED_ALPHA)
-        };
-        let prefix = if is_sel {
-            MENU_SELECTED_PREFIX
-        } else {
-            MENU_UNSELECTED_PREFIX
-        };
-        let row_text = format!(
-            "{}{}",
-            prefix,
-            world_row_label(i18n, world_id, worlds, &levels.levels, pos)
-        );
-        let text_x = MENU_PANEL_X + MENU_WORLD_TEXT_DX;
-        let pill_right = MENU_PANEL_X + MENU_WORLD_PILL_DX + MENU_WORLD_PILL_W;
-        // A locked row reserves room for its label on the right and shrinks the name to fit.
-        let lock_label = i18n.t("menu.locked");
-        let lock_w = if unlocked {
-            0.0
-        } else {
-            measure_text(lock_label, Some(font), row_layout.text_size, 1.0).width + MENU_LOCK_GAP
-        };
-        let text_limit = pill_right - MENU_LOCK_LABEL_PAD - lock_w - text_x;
-        let row_size = fit_font_size(
-            |size| measure_text(&row_text, Some(font), size, 1.0).width,
-            row_layout.text_size,
-            MENU_WORLD_TEXT_SIZE_MIN.min(row_layout.text_size),
-            text_limit,
-        );
-        txt(
-            font,
-            &row_text,
-            text_x,
-            y + row_layout.text_dy,
-            row_size,
-            col,
-        );
-        if !unlocked {
-            let label_w = lock_w - MENU_LOCK_GAP;
-            txt(
-                font,
-                lock_label,
-                pill_right - MENU_LOCK_LABEL_PAD - label_w,
-                y + row_layout.text_dy,
-                row_layout.text_size,
-                col,
-            );
+impl MenuModelCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            key: None,
+            model: MenuModel::empty(),
         }
     }
 
-    let sec_def = &levels.levels[selected_sector_idx % levels.levels.len()];
-    let sec_line = sector_line(i18n.t("menu.sector_select"), sec_def);
-    let sec_size = fit_font_size(
-        |size| measure_text(&sec_line, Some(font), size, 1.0).width,
-        MENU_SECTOR_SIZE,
-        MENU_SECTOR_SIZE_MIN,
-        MENU_SECTOR_MAX_W,
-    );
-    txt(
-        font,
-        &sec_line,
-        MENU_PANEL_X + MENU_LABEL_DX,
-        MENU_SECTOR_Y,
-        sec_size,
-        acc,
-    );
+    /// The model for `key`, built with `build` only when `key` differs from the cached one.
+    pub(crate) fn get(
+        &mut self,
+        key: MenuModelKey,
+        build: impl FnOnce() -> MenuModel,
+    ) -> &MenuModel {
+        if self.key.as_ref() != Some(&key) {
+            self.model = build();
+            self.key = Some(key);
+        }
+        &self.model
+    }
 
-    // Glowing CTA Pill Button
-    draw_rounded_rect(
-        MENU_CTA_X,
-        MENU_CTA_Y,
-        MENU_CTA_W,
-        MENU_CTA_H,
-        MENU_CTA_RADIUS,
-        acc,
-    );
-    draw_rounded_rect(
-        MENU_CTA_X + MENU_CTA_BORDER,
-        MENU_CTA_Y + MENU_CTA_BORDER,
-        MENU_CTA_W - 2.0 * MENU_CTA_BORDER,
-        MENU_CTA_H - 2.0 * MENU_CTA_BORDER,
-        MENU_CTA_RADIUS - MENU_CTA_BORDER,
-        rgba(MENU_CTA_COLOR),
-    );
-    txt(
-        font,
-        i18n.t("menu.play"),
-        MENU_CTA_X + MENU_CTA_TEXT_DX,
-        MENU_CTA_TEXT_Y,
-        MENU_CTA_TEXT_SIZE,
-        WHITE,
-    );
+    /// The last model returned by `get` (empty before the first call).
+    pub(crate) fn current(&self) -> &MenuModel {
+        &self.model
+    }
+}
 
-    let footer = [
-        i18n.t("menu.editor_btn"),
-        i18n.t("menu.theme_btn"),
-        i18n.t("menu.lang_btn"),
-        i18n.t("menu.music_btn"),
-    ]
-    .join(MENU_FOOTER_SEPARATOR);
-    txt(
-        font,
-        &footer,
-        MENU_PANEL_X + MENU_FOOTER_DX,
-        MENU_FOOTER_Y,
-        MENU_FOOTER_SIZE,
-        pri,
-    );
+/// Pointer state of one frame, in screen coordinates, merged from the mouse and the touches.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct PointerFrame {
+    pub(crate) position: Option<(f32, f32)>,
+    pub(crate) pressed: bool,
+    pub(crate) released: bool,
+}
+
+/// Merges the mouse and the touches into one pointer. The first touch, when there is one, is the
+/// pointer: `Started` is a press, `Ended` a release at its position and `Cancelled` a release
+/// without a position. Touch positions are physical pixels and are scaled by `1 / dpi_scale`
+/// like the mouse position.
+pub(crate) fn pointer_frame(
+    mouse: (f32, f32),
+    mouse_pressed: bool,
+    mouse_released: bool,
+    touches: &[Touch],
+    dpi_scale: f32,
+) -> PointerFrame {
+    let Some(touch) = touches.first() else {
+        return PointerFrame {
+            position: Some(mouse),
+            pressed: mouse_pressed,
+            released: mouse_released,
+        };
+    };
+    let position = (touch.position.x / dpi_scale, touch.position.y / dpi_scale);
+    match touch.phase {
+        TouchPhase::Started => PointerFrame {
+            position: Some(position),
+            pressed: true,
+            released: mouse_released,
+        },
+        TouchPhase::Ended => PointerFrame {
+            position: Some(position),
+            pressed: mouse_pressed,
+            released: true,
+        },
+        TouchPhase::Cancelled => PointerFrame {
+            position: None,
+            pressed: false,
+            released: true,
+        },
+        TouchPhase::Moved | TouchPhase::Stationary => PointerFrame {
+            position: Some(position),
+            pressed: mouse_pressed,
+            released: mouse_released,
+        },
+    }
+}
+
+/// Builds the menu input of the frame: keyboard edges plus the pointer, in arena coordinates.
+/// Enter and Escape are dropped when developer sector entry consumed them this frame.
+pub(crate) fn read_menu_input(
+    pointer: PointerFrame,
+    to_arena: impl Fn(f32, f32) -> (f32, f32),
+    dev_enter_consumed: bool,
+    dev_esc_consumed: bool,
+) -> MenuInput {
+    let input = MenuInput {
+        pointer: pointer.position.map(|(x, y)| to_arena(x, y)),
+        pointer_pressed: pointer.pressed,
+        pointer_released: pointer.released,
+        up: is_key_pressed(KeyCode::Up),
+        down: is_key_pressed(KeyCode::Down),
+        left: is_key_pressed(KeyCode::Left),
+        right: is_key_pressed(KeyCode::Right),
+        page_up: is_key_pressed(KeyCode::PageUp),
+        page_down: is_key_pressed(KeyCode::PageDown),
+        home: is_key_pressed(KeyCode::Home),
+        end: is_key_pressed(KeyCode::End),
+        enter: is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::Space),
+        escape: is_key_pressed(KeyCode::Escape),
+    };
+    without_dev_keys(input, dev_enter_consumed, dev_esc_consumed)
+}
+
+/// Clears the keys that developer sector entry already used this frame.
+pub(crate) fn without_dev_keys(
+    input: MenuInput,
+    dev_enter_consumed: bool,
+    dev_esc_consumed: bool,
+) -> MenuInput {
+    MenuInput {
+        enter: input.enter && !dev_enter_consumed,
+        escape: input.escape && !dev_esc_consumed,
+        ..input
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{catalogs, text_width};
-    use crate::{RAW_EN, RAW_FONT, RAW_FR, RAW_LEVELS};
-    use kinetix_core::config::MAX_LEVEL_NAME_LEN;
+    use crate::tests::catalogs;
+    use crate::RAW_LEVELS;
+    use kinetix_core::config::LevelPack;
 
     fn level(id: usize, world: usize) -> LevelDef {
         LevelDef {
@@ -564,56 +344,6 @@ mod tests {
             boss: false,
             rows: Vec::new(),
         }
-    }
-
-    #[test]
-    fn nine_world_rows_fit_and_extra_worlds_are_capped() {
-        let l = world_row_layout(WORLD_SELECT_KEYS.len());
-        let last_bottom =
-            MENU_WORLD_LIST_Y + (WORLD_SELECT_KEYS.len() - 1) as f32 * l.step + l.pill_h;
-        assert!(last_bottom <= MENU_WORLD_LIST_BOTTOM_Y + 0.01);
-        assert!(l.text_size <= l.pill_h as u16);
-        assert_eq!(world_row_layout(40), l);
-    }
-
-    #[test]
-    fn count_placeholder_is_substituted() {
-        assert_eq!(substitute_count("keys [1-{count}]", 5), "keys [1-5]");
-        assert_eq!(substitute_count("no placeholder", 5), "no placeholder");
-    }
-
-    #[test]
-    fn locale_campaign_strings_use_the_placeholder() {
-        for raw in [RAW_EN, RAW_FR] {
-            let catalog = I18nCatalog::from_json_str(raw).unwrap();
-            assert!(catalog.t("menu.campaigns").contains(COUNT_PLACEHOLDER));
-        }
-    }
-
-    #[test]
-    fn world_rows_keep_reference_look_for_three_worlds() {
-        let l = world_row_layout(3);
-        assert_eq!(l.pill_h, MENU_WORLD_PILL_H);
-        assert_eq!(l.step, MENU_WORLD_PILL_H + MENU_WORLD_ROW_GAP);
-        assert_eq!(l.text_size, MENU_WORLD_TEXT_SIZE);
-        assert_eq!(l.text_dy, MENU_WORLD_TEXT_DY);
-    }
-
-    #[test]
-    fn world_rows_fit_above_the_sector_line() {
-        for count in 1..=WORLD_SELECT_KEYS.len() {
-            let l = world_row_layout(count);
-            let last_bottom = MENU_WORLD_LIST_Y + (count - 1) as f32 * l.step + l.pill_h;
-            assert!(
-                last_bottom <= MENU_WORLD_LIST_BOTTOM_Y + 0.01,
-                "count {count}"
-            );
-            assert!(last_bottom < MENU_SECTOR_Y);
-            assert!(l.pill_h >= MENU_WORLD_PILL_MIN_H);
-            assert!(l.text_size >= MENU_WORLD_TEXT_SIZE_FLOOR);
-        }
-        assert!(world_row_layout(6).pill_h < MENU_WORLD_PILL_H);
-        assert_eq!(world_row_layout(0), world_row_layout(1));
     }
 
     #[test]
@@ -630,73 +360,10 @@ mod tests {
     }
 
     #[test]
-    fn sector_navigation_syncs_the_world_position() {
-        let levels = [level(1, 1), level(2, 1), level(3, 2), level(4, 2)];
-        let worlds = build_worlds(&levels);
-        assert_eq!(world_pos_for_level(&worlds, &levels, 1, 9), 0);
-        assert_eq!(world_pos_for_level(&worlds, &levels, 2, 9), 1);
-        assert_eq!(world_pos_for_level(&worlds, &levels, 99, 9), 9);
-    }
-
-    #[test]
     fn fresh_profile_can_only_start_the_first_sector() {
         let max_unlocked = 0;
         assert!(is_sector_unlocked(0, max_unlocked));
         assert!(!is_sector_unlocked(1, max_unlocked));
-        assert_eq!(clamp_sector(9, max_unlocked, 14), 0);
-    }
-
-    #[test]
-    fn sector_clamp_respects_both_bounds() {
-        assert_eq!(clamp_sector(3, 5, 14), 3);
-        assert_eq!(clamp_sector(6, 5, 14), 5);
-        assert_eq!(clamp_sector(20, 30, 14), 14);
-        assert_eq!(clamp_sector(0, 0, 0), 0);
-    }
-
-    #[test]
-    fn sector_navigation_handles_step_page_and_world_bounds() {
-        let levels: Vec<LevelDef> = (0..30).map(|i| level(i + 1, (i / 10) + 1)).collect();
-        let worlds = build_worlds(&levels);
-        let max_unlocked = 16; // World 1 (0..=9) full, World 2 (10..=16) partial, World 3 locked
-
-        assert_eq!(
-            navigate_sector(SectorNav::Next, &worlds, &levels, 0, 0, max_unlocked),
-            (0, 1)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::Prev, &worlds, &levels, 0, 0, max_unlocked),
-            (0, 0)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::PageNext, &worlds, &levels, 0, 2, max_unlocked),
-            (1, 12)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::PageNext, &worlds, &levels, 1, 12, max_unlocked),
-            (1, 16)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::PagePrev, &worlds, &levels, 1, 15, max_unlocked),
-            (0, 5)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::WorldEnd, &worlds, &levels, 0, 3, max_unlocked),
-            (0, 9)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::WorldHome, &worlds, &levels, 0, 9, max_unlocked),
-            (0, 0)
-        );
-        // World 2 end is clamped to max_unlocked (16 instead of 19).
-        assert_eq!(
-            navigate_sector(SectorNav::WorldEnd, &worlds, &levels, 1, 10, max_unlocked),
-            (1, 16)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::WorldHome, &worlds, &levels, 1, 16, max_unlocked),
-            (1, 10)
-        );
     }
 
     #[test]
@@ -704,28 +371,6 @@ mod tests {
         assert!(is_world_unlocked(5, 5));
         assert!(!is_world_unlocked(5, 4));
         assert!(is_world_unlocked(0, 0));
-    }
-
-    #[test]
-    fn world_navigation_skips_locked_worlds() {
-        let worlds = [(1, 0), (2, 5), (3, 10)];
-        // Only world 1 unlocked: nothing else to move to.
-        assert_eq!(step_unlocked_world(&worlds, 0, true, 4), 0);
-        assert_eq!(step_unlocked_world(&worlds, 0, false, 4), 0);
-        // Worlds 1 and 2 unlocked: wraps between them and never reaches world 3.
-        assert_eq!(step_unlocked_world(&worlds, 0, true, 5), 1);
-        assert_eq!(step_unlocked_world(&worlds, 1, true, 9), 0);
-        assert_eq!(step_unlocked_world(&worlds, 0, false, 9), 1);
-        // Everything unlocked: plain wrap-around.
-        assert_eq!(step_unlocked_world(&worlds, 2, true, 14), 0);
-        assert_eq!(step_unlocked_world(&worlds, 0, false, 14), 2);
-        assert_eq!(step_unlocked_world(&[], 0, true, 0), 0);
-    }
-
-    #[test]
-    fn level_pack_worlds_fit_the_world_select_keys() {
-        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        assert!(build_worlds(&pack.levels).len() <= WORLD_SELECT_KEYS.len());
     }
 
     #[test]
@@ -754,10 +399,11 @@ mod tests {
 
     #[test]
     fn locale_world_names_carry_no_sector_range() {
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
         for (code, catalog) in catalogs() {
             assert!(catalog.t("menu.sector_range").contains(FIRST_PLACEHOLDER));
             assert!(catalog.t("menu.sector_range").contains(LAST_PLACEHOLDER));
-            for world in 1..=WORLD_SELECT_KEYS.len() {
+            for world in 1..=build_worlds(&pack.levels).len() {
                 let key = format!("campaigns.c{world}");
                 let name = catalog.t(&key);
                 assert!(
@@ -768,36 +414,218 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sector_line_fits_at_the_minimum_font_size() {
-        let face = ttf_parser::Face::parse(RAW_FONT, 0).expect("valid font");
-        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        let worst_id = 999;
-        let synthetic = LevelDef {
-            id: worst_id,
-            world: 1,
-            name: "W".repeat(MAX_LEVEL_NAME_LEN),
-            boss: false,
-            rows: Vec::new(),
-        };
-        let longest_legacy = pack
-            .levels
-            .iter()
-            .max_by_key(|l| l.name.chars().count())
-            .expect("a level")
-            .clone();
-        // The worst case is the synthetic full-length name; it does not depend on the legacy names.
-        assert_eq!(synthetic.name.chars().count(), MAX_LEVEL_NAME_LEN);
-        for (code, catalog) in catalogs() {
-            for level in [&synthetic, &longest_legacy] {
-                let line = sector_line(catalog.t("menu.sector_select"), level);
-                let width = text_width(&face, &line, MENU_SECTOR_SIZE_MIN as f32);
-                assert!(
-                    width <= MENU_SECTOR_MAX_W,
-                    "{code}/{}: sector line is {width:.0}px, limit {MENU_SECTOR_MAX_W:.0}px",
-                    level.name
-                );
-            }
+    fn named_level(id: usize, world: usize, name: &str) -> LevelDef {
+        LevelDef {
+            name: name.to_owned(),
+            ..level(id, world)
         }
+    }
+
+    fn model_for(max_unlocked: usize, preferred: Option<usize>, library: &Library) -> MenuModel {
+        let levels = [
+            named_level(1, 1, "ALPHA"),
+            named_level(2, 1, "BETA"),
+            named_level(3, 2, "GAMMA"),
+            named_level(4, 2, "DELTA"),
+            named_level(5, 2, "OMEGA"),
+        ];
+        let worlds = build_worlds(&levels);
+        let [(_, en), _] = catalogs();
+        let names = vec!["PROTO".to_owned()];
+        build_menu_model(&MenuModelSource {
+            i18n: &en,
+            levels: &levels,
+            worlds: &worlds,
+            max_unlocked,
+            preferred_sector: preferred,
+            satisfaction_names: &names,
+            library,
+            quit_supported: true,
+            language: Language::Fr,
+            renderer_name: "R".to_owned(),
+            sfx_on: false,
+            music_on: true,
+        })
+    }
+
+    #[test]
+    fn menu_model_lists_worlds_sectors_and_progress() {
+        let model = model_for(3, None, &Library::default());
+        assert_eq!(model.worlds.len(), 2);
+        let first = &model.worlds[0];
+        assert_eq!((first.total, first.cleared), (2, 2));
+        assert!(first.unlocked);
+        assert_eq!(first.sectors[0].index, 0);
+        assert_eq!(first.sectors[0].label, "#1 - ALPHA");
+        let second = &model.worlds[1];
+        assert_eq!((second.total, second.cleared), (3, 1));
+        assert_eq!(second.sectors[0].index, 2);
+        let unlocked: Vec<bool> = second.sectors.iter().map(|s| s.unlocked).collect();
+        assert_eq!(unlocked, [true, true, false]);
+        assert_eq!(model.satisfaction_levels, ["PROTO"]);
+        assert!(model.quit_supported && !model.sfx_on && model.music_on);
+        assert_eq!(model.language, Language::Fr);
+        assert_eq!(model.renderer_name, "R");
+        assert_eq!(model.library_max, MAX_LIBRARY_LEVELS);
+    }
+
+    #[test]
+    fn a_fresh_profile_only_unlocks_the_first_sector_and_world() {
+        let model = model_for(0, None, &Library::default());
+        assert!(model.worlds[0].unlocked);
+        assert!(!model.worlds[1].unlocked);
+        assert_eq!(model.worlds[0].cleared, 0);
+        assert_eq!(model.worlds[1].cleared, 0);
+        assert_eq!(
+            model.worlds[0]
+                .sectors
+                .iter()
+                .filter(|s| s.unlocked)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn library_ids_are_widened_at_the_boundary() {
+        let mut library = Library::default();
+        let id = library.add("MINE".to_owned(), "KTX1".to_owned()).unwrap();
+        let model = model_for(0, None, &library);
+        assert_eq!(model.library.len(), 1);
+        assert_eq!(model.library[0].id, LibraryId::from(id));
+        assert_eq!(model.library[0].name, "MINE");
+    }
+
+    #[test]
+    fn focus_offset_prefers_the_last_started_sector_then_the_furthest_unlocked() {
+        // World of 5 sectors starting at level 10.
+        assert_eq!(focus_offset(10, 5, 12, None), 2);
+        assert_eq!(focus_offset(10, 5, 99, None), 4);
+        assert_eq!(focus_offset(10, 5, 5, None), 0);
+        assert_eq!(focus_offset(10, 5, 14, Some(11)), 1);
+        // A preferred sector outside the world, locked, or past the end is ignored.
+        assert_eq!(focus_offset(10, 5, 12, Some(3)), 2);
+        assert_eq!(focus_offset(10, 5, 12, Some(14)), 2);
+        assert_eq!(focus_offset(10, 5, 14, Some(15)), 4);
+        assert_eq!(focus_offset(10, 0, 14, None), 0);
+    }
+
+    #[test]
+    fn the_model_cache_rebuilds_only_when_the_key_changes() {
+        let key = |max_unlocked| MenuModelKey {
+            language: Language::En,
+            max_unlocked,
+            preferred_sector: None,
+            theme_idx: 0,
+            sfx_on: true,
+            music_on: true,
+            library_len: 0,
+            library_next_id: 1,
+        };
+        let mut cache = MenuModelCache::new();
+        assert!(cache.current().worlds.is_empty());
+        let mut builds = 0;
+        for max_unlocked in [0, 0, 1, 1, 0] {
+            cache.get(key(max_unlocked), || {
+                builds += 1;
+                let mut model = MenuModel::empty();
+                model.language = Language::Fr;
+                model
+            });
+        }
+        assert_eq!(builds, 3);
+        assert_eq!(cache.current().language, Language::Fr);
+    }
+
+    fn touch(phase: TouchPhase, x: f32, y: f32) -> Touch {
+        Touch {
+            id: 1,
+            phase,
+            position: Vec2::new(x, y),
+        }
+    }
+
+    #[test]
+    fn without_a_touch_the_mouse_is_the_pointer() {
+        let frame = pointer_frame((10.0, 20.0), true, false, &[], 2.0);
+        assert_eq!(
+            frame,
+            PointerFrame {
+                position: Some((10.0, 20.0)),
+                pressed: true,
+                released: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_touch_start_is_a_press_and_a_touch_end_a_release_at_its_position() {
+        let started = pointer_frame(
+            (0.0, 0.0),
+            false,
+            false,
+            &[touch(TouchPhase::Started, 200.0, 100.0)],
+            2.0,
+        );
+        assert_eq!(started.position, Some((100.0, 50.0)));
+        assert!(started.pressed && !started.released);
+        let ended = pointer_frame(
+            (0.0, 0.0),
+            false,
+            false,
+            &[touch(TouchPhase::Ended, 300.0, 80.0)],
+            2.0,
+        );
+        assert_eq!(ended.position, Some((150.0, 40.0)));
+        assert!(!ended.pressed && ended.released);
+        let moved = pointer_frame(
+            (0.0, 0.0),
+            false,
+            false,
+            &[touch(TouchPhase::Moved, 40.0, 40.0)],
+            1.0,
+        );
+        assert_eq!(moved.position, Some((40.0, 40.0)));
+        assert!(!moved.pressed && !moved.released);
+    }
+
+    #[test]
+    fn a_cancelled_touch_releases_without_a_position() {
+        let frame = pointer_frame(
+            (5.0, 5.0),
+            true,
+            false,
+            &[touch(TouchPhase::Cancelled, 1.0, 1.0)],
+            1.0,
+        );
+        assert_eq!(frame.position, None);
+        assert!(!frame.pressed && frame.released);
+    }
+
+    #[test]
+    fn only_the_first_touch_drives_the_pointer() {
+        let touches = [
+            touch(TouchPhase::Started, 10.0, 10.0),
+            touch(TouchPhase::Ended, 99.0, 99.0),
+        ];
+        let frame = pointer_frame((0.0, 0.0), false, false, &touches, 1.0);
+        assert_eq!(frame.position, Some((10.0, 10.0)));
+        assert!(frame.pressed && !frame.released);
+    }
+
+    #[test]
+    fn developer_entry_consumes_enter_and_escape_only() {
+        let input = MenuInput {
+            enter: true,
+            escape: true,
+            up: true,
+            ..MenuInput::default()
+        };
+        let kept = without_dev_keys(input, false, false);
+        assert!(kept.enter && kept.escape && kept.up);
+        let no_enter = without_dev_keys(input, true, false);
+        assert!(!no_enter.enter && no_enter.escape && no_enter.up);
+        let no_escape = without_dev_keys(input, false, true);
+        assert!(no_escape.enter && !no_escape.escape && no_escape.up);
     }
 }

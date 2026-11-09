@@ -26,7 +26,10 @@ use audio::{
     set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
+use kinetix_app::library::load_library;
+use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES};
 use kinetix_app::persistence::{load_progress, load_settings, save_settings, Settings};
+use kinetix_app::satisfaction::{level_names, satisfaction_pack};
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
@@ -41,8 +44,8 @@ use session::{
 };
 use std::collections::BTreeSet;
 use title::{
-    build_worlds, draw_title_menu, title_start_requested, update_title_selection, MenuSelection,
-    TitleSelection,
+    build_menu_model, build_worlds, is_sector_unlocked, pointer_frame, read_menu_input,
+    MenuModelCache, MenuModelKey, MenuModelSource,
 };
 use tuning::*;
 use vfx::{
@@ -236,12 +239,42 @@ fn set_native_cursor_grab(grab: bool) {
     let _ = grab;
 }
 
+/// Persists the sound and music switches (single path for the hotkeys and the menu).
+fn persist_audio_settings(sfx: &SoundBank) {
+    save_settings(Settings {
+        sfx_on: !sfx.muted,
+        music_on: sfx.music_enabled,
+    });
+}
+
+/// Opens the level editor on a fresh paddle and ball (the F4 entry).
+fn enter_editor(screen: &mut AppScreen, world: &mut GameWorld) {
+    *screen = AppScreen::Editor;
+    world.reset_paddle_and_ball();
+    world.status = SessionStatus::Playing;
+}
+
+/// Which menu gestures start play from the title: a click on the widget under the pointer, and
+/// Enter / Space on the focused widget.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct TitlePlay {
+    click: bool,
+    key: bool,
+}
+
 /// Input gestures that will make the pointer lock wanted from the given state (see
 /// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
-fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
+fn resume_mask_for(screen: AppScreen, status: SessionStatus, title_play: TitlePlay) -> u32 {
     match screen {
         AppScreen::TitleMenu => {
-            let base = RESUME_CLICK | RESUME_SPACE | RESUME_ENTER | RESUME_CHEAT_MASK;
+            let mut base = RESUME_CHEAT_MASK;
+            // A click or a key only counts when it would start play from the menu.
+            if title_play.click {
+                base |= RESUME_CLICK;
+            }
+            if title_play.key {
+                base |= RESUME_SPACE | RESUME_ENTER;
+            }
             // Tab from the title enters the game and wants the lock when the world is playing.
             if status == SessionStatus::Playing {
                 base | RESUME_TAB
@@ -262,7 +295,13 @@ fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
 
 /// Fills the glyph atlas with every glyph and size the UI uses, before the first frame, so the
 /// atlas is never grown (and its texture recreated) in the middle of a frame.
-fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: &[&str]) {
+fn prewarm_font(
+    font: &Font,
+    raw_locales: &[&str],
+    levels: &[LevelDef],
+    titles: &[&str],
+    extra_names: &[&str],
+) {
     let mut chars: BTreeSet<char> = Font::ascii_character_list()
         .into_iter()
         .filter(|c| !c.is_control())
@@ -274,6 +313,9 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
     for level in levels {
         chars.extend(level.name.chars().filter(printable));
     }
+    for name in extra_names {
+        chars.extend(name.chars().filter(printable));
+    }
     let chars: Vec<char> = chars.into_iter().collect();
 
     // Glyphs are cached per physical pixel size (font size times the DPI scale, rounded up).
@@ -283,8 +325,7 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
         .iter()
         .copied()
         .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
-        .chain(MENU_WORLD_TEXT_SIZE_FLOOR..=MENU_WORLD_TEXT_SIZE)
-        .chain(MENU_SECTOR_SIZE_MIN..=MENU_SECTOR_SIZE)
+        .chain(MENU_FONT_SIZES.iter().copied())
         .map(physical)
         .collect();
     for size in sizes {
@@ -359,11 +400,23 @@ async fn main() {
     let catalog_en = I18nCatalog::from_json_str(RAW_EN).expect("Invalid en.json");
     let catalog_fr = I18nCatalog::from_json_str(RAW_FR).expect("Invalid fr.json");
     let ui_font = load_ttf_font_from_bytes(RAW_FONT).expect("Failed to load embedded UI font");
+    let satisfaction_levels = satisfaction_pack();
+    let satisfaction_names: Vec<String> = level_names(&satisfaction_levels)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let library = load_library();
+    let extra_names: Vec<&str> = satisfaction_names
+        .iter()
+        .map(String::as_str)
+        .chain(library.entries.iter().map(|entry| entry.name.as_str()))
+        .collect();
     prewarm_font(
         &ui_font,
         &[RAW_EN, RAW_FR],
         &level_pack.levels,
         &[catalog_en.t("app.title"), catalog_fr.t("app.title")],
+        &extra_names,
     );
 
     let add_mat = additive_material();
@@ -419,8 +472,12 @@ async fn main() {
 
     let mut screen = AppScreen::TitleMenu;
     let worlds = build_worlds(&level_pack.levels);
-    let mut selected_world_pos: usize = 0;
-    let mut selected_sector_idx: usize = 0;
+    let mut menu = Menu::new();
+    let mut menu_model = MenuModelCache::new();
+    // Sector started last from the menu, focused first when its world is opened again.
+    let mut last_started_sector: Option<usize> = None;
+    // Arena position of the pointer on the title, for the resume mask.
+    let mut title_pointer: Option<(f32, f32)> = None;
 
     let mut events: Vec<GameEvent> = Vec::with_capacity(MAX_EVENTS);
     let mut particles: Vec<Particle> = Vec::with_capacity(MAX_PARTICLES);
@@ -497,6 +554,9 @@ async fn main() {
             world.status = SessionStatus::Playing;
         }
         if is_key_pressed(KeyCode::Tab) {
+            if screen == AppScreen::TitleMenu && menu.renderer_dirty() {
+                save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+            }
             screen = match screen {
                 AppScreen::TitleMenu => AppScreen::InGame,
                 _ => AppScreen::TitleMenu,
@@ -504,17 +564,11 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::M) {
             sfx.muted = !sfx.muted;
-            save_settings(Settings {
-                sfx_on: !sfx.muted,
-                music_on: sfx.music_enabled,
-            });
+            persist_audio_settings(&sfx);
         }
         if is_key_pressed(KeyCode::B) {
             sfx.music_enabled = !sfx.music_enabled;
-            save_settings(Settings {
-                sfx_on: !sfx.muted,
-                music_on: sfx.music_enabled,
-            });
+            persist_audio_settings(&sfx);
         }
 
         // Hidden developer mode (Ctrl+Shift+D): never persisted, never advertised.
@@ -694,28 +748,99 @@ async fn main() {
 
         match screen {
             AppScreen::TitleMenu => {
-                let max_unlocked = world.max_unlocked_level;
-                let selection = update_title_selection(
-                    &worlds,
-                    &level_pack.levels,
-                    max_unlocked,
-                    TitleSelection {
-                        world_pos: selected_world_pos,
-                        sector_idx: selected_sector_idx,
-                    },
+                let key = MenuModelKey {
+                    language: lang,
+                    max_unlocked: world.max_unlocked_level,
+                    preferred_sector: last_started_sector,
+                    theme_idx,
+                    sfx_on: !sfx.muted,
+                    music_on: sfx.music_enabled,
+                    library_len: library.entries.len(),
+                    library_next_id: library.next_id,
+                };
+                let model = menu_model.get(key, || {
+                    build_menu_model(&MenuModelSource {
+                        i18n,
+                        levels: &level_pack.levels,
+                        worlds: &worlds,
+                        max_unlocked: world.max_unlocked_level,
+                        preferred_sector: last_started_sector,
+                        satisfaction_names: &satisfaction_names,
+                        library: &library,
+                        quit_supported: cfg!(not(target_arch = "wasm32")),
+                        language: lang,
+                        renderer_name: i18n.t(&theme.name_key).to_owned(),
+                        sfx_on: !sfx.muted,
+                        music_on: sfx.music_enabled,
+                    })
+                });
+                let pointer = pointer_frame(
+                    (mx, my),
+                    is_mouse_button_pressed(MouseButton::Left),
+                    is_mouse_button_released(MouseButton::Left),
+                    &touches(),
+                    miniquad::window::dpi_scale(),
                 );
-                selected_world_pos = selection.world_pos;
-                selected_sector_idx = selection.sector_idx;
-
-                if title_start_requested(selected_sector_idx, max_unlocked, dev_enter_consumed) {
-                    start_run_from_title(
-                        &mut world,
-                        &mut dev_state,
-                        &level_pack.levels,
-                        selected_sector_idx,
-                        session.source,
-                    );
-                    screen = AppScreen::InGame;
+                let input = read_menu_input(
+                    pointer,
+                    |x, y| screen_to_arena(x, y, view_scale, view_ox, view_oy),
+                    dev_enter_consumed,
+                    dev_esc_consumed,
+                );
+                title_pointer = input.pointer;
+                match menu.update(&input, model) {
+                    MenuAction::StartSector(idx)
+                        if is_sector_unlocked(idx, world.max_unlocked_level)
+                            && idx < level_pack.levels.len() =>
+                    {
+                        if menu.renderer_dirty() {
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                        }
+                        start_run_from_title(
+                            &mut world,
+                            &mut dev_state,
+                            &level_pack.levels,
+                            idx,
+                            session.source,
+                        );
+                        last_started_sector = Some(idx);
+                        menu.open_home();
+                        screen = AppScreen::InGame;
+                    }
+                    MenuAction::OpenEditor => {
+                        if menu.renderer_dirty() {
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                        }
+                        menu.open_home();
+                        enter_editor(&mut screen, &mut world);
+                    }
+                    MenuAction::SetLanguage(language) => {
+                        lang = language;
+                        set_document_lang(lang == Language::Fr);
+                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                    }
+                    MenuAction::CycleRenderer => {
+                        theme_idx = (theme_idx + 1) % theme_reg.themes.len();
+                    }
+                    MenuAction::PersistRenderer => {
+                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                    }
+                    MenuAction::ToggleSfx => {
+                        sfx.muted = !sfx.muted;
+                        persist_audio_settings(&sfx);
+                    }
+                    MenuAction::ToggleMusic => {
+                        sfx.music_enabled = !sfx.music_enabled;
+                        persist_audio_settings(&sfx);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    MenuAction::QuitApp => {
+                        set_native_cursor_grab(false);
+                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                        break;
+                    }
+                    // Satisfaction, library and pause actions are wired in later lots.
+                    _ => {}
                 }
             }
             AppScreen::Editor => {
@@ -923,7 +1048,16 @@ async fn main() {
 
         // Tell the page which gestures will make the lock wanted next, so it can request the
         // lock synchronously inside the input handler (required by Firefox).
-        let resume_mask = resume_mask_for(screen, world.status);
+        let title_play = if screen == AppScreen::TitleMenu {
+            let model = menu_model.current();
+            TitlePlay {
+                click: title_pointer.is_some_and(|p| menu.starts_play_at(model, p)),
+                key: menu.focused_starts_play(model),
+            }
+        } else {
+            TitlePlay::default()
+        };
+        let resume_mask = resume_mask_for(screen, world.status, title_play);
         if last_resume_mask != Some(resume_mask) {
             set_resume_mask(resume_mask);
             last_resume_mask = Some(resume_mask);
@@ -1280,17 +1414,14 @@ async fn main() {
         });
 
         if screen == AppScreen::TitleMenu {
-            draw_title_menu(
-                &world,
-                &level_pack,
+            draw_menu(
+                &menu,
+                menu_model.current(),
                 theme,
                 i18n,
                 &ui_font,
-                &MenuSelection {
-                    worlds: &worlds,
-                    world_pos: selected_world_pos,
-                    sector_idx: selected_sector_idx,
-                },
+                arena_w,
+                arena_h,
             );
         }
 
@@ -2356,33 +2487,94 @@ mod tests {
     }
 
     #[test]
+    fn title_resume_mask_follows_the_widget_that_would_start_play() {
+        let mask = |click, key| {
+            resume_mask_for(
+                AppScreen::TitleMenu,
+                SessionStatus::Paused,
+                TitlePlay { click, key },
+            )
+        };
+        let none = mask(false, false);
+        assert_eq!(none, RESUME_CHEAT_MASK);
+        let click = mask(true, false);
+        assert_ne!(click & RESUME_CLICK, 0);
+        assert_eq!(click & (RESUME_SPACE | RESUME_ENTER), 0);
+        let key = mask(false, true);
+        assert_eq!(key & RESUME_CLICK, 0);
+        assert_eq!(
+            key & (RESUME_SPACE | RESUME_ENTER),
+            RESUME_SPACE | RESUME_ENTER
+        );
+        assert_eq!(mask(true, true), click | key);
+        // Tab from the title only counts while the world is playing, whatever the widget.
+        assert_ne!(
+            resume_mask_for(
+                AppScreen::TitleMenu,
+                SessionStatus::Playing,
+                TitlePlay::default()
+            ) & RESUME_TAB,
+            0
+        );
+    }
+
+    #[test]
     fn resume_mask_matches_the_inputs_that_start_play() {
         assert_eq!(
-            resume_mask_for(AppScreen::InGame, SessionStatus::Playing),
+            resume_mask_for(
+                AppScreen::InGame,
+                SessionStatus::Playing,
+                TitlePlay::default()
+            ),
             0
         );
-        let paused = resume_mask_for(AppScreen::InGame, SessionStatus::Paused);
+        let paused = resume_mask_for(
+            AppScreen::InGame,
+            SessionStatus::Paused,
+            TitlePlay::default(),
+        );
         assert_eq!(paused, RESUME_P | RESUME_R | RESUME_CHEAT_MASK);
-        let over = resume_mask_for(AppScreen::InGame, SessionStatus::GameOver);
+        let over = resume_mask_for(
+            AppScreen::InGame,
+            SessionStatus::GameOver,
+            TitlePlay::default(),
+        );
         assert_eq!(
             over,
-            resume_mask_for(AppScreen::InGame, SessionStatus::Victory)
+            resume_mask_for(
+                AppScreen::InGame,
+                SessionStatus::Victory,
+                TitlePlay::default()
+            )
         );
         assert_eq!(over & RESUME_P, 0);
+        let click_play = TitlePlay {
+            click: true,
+            key: false,
+        };
+        let key_play = TitlePlay {
+            click: false,
+            key: true,
+        };
         assert_ne!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing) & RESUME_CLICK,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing, click_play)
+                & RESUME_CLICK,
             0
         );
         assert_ne!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing) & RESUME_TAB,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing, key_play) & RESUME_TAB,
             0
         );
         assert_eq!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused) & RESUME_TAB,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused, key_play) & RESUME_TAB,
             0
         );
         assert_eq!(
-            resume_mask_for(AppScreen::Editor, SessionStatus::Playing),
+            resume_mask_for(
+                AppScreen::Editor,
+                SessionStatus::Playing,
+                TitlePlay::default()
+            ),
             RESUME_F4 | RESUME_CHEAT_MASK
         );
     }
