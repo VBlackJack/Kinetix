@@ -32,9 +32,10 @@ use crate::bosses::boss_arena;
 use crate::motifs::{MotifFamily, MotifTemplate, MOTIFS};
 use crate::simulate::SECTORS_PER_BLOCK;
 use crate::validate::{
-    colour_regions_per_cell, dust_and_components, is_destructible_cell, mirror_mismatch_cells,
-    BOSS_STEM_MAX_LEN, BOSS_SUFFIX, DENSITY_MAX, DENSITY_MIN, FINAL_BOSS_SUFFIX,
-    MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8, MAX_DUST, MAX_LEVEL_NAME_LEN, MECHANIC_DEBUTS,
+    colour_regions_per_cell, dust_and_components, inner_gap_cols, inner_gap_rows,
+    is_destructible_cell, mirror_mismatch_cells, BOSS_STEM_MAX_LEN, BOSS_SUFFIX, DENSITY_MAX,
+    DENSITY_MIN, FINAL_BOSS_SUFFIX, MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8, MAX_DUST,
+    MAX_INNER_GAP_COLS, MAX_INNER_GAP_ROWS, MAX_LEVEL_NAME_LEN, MECHANIC_DEBUTS,
     MIN_ASYMMETRIC_CELLS,
 };
 use kinetix_core::config::LevelDef;
@@ -157,10 +158,6 @@ const MAX_TRIM_COLS: usize = 2;
 /// An asymmetric motif may lose at most this percent of its cells to the column trim, so the
 /// shape stays recognisable.
 const TRIM_MAX_CELL_PERCENT: usize = 15;
-/// Widest run of fully empty columns allowed between two parts of an asymmetric level (the
-/// widest gap of a hand-authored motif is 3): a wider one reads as two unrelated pieces.
-const MAX_INNER_GAP_COLS: usize = 3;
-
 /// Seed mixing constant for per-level RNG initialization.
 const LEVEL_SEED_SALT: u64 = 0x517C_C1B7_2722_0A95;
 /// SplitMix64 golden ratio increment.
@@ -1039,33 +1036,6 @@ fn orient_asymmetric(grid: &mut Grid, rng: &mut Rng) {
     shift_clamped(grid, dx);
 }
 
-/// Longest run of fully empty columns between the first and the last shape column (portals are
-/// not shape cells).
-fn inner_gap_cols(rows: &[String]) -> usize {
-    let occupied: Vec<bool> = (0..COLS)
-        .map(|c| {
-            rows.iter().any(|row| {
-                row.chars()
-                    .nth(c)
-                    .is_some_and(|ch| !matches!(ch, '0' | CELL_PORTAL))
-            })
-        })
-        .collect();
-    let (Some(first), Some(last)) = (
-        occupied.iter().position(|&o| o),
-        occupied.iter().rposition(|&o| o),
-    ) else {
-        return 0;
-    };
-    let mut best = 0usize;
-    let mut run = 0usize;
-    for &o in &occupied[first..=last] {
-        run = if o { 0 } else { run + 1 };
-        best = best.max(run);
-    }
-    best
-}
-
 /// Sets a cell, and its mirror counterpart on symmetric sectors.
 fn put(grid: &mut Grid, r: usize, c: usize, ch: char, symmetric: bool) {
     grid[r][c] = ch;
@@ -1635,7 +1605,9 @@ fn layout_issue(rows: &[String], plan: &SectorPlan, window: (usize, usize)) -> O
             ));
         }
     }
-    if !plan.symmetric && inner_gap_cols(rows) > MAX_INNER_GAP_COLS {
+    if !plan.symmetric
+        && (inner_gap_cols(rows) > MAX_INNER_GAP_COLS || inner_gap_rows(rows) > MAX_INNER_GAP_ROWS)
+    {
         return Some("asymmetric level reads as two separate pieces".to_string());
     }
     let (dust, components) = dust_and_components(rows);
@@ -1852,13 +1824,10 @@ mod tests {
                     "world {world} sector {sector}: not asymmetric"
                 );
                 assert!(
-                    inner_gap_cols(&level.rows) <= MAX_INNER_GAP_COLS,
-                    "world {world} sector {sector} is a collage:
-{}",
-                    level.rows.join(
-                        "
-"
-                    )
+                    inner_gap_cols(&level.rows) <= MAX_INNER_GAP_COLS
+                        && inner_gap_rows(&level.rows) <= MAX_INNER_GAP_ROWS,
+                    "world {world} sector {sector} is a collage:\n{}",
+                    level.rows.join("\n")
                 );
                 let (dust, _) = dust_and_components(&level.rows);
                 assert_eq!(dust, 0, "world {world} sector {sector} has loose bricks");
