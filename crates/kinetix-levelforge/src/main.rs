@@ -23,16 +23,14 @@ pub mod validate;
 use generate::generate_sector;
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack};
 use simulate::{
-    casual_loss_gate, compute_world_stats, fairness_issues, simulate_levels, LevelSimSummary,
-    DEFAULT_SEEDS, PRESETS,
+    block_stats, casual_loss_gate, compute_world_stats, fairness_issues, simulate_levels,
+    LevelSimSummary, DEFAULT_SEEDS, PRESETS,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use validate::{
-    check_reachability, validate_pack, LEGACY_LEVEL_COUNT, MAX_WORLDS, SECTORS_PER_WORLD,
-};
+use validate::{validate_candidate, validate_pack, LEGACY_LEVEL_COUNT, SECTORS_PER_WORLD};
 
 const DEFAULT_LEVELS_PATH: &str = "assets/config/levels.json";
 const DEFAULT_CONFIG_PATH: &str = "assets/config/game_config.json";
@@ -40,13 +38,14 @@ const DEFAULT_OUT_DIR: &str = "target/levelforge";
 const DEFAULT_CSV_FILE: &str = "target/levelforge/simulation.csv";
 const DEFAULT_CANDIDATE_FILE: &str = "target/levelforge/candidate-levels.json";
 const DEFAULT_SEED: u64 = 0x2026_1108_CAFE_BABE;
-const DEFAULT_WORLDS: usize = 8;
 /// Candidates tried per sector before `generate` gives up (no forced acceptance).
 const GENERATE_ATTEMPT_BUDGET: u64 = 25;
 /// Seed stride between two attempts of the same sector.
 const GENERATE_ATTEMPT_SEED_STRIDE: u64 = 7919;
 /// The per-level table is printed only for runs up to this many levels.
 const MAX_LEVELS_IN_DETAIL_TABLE: usize = 60;
+/// Worlds `generate` can build (the generator has eight world identities).
+const MAX_GENERATED_WORLDS: usize = 8;
 const MS_PER_SEC: f64 = 1000.0;
 
 fn load_levels(path: &str) -> Result<(LevelPack, Duration), String> {
@@ -145,6 +144,21 @@ fn print_level_table(summaries: &[LevelSimSummary]) {
     }
 }
 
+fn print_block_table(summaries: &[LevelSimSummary]) {
+    println!("| Block | Levels | Good clear (mean) | Good median (s) | Casual clear (mean) |");
+    println!("|:------|-------:|------------------:|----------------:|--------------------:|");
+    for b in block_stats(summaries) {
+        println!(
+            "| {} | {:>6} | {:>16.1}% | {:>15} | {:>18.1}% |",
+            b.label,
+            b.levels,
+            b.good_clear_rate * 100.0,
+            fmt_time(b.good_median_clear_time),
+            b.casual_clear_rate * 100.0
+        );
+    }
+}
+
 fn cmd_simulate(levels_path: &str, world_filter: Option<usize>) -> ExitCode {
     let pack = match load_levels(levels_path) {
         Ok((p, _)) => p,
@@ -180,6 +194,9 @@ fn cmd_simulate(levels_path: &str, world_filter: Option<usize>) -> ExitCode {
         println!();
     }
     print_world_stats_table(&levels_to_run, Some(&summaries));
+    println!();
+    print_block_table(&summaries);
+    println!();
 
     let mut problems = fairness_issues(&summaries);
     if let Err(e) = casual_loss_gate(&summaries) {
@@ -264,18 +281,27 @@ fn print_world_stats_table(levels: &[LevelDef], sims: Option<&[LevelSimSummary]>
     }
 }
 
-/// Why a generated candidate is not acceptable (empty means accepted).
-fn candidate_issues(config: &GameConfig, candidate: &LevelDef) -> Vec<String> {
-    if let Err(e) = check_reachability(&candidate.rows) {
-        return vec![e];
+/// Why a generated candidate is not acceptable (empty means accepted): the per-level rules of
+/// the pack validation (reachability, portals, density, name, similarity, asymmetry share
+/// feasibility) applied to `prefix` plus the candidate, then the bot fairness bands.
+fn candidate_issues(
+    config: &GameConfig,
+    prefix: &[LevelDef],
+    candidate: &LevelDef,
+    is_last: bool,
+    planned_total: usize,
+) -> Vec<String> {
+    let rule_errors = validate_candidate(prefix, candidate, is_last, planned_total);
+    if !rule_errors.is_empty() {
+        return rule_errors.iter().map(ToString::to_string).collect();
     }
     let sims = simulate_levels(config, std::slice::from_ref(candidate), &DEFAULT_SEEDS);
     fairness_issues(&sims)
 }
 
 fn cmd_generate(levels_path: &str, max_world: usize, seed: u64, out_path: &str) -> ExitCode {
-    if max_world == 0 || max_world > MAX_WORLDS {
-        eprintln!("error: --worlds must be in 1..={MAX_WORLDS}");
+    if max_world == 0 || max_world > MAX_GENERATED_WORLDS {
+        eprintln!("error: --worlds must be in 1..={MAX_GENERATED_WORLDS}");
         return ExitCode::FAILURE;
     }
     let (mut pack, _) = match load_levels(levels_path) {
@@ -296,6 +322,10 @@ fn cmd_generate(levels_path: &str, max_world: usize, seed: u64, out_path: &str) 
     // Generation always restarts from the legacy reference levels (indices 0..LEGACY_LEVEL_COUNT).
     let target_total = max_world * SECTORS_PER_WORLD;
     pack.levels.truncate(LEGACY_LEVEL_COUNT.min(target_total));
+    // In a pack with generated levels the legacy reference levels all belong to world 1.
+    for level in &mut pack.levels {
+        level.world = 1;
+    }
 
     let mut used_names: BTreeSet<String> = pack.levels.iter().map(|l| l.name.clone()).collect();
 
@@ -309,15 +339,22 @@ fn cmd_generate(levels_path: &str, max_world: usize, seed: u64, out_path: &str) 
         let mut accepted = None;
         for attempt in 0..GENERATE_ATTEMPT_BUDGET {
             let mut candidate_names = used_names.clone();
-            let candidate = generate_sector(
+            let candidate = match generate_sector(
                 id,
                 world,
                 sector_in_world,
                 is_last,
                 seed.wrapping_add(attempt * GENERATE_ATTEMPT_SEED_STRIDE),
                 &mut candidate_names,
-            );
-            let issues = candidate_issues(&config, &candidate);
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Names do not depend on the seed, so retrying cannot help.
+                    eprintln!("FAIL: level {id}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let issues = candidate_issues(&config, &pack.levels, &candidate, is_last, target_total);
             if issues.is_empty() {
                 used_names = candidate_names;
                 accepted = Some(candidate);
@@ -400,61 +437,195 @@ fn cmd_write(candidate_path: &str, levels_path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Value following `flag` in `args`, if present.
-fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
+/// Usage text printed on any command line error.
+const USAGE: &str = "usage:
+  kinetix-levelforge validate [--levels <path>]
+  kinetix-levelforge simulate [--levels <path>] [--world <n>]
+  kinetix-levelforge stats [--levels <path>] [--sim]
+  kinetix-levelforge generate --worlds <1..=8> [--seed <u64>] [--levels <path>] [--out <path>]
+  kinetix-levelforge write [--candidate <path>] [--levels <path>]
+defaults: --levels assets/config/levels.json, --out and --candidate target/levelforge/candidate-levels.json,
+          --seed is a decimal u64 (built-in default when omitted)";
+
+/// Strictly parsed flags of one command.
+#[derive(Debug, Default)]
+struct Flags {
+    values: BTreeMap<String, String>,
+    switches: BTreeSet<String>,
+}
+
+impl Flags {
+    fn value(&self, flag: &str) -> Option<&str> {
+        self.values.get(flag).map(String::as_str)
+    }
+
+    fn has(&self, flag: &str) -> bool {
+        self.switches.contains(flag)
+    }
+
+    /// Value of `flag` parsed as `T`; `Ok(None)` when absent, `Err` when unparsable.
+    fn parsed<T: std::str::FromStr>(&self, flag: &str) -> Result<Option<T>, String> {
+        match self.value(flag) {
+            None => Ok(None),
+            Some(raw) => raw
+                .parse::<T>()
+                .map(Some)
+                .map_err(|_| format!("invalid value {raw:?} for {flag}")),
+        }
+    }
+}
+
+/// Parses `args` against the flags that take a value and the boolean switches of a command.
+/// Unknown flags, positional arguments, repeated flags and a missing value are errors.
+fn parse_flags(args: &[String], valued: &[&str], switches: &[&str]) -> Result<Flags, String> {
+    let mut flags = Flags::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if switches.contains(&arg.as_str()) {
+            if !flags.switches.insert(arg.clone()) {
+                return Err(format!("repeated flag {arg}"));
+            }
+        } else if valued.contains(&arg.as_str()) {
+            let value = iter
+                .next()
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| format!("missing value for {arg}"))?;
+            if flags.values.insert(arg.clone(), value.clone()).is_some() {
+                return Err(format!("repeated flag {arg}"));
+            }
+        } else {
+            return Err(format!("unknown argument {arg:?}"));
+        }
+    }
+    Ok(flags)
+}
+
+fn usage_error(message: &str) -> ExitCode {
+    eprintln!("error: {message}\n{USAGE}");
+    ExitCode::FAILURE
+}
+
+/// Absolute, lexically normalized form of a path; canonical when the file exists.
+fn normalized_path(path: &str) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let raw = std::path::Path::new(path);
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(raw))
+            .unwrap_or_else(|_| raw.to_path_buf())
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when both arguments name the same file (existing or not yet created).
+fn same_path(a: &str, b: &str) -> bool {
+    normalized_path(a) == normalized_path(b)
+}
+
+fn run(cmd: &str, rest: &[String]) -> Result<ExitCode, String> {
+    match cmd {
+        "validate" => {
+            let flags = parse_flags(rest, &["--levels"], &[])?;
+            Ok(cmd_validate(
+                flags.value("--levels").unwrap_or(DEFAULT_LEVELS_PATH),
+            ))
+        }
+        "simulate" => {
+            let flags = parse_flags(rest, &["--levels", "--world"], &[])?;
+            let world_filter = flags.parsed::<usize>("--world")?;
+            Ok(cmd_simulate(
+                flags.value("--levels").unwrap_or(DEFAULT_LEVELS_PATH),
+                world_filter,
+            ))
+        }
+        "stats" => {
+            let flags = parse_flags(rest, &["--levels"], &["--sim"])?;
+            Ok(cmd_stats(
+                flags.value("--levels").unwrap_or(DEFAULT_LEVELS_PATH),
+                flags.has("--sim"),
+            ))
+        }
+        "generate" => {
+            let flags = parse_flags(rest, &["--worlds", "--seed", "--levels", "--out"], &[])?;
+            let max_world = flags.parsed::<usize>("--worlds")?.ok_or_else(|| {
+                format!("generate requires --worlds <1..={MAX_GENERATED_WORLDS}>")
+            })?;
+            let seed = flags.parsed::<u64>("--seed")?.unwrap_or(DEFAULT_SEED);
+            let levels_path = flags.value("--levels").unwrap_or(DEFAULT_LEVELS_PATH);
+            let out_path = flags.value("--out").unwrap_or(DEFAULT_CANDIDATE_FILE);
+            if same_path(levels_path, out_path) {
+                return Err(format!(
+                    "--out {out_path:?} is the levels file itself; the candidate must be a separate file (use `write` to publish it)"
+                ));
+            }
+            Ok(cmd_generate(levels_path, max_world, seed, out_path))
+        }
+        "write" => {
+            let flags = parse_flags(rest, &["--candidate", "--levels"], &[])?;
+            Ok(cmd_write(
+                flags.value("--candidate").unwrap_or(DEFAULT_CANDIDATE_FILE),
+                flags.value("--levels").unwrap_or(DEFAULT_LEVELS_PATH),
+            ))
+        }
+        other => Err(format!(
+            "unknown subcommand {other:?}; expected validate | simulate | stats | generate | write"
+        )),
+    }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("validate");
-
-    match cmd {
-        "validate" => {
-            let path = args
-                .get(1)
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_LEVELS_PATH);
-            cmd_validate(path)
-        }
-        "simulate" => {
-            let world_filter = flag_value(&args, "--world").and_then(|v| v.parse::<usize>().ok());
-            cmd_simulate(DEFAULT_LEVELS_PATH, world_filter)
-        }
-        "stats" => {
-            let with_sim = args.iter().any(|a| a == "--sim");
-            cmd_stats(DEFAULT_LEVELS_PATH, with_sim)
-        }
-        "generate" => {
-            let max_world = flag_value(&args, "--worlds")
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DEFAULT_WORLDS);
-            let seed = flag_value(&args, "--seed")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_SEED);
-            let out = flag_value(&args, "--out").unwrap_or(DEFAULT_CANDIDATE_FILE);
-            cmd_generate(DEFAULT_LEVELS_PATH, max_world, seed, out)
-        }
-        "write" => {
-            let candidate = flag_value(&args, "--candidate").unwrap_or(DEFAULT_CANDIDATE_FILE);
-            let levels = flag_value(&args, "--levels").unwrap_or(DEFAULT_LEVELS_PATH);
-            cmd_write(candidate, levels)
-        }
-        other => {
-            eprintln!(
-                "Unknown subcommand: {other}. Expected: validate | simulate | stats | generate | write"
-            );
-            ExitCode::FAILURE
-        }
+    let (cmd, rest) = match args.split_first() {
+        Some((cmd, rest)) => (cmd.as_str(), rest),
+        None => ("validate", &[][..]),
+    };
+    match run(cmd, rest) {
+        Ok(code) => code,
+        Err(message) => usage_error(&message),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_path_detects_equivalent_spellings() {
+        assert!(same_path("a/b.json", "a/./b.json"));
+        assert!(same_path("a/x/../b.json", "a/b.json"));
+        assert!(!same_path("a/b.json", "a/c.json"));
+    }
+
+    #[test]
+    fn generate_refuses_out_equal_to_levels() {
+        let args: Vec<String> = [
+            "--worlds",
+            "1",
+            "--levels",
+            "x/l.json",
+            "--out",
+            "x/./l.json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(run("generate", &args).is_err());
+    }
 
     const RAW_LEVELS: &str = include_str!("../../../assets/config/levels.json");
 
@@ -468,13 +639,43 @@ mod tests {
         );
     }
 
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn flag_value_reads_the_following_argument() {
-        let args: Vec<String> = ["generate", "--worlds", "3"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(flag_value(&args, "--worlds"), Some("3"));
-        assert_eq!(flag_value(&args, "--seed"), None);
+    fn parse_flags_reads_values_and_switches() {
+        let flags = parse_flags(
+            &args(&["--worlds", "3", "--sim"]),
+            &["--worlds", "--seed"],
+            &["--sim"],
+        )
+        .expect("valid flags");
+        assert_eq!(flags.value("--worlds"), Some("3"));
+        assert_eq!(flags.value("--seed"), None);
+        assert!(flags.has("--sim"));
+        assert_eq!(flags.parsed::<usize>("--worlds"), Ok(Some(3)));
+    }
+
+    #[test]
+    fn parse_flags_rejects_unknown_missing_repeated_and_unparsable() {
+        let valued = ["--worlds", "--seed"];
+        assert!(parse_flags(&args(&["--bogus"]), &valued, &[]).is_err());
+        assert!(parse_flags(&args(&["positional"]), &valued, &[]).is_err());
+        assert!(parse_flags(&args(&["--worlds"]), &valued, &[]).is_err());
+        assert!(parse_flags(&args(&["--worlds", "--seed", "1"]), &valued, &[]).is_err());
+        assert!(parse_flags(&args(&["--worlds", "1", "--worlds", "2"]), &valued, &[]).is_err());
+        let flags = parse_flags(&args(&["--seed", "abc"]), &valued, &[]).expect("shape ok");
+        assert!(flags.parsed::<u64>("--seed").is_err());
+    }
+
+    #[test]
+    fn commands_reject_bad_command_lines() {
+        assert!(run("generate", &[]).is_err());
+        assert!(run("generate", &args(&["--worlds", "x"])).is_err());
+        assert!(run("generate", &args(&["--worlds", "1", "--seed", "x"])).is_err());
+        assert!(run("simulate", &args(&["--world", "x"])).is_err());
+        assert!(run("validate", &args(&["--levels"])).is_err());
+        assert!(run("nope", &[]).is_err());
     }
 }

@@ -2940,15 +2940,16 @@ mod tests {
             boss: false,
             rows: Vec::new(),
         };
-        let legacy_boss = pack
+        let longest_legacy = pack
             .levels
             .iter()
             .max_by_key(|l| l.name.chars().count())
             .expect("a level")
             .clone();
-        assert!(legacy_boss.name.chars().count() >= MAX_LEVEL_NAME_LEN);
+        // The worst case is the synthetic full-length name; it does not depend on the legacy names.
+        assert_eq!(synthetic.name.chars().count(), MAX_LEVEL_NAME_LEN);
         for (code, catalog) in catalogs() {
-            for level in [&synthetic, &legacy_boss] {
+            for level in [&synthetic, &longest_legacy] {
                 let line = sector_line(catalog.t("menu.sector_select"), level);
                 let width = text_width(&face, &line, MENU_SECTOR_SIZE_MIN as f32);
                 assert!(

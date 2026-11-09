@@ -42,12 +42,19 @@ pub const BOSS_DENSITY_MAX: usize = 40;
 /// A generated level is rejected when more than this fraction of the union of non-empty
 /// cells is identical to an earlier level of the same class (boss or regular).
 pub const SIMILARITY_MAX: f32 = 0.85;
+/// A generated level counts as asymmetric only when at least this many cells differ from their
+/// left-right mirror counterpart (a mismatching pair counts as two cells), so a single stray
+/// cell does not make a mirrored level pass as asymmetric.
+pub const MIN_ASYMMETRIC_CELLS: usize = 6;
 /// Minimum percentage of asymmetric (not left-right mirrored) generated levels per world.
 pub const MIN_ASYMMETRIC_PERCENT: usize = 30;
 /// Name suffix of a boss level.
 pub const BOSS_SUFFIX: &str = " [BOSS]";
 /// Name suffix of the last level of a pack that contains generated levels.
 pub const FINAL_BOSS_SUFFIX: &str = " [FINAL BOSS]";
+/// Longest boss stem (the name without its suffix): the room left by the longest suffix, so
+/// switching between `BOSS_SUFFIX` and `FINAL_BOSS_SUFFIX` never changes the stem.
+pub const BOSS_STEM_MAX_LEN: usize = MAX_LEVEL_NAME_LEN - FINAL_BOSS_SUFFIX.len();
 const GRID_CELLS: usize = EDITOR_ROWS * EDITOR_COLS;
 const PERCENT: usize = 100;
 
@@ -84,9 +91,9 @@ pub fn is_valid_name_char(ch: char) -> bool {
 /// and columns `0` and `EDITOR_COLS + 1` are the left and right side corridors between
 /// `wall_side` and `BRICK_GRID_SIDE_MARGIN`.
 ///
-/// - Empty cells (`0`), destructible bricks (`1-6`, `E`, `G`, `M`) and portals (`T`) are
-///   traversable (destructible bricks are cleared as the ball hits them, opening the path
-///   behind them; portals also teleport between pairs).
+/// - Empty cells (`0`), destructible bricks (`1-6`, `E`, `G`, `M`, `B`, `R`) and portals
+///   (`T`) are traversable (destructible bricks are cleared as the ball hits them, opening
+///   the path behind them; portals also teleport between pairs).
 /// - Indestructible `#` cells block traversal.
 /// - Reaching any portal opens every portal. For a generated level (exactly two portals)
 ///   this is exactly "the two portals connect each other"; for legacy levels with more
@@ -193,12 +200,41 @@ pub fn cell_similarity(a: &[u8; GRID_CELLS], b: &[u8; GRID_CELLS]) -> f32 {
     }
 }
 
-/// A level is asymmetric when at least one row differs from its left-right mirror.
-pub fn is_asymmetric(level: &LevelDef) -> bool {
+/// Cell class used for the shape comparison: all brick colours (digits 1 to 6) are one class,
+/// every other cell stands for itself.
+fn shape_class(cell: u8) -> u8 {
+    if (b'1'..=b'6').contains(&cell) {
+        b'1'
+    } else {
+        cell
+    }
+}
+
+/// The grid with every brick colour collapsed to one class (see `shape_class`).
+fn shape_grid(grid: &[u8; GRID_CELLS]) -> [u8; GRID_CELLS] {
+    grid.map(shape_class)
+}
+
+/// Number of cells that differ from their left-right mirror counterpart (a mismatching pair
+/// counts as two cells).
+pub fn mirror_mismatch_cells(level: &LevelDef) -> usize {
     level
         .rows
         .iter()
-        .any(|row| row.chars().rev().collect::<String>() != *row)
+        .map(|row| {
+            let cells: Vec<char> = row.chars().collect();
+            cells
+                .iter()
+                .zip(cells.iter().rev())
+                .filter(|(a, b)| a != b)
+                .count()
+        })
+        .sum()
+}
+
+/// A level is asymmetric when at least `MIN_ASYMMETRIC_CELLS` cells differ from the mirror.
+pub fn is_asymmetric(level: &LevelDef) -> bool {
+    mirror_mismatch_cells(level) >= MIN_ASYMMETRIC_CELLS
 }
 
 fn push_error(errors: &mut Vec<ValidationError>, level_id: usize, message: String) {
@@ -209,6 +245,13 @@ fn push_error(errors: &mut Vec<ValidationError>, level_id: usize, message: Strin
 fn check_generated_name(errors: &mut Vec<ValidationError>, level: &LevelDef, is_last: bool) {
     let name = level.name.as_str();
     let lid = level.id;
+    if is_last && !level.boss {
+        push_error(
+            errors,
+            lid,
+            format!("name {name:?}: the last level of the pack must have boss: true"),
+        );
+    }
     let expected_suffix = if is_last {
         Some(FINAL_BOSS_SUFFIX)
     } else if level.boss {
@@ -237,6 +280,14 @@ fn check_generated_name(errors: &mut Vec<ValidationError>, level: &LevelDef, is_
             format!("name {name:?} uses '[' or ']' outside the boss suffix"),
         );
     }
+    let stem_len = stem.chars().count();
+    if expected_suffix.is_some() && stem_len > BOSS_STEM_MAX_LEN {
+        push_error(
+            errors,
+            lid,
+            format!("boss name {name:?} has a {stem_len} chars stem (max {BOSS_STEM_MAX_LEN})"),
+        );
+    }
     let len = name.chars().count();
     if len > MAX_LEVEL_NAME_LEN {
         push_error(
@@ -247,20 +298,83 @@ fn check_generated_name(errors: &mut Vec<ValidationError>, level: &LevelDef, is_
     }
 }
 
+/// How much of a pack one validation run covers.
+struct Scope {
+    /// First index whose per-level rules are checked (earlier levels only feed the
+    /// cross-level rules: ids, duplicate names, similarity, asymmetry share).
+    first_idx: usize,
+    /// Whether the last level of the slice is the final boss of the finished pack.
+    last_is_final: bool,
+    /// Length of the finished pack, used to judge whether the asymmetry share is still
+    /// reachable while a pack is being built.
+    planned_total: usize,
+}
+
+/// World a level at `idx` must belong to once the pack holds generated levels: the legacy
+/// reference levels are all world 1, then `world = idx / SECTORS_PER_WORLD + 1`.
+fn campaign_world(idx: usize) -> usize {
+    if idx < LEGACY_LEVEL_COUNT {
+        1
+    } else {
+        idx / SECTORS_PER_WORLD + 1
+    }
+}
+
 /// Validates a full campaign pack.
 pub fn validate_pack(levels: &[LevelDef]) -> Vec<ValidationError> {
+    validate_levels(
+        levels,
+        &Scope {
+            first_idx: 0,
+            last_is_final: true,
+            planned_total: levels.len(),
+        },
+    )
+}
+
+/// Runs the per-level rules of [`validate_pack`] on `candidate` as if appended to `prefix`
+/// (already validated), so a generator can retry a bad candidate. `is_last` marks the final
+/// boss, `planned_total` is the length of the finished pack. Pack-wide rules that only make
+/// sense on the finished pack (final boss name, asymmetry share) are judged for feasibility.
+pub fn validate_candidate(
+    prefix: &[LevelDef],
+    candidate: &LevelDef,
+    is_last: bool,
+    planned_total: usize,
+) -> Vec<ValidationError> {
+    let mut pack = prefix.to_vec();
+    pack.push(candidate.clone());
+    validate_levels(
+        &pack,
+        &Scope {
+            first_idx: pack.len() - 1,
+            last_is_final: is_last,
+            planned_total,
+        },
+    )
+}
+
+fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     if levels.is_empty() {
         push_error(&mut errors, 0, "level pack is empty".to_string());
         return errors;
     }
 
-    let mut seen_names = BTreeSet::new();
-    let mut expected_id = 1usize;
-    let mut current_world = 1usize;
+    let first_idx = scope.first_idx.min(levels.len() - 1);
+    let mut seen_names: BTreeSet<String> =
+        levels[..first_idx].iter().map(|l| l.name.clone()).collect();
+    let mut expected_id = first_idx + 1;
+    let mut current_world = if first_idx > 0 {
+        levels[first_idx - 1].world
+    } else {
+        1
+    };
     let last_idx = levels.len() - 1;
+    // Once the pack holds generated levels, the whole pack follows the campaign layout.
+    let campaign = levels.len() > LEGACY_LEVEL_COUNT;
 
-    for (idx, level) in levels.iter().enumerate() {
+    for (idx, level) in levels.iter().enumerate().skip(first_idx) {
         let lid = level.id;
         let generated = idx >= LEGACY_LEVEL_COUNT;
         if lid != expected_id {
@@ -272,8 +386,8 @@ pub fn validate_pack(levels: &[LevelDef]) -> Vec<ValidationError> {
         }
         expected_id = lid + 1;
 
-        if generated {
-            let expected_world = idx / SECTORS_PER_WORLD + 1;
+        if campaign {
+            let expected_world = campaign_world(idx);
             if level.world != expected_world {
                 push_error(
                     &mut errors,
@@ -311,7 +425,7 @@ pub fn validate_pack(levels: &[LevelDef]) -> Vec<ValidationError> {
             push_error(&mut errors, lid, "name is empty".to_string());
         }
         if generated {
-            check_generated_name(&mut errors, level, idx == last_idx);
+            check_generated_name(&mut errors, level, scope.last_is_final && idx == last_idx);
         }
         if !name.chars().all(is_valid_name_char) {
             push_error(
@@ -431,8 +545,8 @@ pub fn validate_pack(levels: &[LevelDef]) -> Vec<ValidationError> {
     }
 
     check_world_count(&mut errors, levels);
-    check_similarity(&mut errors, levels);
-    check_asymmetry(&mut errors, levels);
+    check_similarity(&mut errors, levels, first_idx);
+    check_asymmetry(&mut errors, levels, scope.planned_total);
     errors
 }
 
@@ -447,26 +561,34 @@ fn check_world_count(errors: &mut Vec<ValidationError>, levels: &[LevelDef]) {
     }
 }
 
-/// Rejects a generated level too similar to any earlier level of the same class; legacy
+/// Rejects a generated level too similar, on exact cells or on shape (digits 1 to 6 as one
+/// class), to any earlier level of the same class; legacy
 /// levels take part as reference but are never rejected themselves.
-fn check_similarity(errors: &mut Vec<ValidationError>, levels: &[LevelDef]) {
+fn check_similarity(errors: &mut Vec<ValidationError>, levels: &[LevelDef], first_idx: usize) {
     if levels.len() <= LEGACY_LEVEL_COUNT {
         return;
     }
     let grids: Vec<[u8; GRID_CELLS]> = levels.iter().map(cell_grid).collect();
-    for idx in LEGACY_LEVEL_COUNT..levels.len() {
+    let shapes: Vec<[u8; GRID_CELLS]> = grids.iter().map(shape_grid).collect();
+    for idx in first_idx.max(LEGACY_LEVEL_COUNT)..levels.len() {
         for earlier in 0..idx {
             if levels[earlier].boss != levels[idx].boss {
                 continue;
             }
             let sim = cell_similarity(&grids[idx], &grids[earlier]);
-            if sim > SIMILARITY_MAX {
+            let shape_sim = cell_similarity(&shapes[idx], &shapes[earlier]);
+            if sim > SIMILARITY_MAX || shape_sim > SIMILARITY_MAX {
+                let (kind, value) = if sim > SIMILARITY_MAX {
+                    ("identical to", sim)
+                } else {
+                    ("same shape (colours ignored) as", shape_sim)
+                };
                 push_error(
                     errors,
                     levels[idx].id,
                     format!(
-                        "{:.0}% identical to level {} (max {:.0}%)",
-                        sim * PERCENT as f32,
+                        "{:.0}% {kind} level {} (max {:.0}%)",
+                        value * PERCENT as f32,
                         levels[earlier].id,
                         SIMILARITY_MAX * PERCENT as f32
                     ),
@@ -477,8 +599,10 @@ fn check_similarity(errors: &mut Vec<ValidationError>, levels: &[LevelDef]) {
     }
 }
 
-/// Every world that contains generated levels needs a share of asymmetric ones.
-fn check_asymmetry(errors: &mut Vec<ValidationError>, levels: &[LevelDef]) {
+/// Every world that contains generated levels needs a share of asymmetric ones. While a pack
+/// is being built (`planned_total` beyond `levels.len()`), the share only has to remain
+/// reachable if every still-missing level of that world turned out asymmetric.
+fn check_asymmetry(errors: &mut Vec<ValidationError>, levels: &[LevelDef], planned_total: usize) {
     // world -> (first generated level id, generated count, asymmetric count)
     let mut per_world: BTreeMap<usize, (usize, usize, usize)> = BTreeMap::new();
     for level in levels.iter().skip(LEGACY_LEVEL_COUNT) {
@@ -489,12 +613,16 @@ fn check_asymmetry(errors: &mut Vec<ValidationError>, levels: &[LevelDef]) {
         }
     }
     for (world, (first_id, total, asymmetric)) in per_world {
-        if asymmetric * PERCENT < total * MIN_ASYMMETRIC_PERCENT {
+        let world_start = (world.saturating_sub(1) * SECTORS_PER_WORLD).max(LEGACY_LEVEL_COUNT);
+        let world_end = (world * SECTORS_PER_WORLD).min(planned_total);
+        let missing = world_end.saturating_sub(world_start).saturating_sub(total);
+        let planned = total + missing;
+        if (asymmetric + missing) * PERCENT < planned * MIN_ASYMMETRIC_PERCENT {
             push_error(
                 errors,
                 first_id,
                 format!(
-                    "world {world}: only {asymmetric}/{total} generated levels are asymmetric (min {MIN_ASYMMETRIC_PERCENT}%)"
+                    "world {world}: only {asymmetric}/{total} generated levels are asymmetric (min {MIN_ASYMMETRIC_PERCENT}% of {planned})"
                 ),
             );
         }
@@ -554,6 +682,9 @@ mod tests {
     /// Legacy pack plus `extra` regular generated levels and a final boss.
     fn extended_pack(extra: usize) -> Vec<LevelDef> {
         let mut levels = legacy_pack();
+        for level in &mut levels {
+            level.world = 1;
+        }
         for k in 0..extra {
             let idx = levels.len();
             levels.push(make_level(
@@ -622,14 +753,16 @@ mod tests {
 
     #[test]
     fn legacy_levels_are_never_rejected_by_new_rules() {
-        // The legacy final boss name is longer than the cap and several legacy levels have
-        // more than two portals: both stay accepted, also inside an extended pack.
-        let legacy = legacy_pack();
-        assert!(legacy
-            .iter()
-            .any(|l| l.name.chars().count() > MAX_LEVEL_NAME_LEN));
+        // A legacy name longer than the cap (none of the shipped names is, so one is made up
+        // here) and several legacy levels with more than two portals stay accepted, also
+        // inside an extended pack.
+        let mut legacy = legacy_pack();
+        legacy[1].name = "LEGACY NAME BEYOND THE CAP".to_string();
+        assert!(legacy[1].name.chars().count() > MAX_LEVEL_NAME_LEN);
         assert!(validate_pack(&legacy).is_empty());
-        let errors = validate_pack(&extended_pack(3));
+        let mut extended = extended_pack(3);
+        extended[1].name = legacy[1].name.clone();
+        let errors = validate_pack(&extended);
         assert!(errors.is_empty(), "{errors:#?}");
     }
 
@@ -675,6 +808,47 @@ mod tests {
         pack[16].rows[0].replace_range(0..1, "4");
         pack[15].rows[0].replace_range(0..1, "1");
         assert!(has_error(&validate_pack(&pack), "identical to level 16"));
+    }
+
+    #[test]
+    fn recoloured_near_duplicate_is_rejected_on_shape() {
+        let mut pack = extended_pack(3);
+        pack[16].rows = pack[15]
+            .rows
+            .iter()
+            .map(|r| {
+                r.chars()
+                    .map(|ch| match ch.to_digit(10) {
+                        Some(d) if (1..=6).contains(&d) => {
+                            char::from_digit(d % 6 + 1, 10).unwrap_or(ch)
+                        }
+                        _ => ch,
+                    })
+                    .collect()
+            })
+            .collect();
+        let a = cell_grid(&pack[15]);
+        let b = cell_grid(&pack[16]);
+        assert!(
+            cell_similarity(&a, &b) <= SIMILARITY_MAX,
+            "exact cells differ"
+        );
+        let errors = validate_pack(&pack);
+        assert!(has_error(&errors, "same shape"), "{errors:#?}");
+    }
+
+    #[test]
+    fn one_cell_asymmetry_is_not_counted() {
+        let mut level = sample_level(20, 1, "X", vec!["111111111111111"; 3]);
+        assert_eq!(mirror_mismatch_cells(&level), 0);
+        assert!(!is_asymmetric(&level));
+        level.rows[0].replace_range(0..1, "2");
+        assert_eq!(mirror_mismatch_cells(&level), 2);
+        assert!(!is_asymmetric(&level));
+        level.rows[1].replace_range(0..1, "2");
+        level.rows[2].replace_range(0..1, "2");
+        assert_eq!(mirror_mismatch_cells(&level), MIN_ASYMMETRIC_CELLS);
+        assert!(is_asymmetric(&level));
     }
 
     #[test]
@@ -727,6 +901,9 @@ mod tests {
     #[test]
     fn at_most_nine_worlds() {
         let mut pack = legacy_pack();
+        for level in &mut pack {
+            level.world = 1;
+        }
         let mut next = 0usize;
         while pack.len() < 10 * SECTORS_PER_WORLD {
             let idx = pack.len();
@@ -754,6 +931,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_worlds_with_generated_levels_are_rejected() {
+        let mut pack = legacy_pack();
+        assert!(pack.iter().any(|l| l.world > 1));
+        let idx = pack.len();
+        pack.push(make_level(idx, "TEST FINALE [FINAL BOSS]", true, 9000));
+        assert!(has_error(
+            &validate_pack(&pack),
+            "does not match the layout"
+        ));
+    }
+
+    #[test]
+    fn legacy_reassigned_to_world_one_with_generated_levels_passes() {
+        let errors = validate_pack(&extended_pack(3));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn candidate_rules_run_before_the_pack_is_finished() {
+        let prefix = extended_pack(2);
+        let prefix = &prefix[..prefix.len() - 1];
+        let total = 100;
+        let idx = prefix.len();
+        let good = make_level(idx, "NEXT SECTOR", false, 4242);
+        let errors = validate_candidate(prefix, &good, false, total);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let mut bad = good.clone();
+        bad.rows[0] = "T".repeat(EDITOR_COLS);
+        assert!(has_error(
+            &validate_candidate(prefix, &bad, false, total),
+            "portals"
+        ));
+        let mut dup = good;
+        dup.name = prefix[LEGACY_LEVEL_COUNT].name.clone();
+        assert!(has_error(
+            &validate_candidate(prefix, &dup, false, total),
+            "duplicate"
+        ));
+    }
+
+    #[test]
     fn boss_and_final_boss_suffixes_are_required() {
         let mut pack = extended_pack(3);
         pack[15].boss = true;
@@ -770,6 +989,31 @@ mod tests {
         let last = pack.len() - 1;
         pack[last].name = "TEST FINALE [BOSS]".to_string();
         assert!(has_error(&validate_pack(&pack), "[FINAL BOSS]"));
+    }
+
+    #[test]
+    fn last_level_must_be_flagged_as_boss() {
+        let mut pack = extended_pack(3);
+        let last = pack.len() - 1;
+        pack[last].boss = false;
+        pack[last].rows = random_rows(9000, false);
+        assert!(has_error(&validate_pack(&pack), "must have boss: true"));
+    }
+
+    #[test]
+    fn generated_boss_stem_is_capped() {
+        let mut pack = extended_pack(3);
+        let last = pack.len() - 1;
+        let long_stem = "X".repeat(BOSS_STEM_MAX_LEN + 1);
+        pack[last].name = format!("{long_stem}{FINAL_BOSS_SUFFIX}");
+        assert!(has_error(&validate_pack(&pack), "chars stem"));
+        let ok_stem = "X".repeat(BOSS_STEM_MAX_LEN);
+        pack[last].name = format!("{ok_stem}{FINAL_BOSS_SUFFIX}");
+        assert!(!has_error(&validate_pack(&pack), "chars stem"));
+        pack[15].boss = true;
+        pack[15].rows = random_rows(77, true);
+        pack[15].name = format!("{long_stem}{BOSS_SUFFIX}");
+        assert!(has_error(&validate_pack(&pack), "chars stem"));
     }
 
     #[test]

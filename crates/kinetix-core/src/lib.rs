@@ -279,7 +279,7 @@ mod tests {
                 ],
             ),
             (
-                "OMEGA EMPEROR [FINAL BOSS]",
+                "OMEGA EMPEROR [BOSS]",
                 true,
                 &[
                     "000000000000000",

@@ -17,7 +17,7 @@
 //! Deterministic procedural campaign generator from curated motif families,
 //! parameterized by world identity, sector position, and difficulty curve.
 
-use crate::validate::{BOSS_SUFFIX, FINAL_BOSS_SUFFIX, MAX_LEVEL_NAME_LEN};
+use crate::validate::{BOSS_STEM_MAX_LEN, BOSS_SUFFIX, FINAL_BOSS_SUFFIX, MAX_LEVEL_NAME_LEN};
 use kinetix_core::config::LevelDef;
 use kinetix_core::level_code::EDITOR_COLS;
 use std::collections::BTreeSet;
@@ -178,15 +178,20 @@ impl Rng {
     }
 }
 
+/// Name candidates tried for one sector before giving up.
+const NAME_ATTEMPT_BUDGET: usize = 500;
+
 /// Generates a unique uppercase name of at most `MAX_LEVEL_NAME_LEN` chars for a sector.
-/// Boss names end with `BOSS_SUFFIX`, or `FINAL_BOSS_SUFFIX` for the last level of the pack.
+/// Boss names end with `BOSS_SUFFIX`, or `FINAL_BOSS_SUFFIX` for the last level of the pack;
+/// their stem is at most `BOSS_STEM_MAX_LEN` chars and does not depend on the suffix.
+/// Fails after `NAME_ATTEMPT_BUDGET` candidates instead of looping forever.
 pub fn generate_unique_name(
     world: usize,
     sector_in_world: usize,
     boss: bool,
     final_boss: bool,
     used: &mut BTreeSet<String>,
-) -> String {
+) -> Result<String, String> {
     let suffix = if final_boss {
         FINAL_BOSS_SUFFIX
     } else {
@@ -194,14 +199,13 @@ pub fn generate_unique_name(
     };
     let w_idx = world.saturating_sub(1).min(7);
     let adjs = WORLD_ADJECTIVES[w_idx];
-    let mut attempt = 0usize;
-    loop {
+    for attempt in 0..NAME_ATTEMPT_BUDGET {
         let a = adjs[(sector_in_world * 3 + attempt * 7) % adjs.len()];
         let n = NOUNS[(sector_in_world * 5 + attempt * 11 + w_idx * 3) % NOUNS.len()];
         let candidate = if boss {
-            let base = format!("{a} {n}{suffix}");
-            if base.len() <= MAX_LEVEL_NAME_LEN {
-                base
+            let stem = format!("{a} {n}");
+            if stem.len() <= BOSS_STEM_MAX_LEN {
+                format!("{stem}{suffix}")
             } else {
                 format!("{a}{suffix}")
             }
@@ -212,10 +216,12 @@ pub fn generate_unique_name(
             format!("{a} {n} {roman_or_num}")
         };
         if candidate.len() <= MAX_LEVEL_NAME_LEN && used.insert(candidate.clone()) {
-            return candidate;
+            return Ok(candidate);
         }
-        attempt += 1;
     }
+    Err(format!(
+        "no unique level name found for world {world}, sector {sector_in_world} after {NAME_ATTEMPT_BUDGET} attempts"
+    ))
 }
 
 /// Target destructible brick count for `(world, sector_in_world)`, rising smoothly within
@@ -244,22 +250,22 @@ pub fn generate_sector(
     is_last: bool,
     seed: u64,
     used_names: &mut BTreeSet<String>,
-) -> LevelDef {
+) -> Result<LevelDef, String> {
     let boss = sector_in_world == 50 || sector_in_world == 100;
     let is_set_piece = !boss && sector_in_world.is_multiple_of(10);
     let is_breather = !boss && (sector_in_world % 10 == 4 || sector_in_world % 10 == 8);
-    let name = generate_unique_name(world, sector_in_world, boss, boss && is_last, used_names);
+    let name = generate_unique_name(world, sector_in_world, boss, boss && is_last, used_names)?;
     let mut rng = Rng::new(seed ^ (id as u64).wrapping_mul(0x517C_C1B7_2722_0A95));
 
     if boss {
         let rows = build_boss_rows(world, sector_in_world, &mut rng);
-        return LevelDef {
+        return Ok(LevelDef {
             id,
             world,
             name,
             boss: true,
             rows,
-        };
+        });
     }
 
     let motif_idx =
@@ -275,13 +281,13 @@ pub fn generate_sector(
         &mut rng,
     );
 
-    LevelDef {
+    Ok(LevelDef {
         id,
         world,
         name,
         boss: false,
         rows,
-    }
+    })
 }
 
 fn build_boss_rows(world: usize, sector_in_world: usize, rng: &mut Rng) -> Vec<String> {
@@ -515,4 +521,33 @@ fn build_motif_rows(
     grid.into_iter()
         .map(|r| r.into_iter().collect::<String>())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boss_stem_fits_the_final_suffix_and_never_depends_on_the_suffix() {
+        assert_eq!(
+            BOSS_STEM_MAX_LEN + FINAL_BOSS_SUFFIX.len(),
+            MAX_LEVEL_NAME_LEN
+        );
+        for world in 1..=8 {
+            for sector in [50, 100] {
+                let regular =
+                    generate_unique_name(world, sector, true, false, &mut BTreeSet::new())
+                        .expect("boss name");
+                let last = generate_unique_name(world, sector, true, true, &mut BTreeSet::new())
+                    .expect("final boss name");
+                let regular_stem = regular.strip_suffix(BOSS_SUFFIX).expect("boss suffix");
+                let last_stem = last
+                    .strip_suffix(FINAL_BOSS_SUFFIX)
+                    .expect("final boss suffix");
+                assert_eq!(regular_stem, last_stem, "world {world} sector {sector}");
+                assert!(last_stem.len() <= BOSS_STEM_MAX_LEN);
+                assert!(last.len() <= MAX_LEVEL_NAME_LEN);
+            }
+        }
+    }
 }

@@ -20,9 +20,10 @@
 //! toward it at a bounded speed, so it can lose balls. Two presets (`good`, `casual`) bracket
 //! the human range; the fairness bands below are calibrated on the legacy levels.
 
-use crate::validate::LEGACY_LEVEL_COUNT;
+use crate::validate::{LEGACY_LEVEL_COUNT, SECTORS_PER_WORLD};
 use kinetix_core::config::{GameConfig, LevelDef};
 use kinetix_core::physics::{GameEvent, GameWorld, SessionStatus};
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 /// Fixed simulation step of the bot (seconds).
@@ -66,6 +67,8 @@ pub const PRESET_GOOD: BotPreset = BotPreset {
     name: "good",
     paddle_speed: 1350.0,
     reaction_delay_sec: 0.12,
+    // 0.35 half-widths: chosen in calibration on 2026-11-09 (the casual preset already
+    // covers weak aim, so the good preset stays precise).
     aim_error_half_widths: 0.35,
 };
 
@@ -99,27 +102,31 @@ pub struct PresetBands {
 // Calibration: both presets over the 12 legacy non-boss levels (the first 15 levels minus
 // the 3 bosses), 8 seeds each, measured on 2026-11-09 with `simulate` against the legacy
 // physics. Min/max per metric:
-//   good:   clear rate 0.125..0.625, median clear time 17.0..41.3 s,
-//           losses per run 0.250..0.875, sudden-death share 0.375..0.875
-//   casual: clear rate 0.000..0.125, median clear time 10.6..36.3 s (7 of 12 levels had a
-//           cleared run), losses per run 1.000..3.000, sudden-death share 0.000..1.000
+//   good:   clear rate 0.000..0.750, median clear time 13.7..40.9 s,
+//           losses per run 0.125..1.375, sudden-death share 0.250..1.000
+//   casual: clear rate 0.000..0.125, median clear time 17.9..33.2 s (4 of 12 levels had a
+//           cleared run), losses per run 1.250..3.000, sudden-death share 0.000..0.875
+// Re-measured the same day after the bot honoured its reaction delay right after the
+// history reset and read ball data only from the delayed sample. The legacy level 13
+// (SPECTRAL VAULT) is then no longer cleared by the good preset (0 of 8 seeds), hence the
+// "no seed cleared" rule below applies to generated levels only.
 // Re-measure and update these values whenever the physics, the bot or the legacy levels change.
 pub const GOOD_BANDS: PresetBands = PresetBands {
     clear_rate: MetricBand {
-        min: 0.125,
-        max: 0.625,
+        min: 0.0,
+        max: 0.75,
     },
     median_clear_time: MetricBand {
-        min: 17.0,
-        max: 41.3,
+        min: 13.7,
+        max: 40.9,
     },
     losses_per_run: MetricBand {
-        min: 0.25,
-        max: 0.875,
+        min: 0.125,
+        max: 1.375,
     },
     sudden_death_share: MetricBand {
-        min: 0.375,
-        max: 0.875,
+        min: 0.25,
+        max: 1.0,
     },
 };
 
@@ -129,11 +136,17 @@ pub const CASUAL_BANDS: PresetBands = PresetBands {
         max: 0.125,
     },
     median_clear_time: MetricBand {
-        min: 10.6,
-        max: 36.3,
+        min: 17.9,
+        max: 33.2,
     },
-    losses_per_run: MetricBand { min: 1.0, max: 3.0 },
-    sudden_death_share: MetricBand { min: 0.0, max: 1.0 },
+    losses_per_run: MetricBand {
+        min: 1.25,
+        max: 3.0,
+    },
+    sudden_death_share: MetricBand {
+        min: 0.0,
+        max: 0.875,
+    },
 };
 
 /// Relative margin added around every calibrated band (fraction of the bound).
@@ -142,9 +155,24 @@ pub const BAND_MARGIN_REL: f32 = 0.30;
 pub const BAND_MARGIN_RATE_ABS: f32 = 0.125;
 /// Absolute margin added around the losses-per-run band (balls).
 pub const BAND_MARGIN_LOSSES_ABS: f32 = 0.25;
-/// The `casual` preset must lose balls on at least this many legacy levels (measured: all 15),
-/// else the bot cannot lose, is rejected, and every other metric is meaningless.
-pub const CASUAL_MIN_LOSING_LEGACY_LEVELS: usize = 6;
+/// Safety margin (levels) below the measured count for the casual loss gate.
+const CASUAL_LOSING_MARGIN: usize = 2;
+/// Non-boss legacy levels on which the casual preset lost balls, measured on 2026-11-09:
+/// all 12 of the 12 (the gate counts the same population as the calibration).
+const CASUAL_MEASURED_LOSING_LEGACY_LEVELS: usize = 12;
+/// The `casual` preset must lose balls on at least this many legacy levels (measured count
+/// minus a margin of 2), else the bot cannot lose, is rejected, and every other metric is
+/// meaningless.
+pub const CASUAL_MIN_LOSING_LEGACY_LEVELS: usize =
+    CASUAL_MEASURED_LOSING_LEGACY_LEVELS - CASUAL_LOSING_MARGIN;
+
+/// Generated non-boss levels: the good bot must clear at least this many seeds (of
+/// `DEFAULT_SEEDS`) before sudden death. Bosses only need one clear (see `fairness_issues`).
+pub const GENERATED_MIN_GOOD_CLEARS: usize = 2;
+/// Generated non-boss levels: explicit cap on the good bot's sudden-death share. It is not
+/// derived from the calibrated band, whose widened upper bound (1.425) can never be exceeded
+/// by a share that is at most 1.0.
+pub const GENERATED_MAX_GOOD_SUDDEN_DEATH_SHARE: f32 = 0.875;
 
 /// Outcome of one bot run (one level, one preset, one seed).
 #[derive(Debug, Clone)]
@@ -257,6 +285,8 @@ pub fn fold_reflect(x: f32, lo: f32, hi: f32) -> f32 {
 }
 
 /// Bottom edge of the lowest obstacle (brick of any kind or boss), or the top wall if none.
+/// Bricks and boss are read from the current world state, not delayed: they change slowly and
+/// only the ball is subject to the reaction delay.
 fn lowest_obstacle_bottom(world: &GameWorld) -> f32 {
     let mut bottom = world.config.arena.wall_top;
     for b in &world.bricks {
@@ -332,12 +362,11 @@ fn desired_paddle_x(world: &GameWorld, sample: BallSample, radius: f32) -> f32 {
     landing - ratio * world.paddle_width * 0.5
 }
 
-/// x of the lowest falling bonus capsule worth catching, when no ball is close to the paddle.
-fn capsule_target(world: &GameWorld) -> Option<f32> {
-    let safe = world
-        .balls
-        .iter()
-        .all(|b| b.stuck_offset.is_some() || b.vy < 0.0 || b.y < CAPSULE_SAFE_BALL_Y);
+/// x of the lowest falling bonus capsule worth catching, when the (delayed) tracked ball is
+/// not close to the paddle. The ball data comes from the delayed sample; capsule positions are
+/// read from the current world state, a deliberate approximation (capsules fall slowly).
+fn capsule_target(world: &GameWorld, seen: BallSample) -> Option<f32> {
+    let safe = seen.vy < 0.0 || seen.y < CAPSULE_SAFE_BALL_Y;
     if !safe {
         return None;
     }
@@ -398,8 +427,11 @@ pub fn simulate_level_seed(
                 while history.len() > delay_steps + 1 {
                     history.pop_front();
                 }
-                if let Some(&seen) = history.front() {
-                    let want = match capsule_target(&world) {
+                // Hold the paddle until a sample at least `delay_steps` old exists, so the
+                // reaction delay also applies right after the history was cleared.
+                if history.len() > delay_steps {
+                    let seen = history[0];
+                    let want = match capsule_target(&world, seen) {
                         Some(x) => x,
                         None => {
                             desired_paddle_x(&world, seen, ball_radius)
@@ -503,13 +535,21 @@ pub fn simulate_levels(
             })
             .collect();
         for h in handles {
-            if let Ok(done) = h.join() {
-                for (slot, res) in done {
-                    slots[slot] = Some(res);
+            match h.join() {
+                Ok(done) => {
+                    for (slot, res) in done {
+                        slots[slot] = Some(res);
+                    }
                 }
+                // A panicked worker must not silently drop its runs.
+                Err(payload) => std::panic::resume_unwind(payload),
             }
         }
     });
+    assert!(
+        slots.iter().all(Option::is_some),
+        "every simulation slot must be filled"
+    );
 
     levels
         .iter()
@@ -521,6 +561,7 @@ pub fn simulate_levels(
                 let runs: Vec<SeedRunResult> = (0..seeds.len())
                     .filter_map(|si| slots[base + si].clone())
                     .collect();
+                debug_assert_eq!(runs.len(), seeds.len());
                 per_preset.push(summarize(*preset, runs));
             }
             let casual = per_preset.remove(1);
@@ -545,6 +586,30 @@ fn band_bounds(band: MetricBand, abs_margin: f32) -> (f32, f32) {
     )
 }
 
+/// Which side of a calibrated band a check enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandSide {
+    /// Both bounds (legacy levels, which are the calibration).
+    Both,
+    /// Only the bound that makes a level too hard (generated levels): easy levels are allowed.
+    HardOnly,
+}
+
+/// Which bound of a metric band is the "too hard" one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HardBound {
+    /// A value below the lower bound is too hard (clear rate).
+    Lower,
+    /// A value above the upper bound is too hard (clear time, losses, sudden-death share).
+    Upper,
+}
+
+/// True for levels whose fairness is judged one-sidedly (the generated levels).
+fn is_generated_level(level_id: usize) -> bool {
+    level_id > LEGACY_LEVEL_COUNT
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_metric(
     issues: &mut Vec<String>,
     who: &str,
@@ -552,9 +617,15 @@ fn check_metric(
     value: f32,
     band: MetricBand,
     abs_margin: f32,
+    side: BandSide,
+    hard: HardBound,
 ) {
     let (lo, hi) = band_bounds(band, abs_margin);
-    if value < lo || value > hi {
+    let enforce_lower = side == BandSide::Both || hard == HardBound::Lower;
+    let enforce_upper = side == BandSide::Both || hard == HardBound::Upper;
+    let too_low = value < lo && enforce_lower;
+    let too_high = value > hi && enforce_upper;
+    if too_low || too_high {
         issues.push(format!(
             "{who}: {metric} {value:.2} outside calibrated band [{lo:.2}, {hi:.2}]"
         ));
@@ -571,8 +642,32 @@ fn check_preset(
         "level {} ({}) [{}]",
         level.level_id, level.name, sum.preset.name
     );
-    if sum.preset.name == PRESET_GOOD.name && sum.clear_rate <= 0.0 {
-        issues.push(format!("{who}: no seed cleared before sudden death"));
+    let generated = is_generated_level(level.level_id);
+    let is_good = sum.preset.name == PRESET_GOOD.name;
+    // Generated levels are judged on the good bot's hard-side limits only: easy teaching
+    // levels and breathers are allowed, so the casual preset is not checked at all.
+    if generated && !is_good {
+        return;
+    }
+    let side = if generated {
+        BandSide::HardOnly
+    } else {
+        BandSide::Both
+    };
+    if is_good && generated {
+        let clears = sum.runs.iter().filter(|r| r.cleared).count();
+        if clears < GENERATED_MIN_GOOD_CLEARS {
+            issues.push(format!(
+                "{who}: cleared {clears} of {} seeds before sudden death, expected at least {GENERATED_MIN_GOOD_CLEARS}",
+                sum.runs.len()
+            ));
+        }
+        if sum.sudden_death_share > GENERATED_MAX_GOOD_SUDDEN_DEATH_SHARE {
+            issues.push(format!(
+                "{who}: sudden-death share {:.2} above the cap {GENERATED_MAX_GOOD_SUDDEN_DEATH_SHARE:.3}",
+                sum.sudden_death_share
+            ));
+        }
     }
     check_metric(
         issues,
@@ -581,6 +676,8 @@ fn check_preset(
         sum.clear_rate,
         bands.clear_rate,
         BAND_MARGIN_RATE_ABS,
+        side,
+        HardBound::Lower,
     );
     // The casual preset legitimately clears nothing on some levels, so a missing median
     // is only a problem through the clear-rate checks above.
@@ -592,6 +689,8 @@ fn check_preset(
             t,
             bands.median_clear_time,
             0.0,
+            side,
+            HardBound::Upper,
         );
     }
     check_metric(
@@ -601,19 +700,31 @@ fn check_preset(
         sum.losses_per_run,
         bands.losses_per_run,
         BAND_MARGIN_LOSSES_ABS,
+        side,
+        HardBound::Upper,
     );
-    check_metric(
-        issues,
-        &who,
-        "sudden-death share",
-        sum.sudden_death_share,
-        bands.sudden_death_share,
-        BAND_MARGIN_RATE_ABS,
-    );
+    // Generated levels use the explicit cap above instead of the band-derived bound.
+    if !generated {
+        check_metric(
+            issues,
+            &who,
+            "sudden-death share",
+            sum.sudden_death_share,
+            bands.sudden_death_share,
+            BAND_MARGIN_RATE_ABS,
+            side,
+            HardBound::Upper,
+        );
+    }
 }
 
-/// Fairness issues of a simulated set: calibrated bands for regular levels, and "the good bot
-/// clears at least one seed" for bosses. Empty means fair.
+/// Fairness issues of a simulated set. Legacy regular levels: the full two-sided calibrated
+/// bands for both presets. Generated regular levels (id > `LEGACY_LEVEL_COUNT`): "not too hard"
+/// only, i.e. the good bot clears at least `GENERATED_MIN_GOOD_CLEARS` seeds before sudden
+/// death and stays inside the hard-side limits (clear rate lower bound, median clear time
+/// upper bound, losses upper bound) plus the explicit `GENERATED_MAX_GOOD_SUDDEN_DEATH_SHARE`
+/// cap; the casual preset is not checked. Bosses: the good bot clears at least one seed.
+/// Empty means fair.
 pub fn fairness_issues(summaries: &[LevelSimSummary]) -> Vec<String> {
     let mut issues = Vec::new();
     for s in summaries {
@@ -633,13 +744,16 @@ pub fn fairness_issues(summaries: &[LevelSimSummary]) -> Vec<String> {
 }
 
 /// Bot-validity gate: the casual preset must lose balls on legacy levels, otherwise the bot
-/// cannot lose and every other metric is meaningless. Skipped when no legacy level is present.
+/// cannot lose and every other metric is meaningless. The measured threshold only holds for the
+/// full calibration population, so the gate is applied only when all
+/// `CASUAL_MEASURED_LOSING_LEGACY_LEVELS` non-boss legacy levels are in the run; partial runs
+/// (for example `simulate --world N`) skip it.
 pub fn casual_loss_gate(summaries: &[LevelSimSummary]) -> Result<(), String> {
     let legacy: Vec<&LevelSimSummary> = summaries
         .iter()
-        .filter(|s| s.level_id >= 1 && s.level_id <= LEGACY_LEVEL_COUNT)
+        .filter(|s| s.level_id >= 1 && s.level_id <= LEGACY_LEVEL_COUNT && !s.boss)
         .collect();
-    if legacy.is_empty() {
+    if legacy.len() < CASUAL_MEASURED_LOSING_LEGACY_LEVELS {
         return Ok(());
     }
     let losing = legacy
@@ -757,6 +871,66 @@ pub fn compute_world_stats(
     out
 }
 
+/// Sectors per reporting block of the per-block table.
+pub const SECTORS_PER_BLOCK: usize = 10;
+/// Label of the legacy prologue row of the per-block table.
+pub const PROLOGUE_BLOCK_LABEL: &str = "prologue";
+
+/// Aggregates of one block of sectors (the legacy prologue, or 10 sectors of one world).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockStats {
+    pub label: String,
+    pub levels: usize,
+    /// Mean of the per-level good-bot clear rates.
+    pub good_clear_rate: f32,
+    /// Median of the per-level good-bot median clear times (levels never cleared are skipped).
+    pub good_median_clear_time: Option<f32>,
+    /// Mean of the per-level casual-bot clear rates.
+    pub casual_clear_rate: f32,
+}
+
+/// Block key ordering the prologue first, then by world and block index.
+fn block_key(level: &LevelSimSummary) -> (usize, usize, usize) {
+    if level.level_id <= LEGACY_LEVEL_COUNT {
+        (0, 0, 0)
+    } else {
+        let sector = (level.level_id - 1) % SECTORS_PER_WORLD;
+        (1, level.world, sector / SECTORS_PER_BLOCK)
+    }
+}
+
+/// Per-block statistics, deterministic and ordered: legacy prologue first (levels 1 to
+/// `LEGACY_LEVEL_COUNT`), then blocks of `SECTORS_PER_BLOCK` sectors per world.
+pub fn block_stats(summaries: &[LevelSimSummary]) -> Vec<BlockStats> {
+    let mut groups: BTreeMap<(usize, usize, usize), Vec<&LevelSimSummary>> = BTreeMap::new();
+    for s in summaries {
+        groups.entry(block_key(s)).or_default().push(s);
+    }
+    groups
+        .into_iter()
+        .map(|(key, members)| {
+            let label = if key.0 == 0 {
+                PROLOGUE_BLOCK_LABEL.to_string()
+            } else {
+                let first = key.2 * SECTORS_PER_BLOCK + 1;
+                format!("W{} S{}-{}", key.1, first, first + SECTORS_PER_BLOCK - 1)
+            };
+            let count = members.len() as f32;
+            let medians: Vec<f32> = members
+                .iter()
+                .filter_map(|m| m.good.median_clear_time)
+                .collect();
+            BlockStats {
+                label,
+                levels: members.len(),
+                good_clear_rate: members.iter().map(|m| m.good.clear_rate).sum::<f32>() / count,
+                good_median_clear_time: median(&medians),
+                casual_clear_rate: members.iter().map(|m| m.casual.clear_rate).sum::<f32>() / count,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +986,9 @@ mod tests {
         }
     }
 
+    /// Losses per run far above any calibrated band.
+    const OUT_OF_BAND_LOSSES: f32 = 50.0;
+
     #[test]
     fn casual_bot_loses_balls_on_legacy_levels() {
         let (config, levels) = legacy_non_boss();
@@ -822,13 +999,16 @@ mod tests {
     #[test]
     fn gate_rejects_a_bot_that_never_loses() {
         let (config, levels) = legacy_non_boss();
-        let mut sums = simulate_levels(&config, &levels[..2], &DEFAULT_SEEDS[..5]);
+        let mut sums = simulate_levels(&config, &levels, &DEFAULT_SEEDS[..2]);
         for s in &mut sums {
             for r in &mut s.casual.runs {
                 r.balls_lost = 0;
             }
         }
         assert!(casual_loss_gate(&sums).is_err());
+        // A partial run (fewer than all legacy non-boss levels) skips the gate.
+        sums.truncate(CASUAL_MEASURED_LOSING_LEGACY_LEVELS - 1);
+        assert!(casual_loss_gate(&sums).is_ok());
     }
 
     #[test]
@@ -848,6 +1028,144 @@ mod tests {
         }
         sums[0].good.clear_rate = 0.0;
         sums[0].good.median_clear_time = None;
+        sums[0].good.losses_per_run = OUT_OF_BAND_LOSSES;
         assert!(!fairness_issues(&sums).is_empty());
+    }
+
+    #[test]
+    fn generated_level_must_be_cleared_by_the_good_bot() {
+        let (config, levels) = legacy_non_boss();
+        let mut sums = simulate_levels(&config, &levels[..1], &DEFAULT_SEEDS[..5]);
+        for r in &mut sums[0].good.runs {
+            r.cleared = false;
+        }
+        sums[0].good.clear_rate = 0.0;
+        sums[0].good.median_clear_time = None;
+        sums[0].level_id = LEGACY_LEVEL_COUNT + 1;
+        assert!(fairness_issues(&sums)
+            .iter()
+            .any(|i| i.contains("cleared 0 of")));
+    }
+
+    /// Builds a summary of a generated level from the first legacy level with chosen good-bot
+    /// metrics, to exercise the one-sided limits. Exactly `clears` of the 8 seeds are cleared.
+    fn generated_summary(
+        clears: usize,
+        clear_rate: f32,
+        median: Option<f32>,
+        losses: f32,
+        sd_share: f32,
+    ) -> Vec<LevelSimSummary> {
+        let (config, levels) = legacy_non_boss();
+        let mut sums = simulate_levels(&config, &levels[..1], &DEFAULT_SEEDS);
+        let s = &mut sums[0];
+        s.level_id = LEGACY_LEVEL_COUNT + 1;
+        for (i, r) in s.good.runs.iter_mut().enumerate() {
+            r.cleared = i < clears;
+        }
+        s.good.clear_rate = clear_rate;
+        s.good.median_clear_time = median;
+        s.good.losses_per_run = losses;
+        s.good.sudden_death_share = sd_share;
+        sums
+    }
+
+    #[test]
+    fn easy_generated_level_cleared_quickly_by_the_good_bot_passes() {
+        // Far outside the legacy two-sided bands on the easy side: full clear rate, very short
+        // median, no losses, no sudden death; the casual bot never loses either.
+        let mut sums = generated_summary(8, 1.0, Some(3.0), 0.0, 0.0);
+        let c = &mut sums[0].casual;
+        c.clear_rate = 1.0;
+        c.median_clear_time = Some(3.0);
+        c.losses_per_run = 0.0;
+        c.sudden_death_share = 0.0;
+        for r in &mut c.runs {
+            r.balls_lost = 0;
+        }
+        assert_eq!(fairness_issues(&sums), Vec::<String>::new());
+        // The same numbers on a legacy level still fail the two-sided bands.
+        sums[0].level_id = 1;
+        assert!(!fairness_issues(&sums).is_empty());
+    }
+
+    #[test]
+    fn too_hard_generated_level_fails_on_each_hard_side_limit() {
+        let ok = (4, 0.5, Some(20.0), 0.5, 0.5);
+        let build = |c: usize, r: f32, m: Option<f32>, l: f32, d: f32| {
+            fairness_issues(&generated_summary(c, r, m, l, d))
+        };
+        assert!(build(ok.0, ok.1, ok.2, ok.3, ok.4).is_empty());
+        // Each hard-side limit fails on its own while the others stay reachable and fine.
+        assert!(build(ok.0, ok.1, Some(60.0), ok.3, ok.4)
+            .iter()
+            .any(|i| i.contains("median clear time")));
+        assert!(build(ok.0, ok.1, ok.2, 5.0, ok.4)
+            .iter()
+            .any(|i| i.contains("losses per run")));
+        assert!(build(ok.0, ok.1, ok.2, ok.3, 1.0)
+            .iter()
+            .any(|i| i.contains("sudden-death share")));
+        assert!(build(
+            ok.0,
+            ok.1,
+            ok.2,
+            ok.3,
+            GENERATED_MAX_GOOD_SUDDEN_DEATH_SHARE
+        )
+        .is_empty());
+        assert!(build(ok.0, -1.0, ok.2, ok.3, ok.4)
+            .iter()
+            .any(|i| i.contains("clear rate")));
+        assert!(build(0, 0.0, None, ok.3, ok.4)
+            .iter()
+            .any(|i| i.contains("cleared 0 of")));
+    }
+
+    #[test]
+    fn generated_level_needs_two_of_eight_clears_but_a_boss_needs_one() {
+        let one = fairness_issues(&generated_summary(1, 0.125, Some(20.0), 0.5, 0.5));
+        assert!(one.iter().any(|i| i.contains("cleared 1 of 8")), "{one:?}");
+        let two = fairness_issues(&generated_summary(
+            GENERATED_MIN_GOOD_CLEARS,
+            0.25,
+            Some(20.0),
+            0.5,
+            0.5,
+        ));
+        assert!(two.is_empty(), "{two:?}");
+        let mut boss = generated_summary(1, 0.125, Some(20.0), 0.5, 0.5);
+        boss[0].boss = true;
+        assert!(fairness_issues(&boss).is_empty());
+    }
+
+    #[test]
+    fn block_stats_group_prologue_and_ten_sector_blocks() {
+        let (config, levels) = legacy_non_boss();
+        let mut sums = simulate_levels(&config, &levels[..1], &DEFAULT_SEEDS[..2]);
+        let template = sums[0].clone();
+        let mut put = |id: usize, world: usize, good: f32, median: Option<f32>, casual: f32| {
+            let mut s = template.clone();
+            s.level_id = id;
+            s.world = world;
+            s.good.clear_rate = good;
+            s.good.median_clear_time = median;
+            s.casual.clear_rate = casual;
+            sums.push(s);
+        };
+        put(16, 1, 1.0, Some(10.0), 0.5);
+        put(20, 1, 0.5, Some(20.0), 0.0);
+        put(21, 1, 0.0, None, 0.0);
+        put(101, 2, 1.0, Some(8.0), 1.0);
+        let blocks = block_stats(&sums);
+        let labels: Vec<&str> = blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["prologue", "W1 S11-20", "W1 S21-30", "W2 S1-10"]);
+        assert_eq!(blocks[0].levels, 1);
+        assert_eq!(blocks[1].levels, 2);
+        assert!((blocks[1].good_clear_rate - 0.75).abs() < f32::EPSILON);
+        assert_eq!(blocks[1].good_median_clear_time, Some(15.0));
+        assert!((blocks[1].casual_clear_rate - 0.25).abs() < f32::EPSILON);
+        assert_eq!(blocks[2].good_median_clear_time, None);
+        assert_eq!(block_stats(&sums), blocks);
     }
 }
