@@ -1,0 +1,2 @@
+# Keep the vendored macroquad copy byte-identical to the published package on every checkout.
+vendor/** -text
