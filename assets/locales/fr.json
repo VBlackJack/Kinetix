@@ -13,7 +13,87 @@
     "lang_btn": "[F2] LANGUE",
     "music_btn": "[B] MUSIQUE DYNAMIQUE",
     "locked": "VERROUILLÉ",
-    "best_score": "RECORD ABSOLU"
+    "best_score": "RECORD ABSOLU",
+    "home": {
+      "button": {
+        "campaign": "CAMPAGNE",
+        "satisfaction": "MODE SATISFACTION",
+        "editor": "ÉDITEUR",
+        "options": "OPTIONS",
+        "quit": "QUITTER"
+      }
+    },
+    "common": {
+      "button": {
+        "back": "RETOUR"
+      }
+    },
+    "chapters": {
+      "title": "CHAPITRES",
+      "label": {
+        "progress": "{done}/{total}",
+        "locked": "VERROUILLÉ"
+      }
+    },
+    "sectors": {
+      "title": "{world}",
+      "label": {
+        "page": "{page}/{pages}",
+        "locked": "VERROUILLÉ"
+      }
+    },
+    "options": {
+      "title": "OPTIONS",
+      "label": {
+        "language": "LANGUE",
+        "renderer": "RENDU",
+        "sfx": "EFFETS SONORES",
+        "music": "MUSIQUE"
+      },
+      "value": {
+        "on": "ACTIVÉ",
+        "off": "DÉSACTIVÉ"
+      },
+      "button": {
+        "controls": "COMMANDES"
+      }
+    },
+    "controls": {
+      "title": "COMMANDES"
+    },
+    "pause": {
+      "title": "PAUSE",
+      "button": {
+        "resume": "REPRENDRE",
+        "restart": "RECOMMENCER",
+        "options": "OPTIONS",
+        "quit": "QUITTER VERS LE MENU"
+      }
+    },
+    "satisfaction": {
+      "title": "MODE SATISFACTION",
+      "label": {
+        "subtitle": "AUCUNE PROGRESSION SAUVEGARDÉE, PAS DE CHRONO"
+      }
+    },
+    "library": {
+      "title": "MES NIVEAUX",
+      "button": {
+        "new": "NOUVEAU NIVEAU",
+        "play": "JOUER",
+        "delete": "SUPPRIMER"
+      },
+      "label": {
+        "empty": "AUCUN NIVEAU SAUVEGARDÉ",
+        "count": "{count}/{max}",
+        "default_name": "NIVEAU {n}"
+      },
+      "toast": {
+        "saved": "NIVEAU SAUVEGARDÉ",
+        "full": "BIBLIOTHÈQUE PLEINE",
+        "deleted": "NIVEAU SUPPRIMÉ"
+      }
+    }
   },
   "campaigns": {
     "c1": "MONDE 1 : GRILLE D'IGNITION",
@@ -82,7 +162,10 @@
     "share_prompt": "Code du niveau (à copier pour le partager) :",
     "paste_prompt": "Collez un code de niveau (KTX1:...) :",
     "import_invalid": "CODE DE NIVEAU INVALIDE",
-    "import_too_long": "CODE DE NIVEAU TROP LONG"
+    "import_too_long": "CODE DE NIVEAU TROP LONG",
+    "library": {
+      "save_hint": "[S] Enregistrer dans mes niveaux"
+    }
   },
   "status": {
     "paused": "SYSTÈME EN PAUSE",
@@ -131,5 +214,10 @@
     "solar_magma": "6/8 Magma Solaire (Noyau Volcanique)",
     "arctic_cryo": "7/8 Cryo Arctique (Verre Givré)",
     "synth_sunset": "8/8 Soleil Synth (Horizon Outrun)"
+  },
+  "storage": {
+    "toast": {
+      "save_failed": "ÉCHEC DE LA SAUVEGARDE"
+    }
   }
 }
