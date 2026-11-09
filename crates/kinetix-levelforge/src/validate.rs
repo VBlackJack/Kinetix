@@ -21,6 +21,7 @@
 //! the rules introduced for generated levels (portal count, density, similarity, asymmetry,
 //! name suffixes, name length, world layout). Those rules apply to indices at or above it.
 
+use crate::simulate::SECTORS_PER_BLOCK;
 use kinetix_core::config::LevelDef;
 pub use kinetix_core::config::MAX_LEVEL_NAME_LEN;
 use kinetix_core::level_code::{EDITOR_COLS, EDITOR_ROWS};
@@ -48,6 +49,29 @@ pub const SIMILARITY_MAX: f32 = 0.85;
 pub const MIN_ASYMMETRIC_CELLS: usize = 6;
 /// Minimum percentage of asymmetric (not left-right mirrored) generated levels per world.
 pub const MIN_ASYMMETRIC_PERCENT: usize = 30;
+/// Minimum percentage of exactly left-right mirror-symmetric regular generated levels per world.
+pub const MIN_SYMMETRIC_PERCENT: usize = 30;
+/// A connected component of at most this many non-empty cells is "dust" (a stray fragment).
+pub const DUST_MAX_CELLS: usize = 3;
+/// Dust components allowed in a regular generated level. Legacy measurement (12 regular
+/// levels, components of at most `DUST_MAX_CELLS` cells, 8-connectivity): max 0, median 0 (measured 2026-11-09).
+pub const MAX_DUST: usize = 0;
+/// 8-connected components of non-empty cells allowed in a regular generated level. Legacy
+/// measurement: max 3, median 1 (measured 2026-11-09).
+pub const MAX_COMPONENTS_8: usize = 4;
+/// Colour regions (8-connected same-character regions) per non-empty cell allowed in a regular
+/// generated level. Legacy measurement: max 0.390, median 0.32 (measured 2026-11-09; the rejected noisy
+/// candidate pack has a median of about 0.55).
+pub const MAX_COLOUR_REGIONS_PER_CELL: f32 = 0.42;
+/// A non-empty row string may appear in at most this many generated levels (about 2% of 800);
+/// a row whose non-empty cells are one char in one contiguous run is exempt.
+pub const MAX_ROW_REUSE: usize = 16;
+/// Generated names must not start with this word, except the level carrying
+/// `FINAL_BOSS_SUFFIX`.
+pub const RESERVED_NAME_PREFIX: &str = "FINAL";
+/// Debut world of each mechanic cell: the first generated level using it must be a regular
+/// level in the first `SECTORS_PER_BLOCK` sectors of that world, and none may use it earlier.
+pub const MECHANIC_DEBUTS: [(char, usize); 5] = [('G', 2), ('M', 3), ('T', 4), ('B', 5), ('R', 6)];
 /// Name suffix of a boss level.
 pub const BOSS_SUFFIX: &str = " [BOSS]";
 /// Name suffix of the last level of a pack that contains generated levels.
@@ -237,6 +261,81 @@ pub fn is_asymmetric(level: &LevelDef) -> bool {
     mirror_mismatch_cells(level) >= MIN_ASYMMETRIC_CELLS
 }
 
+/// A level is exactly mirror-symmetric when no cell differs from its left-right counterpart.
+pub fn is_mirror_symmetric(level: &LevelDef) -> bool {
+    !level.rows.is_empty() && mirror_mismatch_cells(level) == 0
+}
+
+/// Cells that take part in the shape metrics: everything except empty cells and portals.
+fn is_shape_cell(ch: char) -> bool {
+    !matches!(ch, '0' | 'T' | ' ')
+}
+
+/// Sizes of the 8-connected regions of shape cells; two neighbouring shape cells share a
+/// region when `joins` accepts their chars.
+fn region_sizes(rows: &[String], joins: fn(char, char) -> bool) -> Vec<usize> {
+    let grid: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+    let mut seen: Vec<Vec<bool>> = grid.iter().map(|r| vec![false; r.len()]).collect();
+    let mut sizes = Vec::new();
+    for r0 in 0..grid.len() {
+        for c0 in 0..grid[r0].len() {
+            if seen[r0][c0] || !is_shape_cell(grid[r0][c0]) {
+                continue;
+            }
+            seen[r0][c0] = true;
+            let mut stack = vec![(r0, c0)];
+            let mut size = 0usize;
+            while let Some((r, c)) = stack.pop() {
+                size += 1;
+                for dr in -1isize..=1 {
+                    for dc in -1isize..=1 {
+                        let nr = r as isize + dr;
+                        let nc = c as isize + dc;
+                        if (dr == 0 && dc == 0) || nr < 0 || nc < 0 {
+                            continue;
+                        }
+                        let (nr, nc) = (nr as usize, nc as usize);
+                        if nr >= grid.len()
+                            || nc >= grid[nr].len()
+                            || seen[nr][nc]
+                            || !is_shape_cell(grid[nr][nc])
+                            || !joins(grid[r][c], grid[nr][nc])
+                        {
+                            continue;
+                        }
+                        seen[nr][nc] = true;
+                        stack.push((nr, nc));
+                    }
+                }
+            }
+            sizes.push(size);
+        }
+    }
+    sizes
+}
+
+/// `(dust, components)` of a grid: 8-connected components of non-empty cells (every char except
+/// `0` and `T`), of which dust is the number holding at most `DUST_MAX_CELLS` cells.
+pub fn dust_and_components(rows: &[String]) -> (usize, usize) {
+    let sizes = region_sizes(rows, |_, _| true);
+    let dust = sizes.iter().filter(|&&s| s <= DUST_MAX_CELLS).count();
+    (dust, sizes.len())
+}
+
+/// Colour regions (8-connected same-char regions of non-empty cells) divided by the number of
+/// non-empty cells; 0 for a grid without non-empty cells.
+pub fn colour_regions_per_cell(rows: &[String]) -> f32 {
+    let cells = rows
+        .iter()
+        .flat_map(|r| r.chars())
+        .filter(|&c| is_shape_cell(c))
+        .count();
+    if cells == 0 {
+        return 0.0;
+    }
+    region_sizes(rows, |a, b| a == b).len() as f32 / cells as f32
+}
+
 fn push_error(errors: &mut Vec<ValidationError>, level_id: usize, message: String) {
     errors.push(ValidationError { level_id, message });
 }
@@ -286,6 +385,22 @@ fn check_generated_name(errors: &mut Vec<ValidationError>, level: &LevelDef, is_
             errors,
             lid,
             format!("boss name {name:?} has a {stem_len} chars stem (max {BOSS_STEM_MAX_LEN})"),
+        );
+    }
+    if name.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+        push_error(
+            errors,
+            lid,
+            format!("name {name:?} must not end with a digit"),
+        );
+    }
+    if name.starts_with(RESERVED_NAME_PREFIX) && !name.ends_with(FINAL_BOSS_SUFFIX) {
+        push_error(
+            errors,
+            lid,
+            format!(
+                "name {name:?} must not start with {RESERVED_NAME_PREFIX:?} (reserved for the final boss)"
+            ),
         );
     }
     let len = name.chars().count();
@@ -519,6 +634,36 @@ fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
             );
         }
 
+        if generated && !level.boss {
+            let (dust, components) = dust_and_components(&level.rows);
+            if dust > MAX_DUST {
+                push_error(
+                    &mut errors,
+                    lid,
+                    format!(
+                        "{dust} dust fragments (components of at most {DUST_MAX_CELLS} cells), max {MAX_DUST}"
+                    ),
+                );
+            }
+            if components > MAX_COMPONENTS_8 {
+                push_error(
+                    &mut errors,
+                    lid,
+                    format!("{components} connected components, max {MAX_COMPONENTS_8}"),
+                );
+            }
+            let regions = colour_regions_per_cell(&level.rows);
+            if regions > MAX_COLOUR_REGIONS_PER_CELL {
+                push_error(
+                    &mut errors,
+                    lid,
+                    format!(
+                        "colour fragmentation {regions:.2} regions per cell, max {MAX_COLOUR_REGIONS_PER_CELL}"
+                    ),
+                );
+            }
+        }
+
         if level.boss {
             if level.rows.len() < BOSS_CLEAR_ROWS {
                 push_error(
@@ -547,7 +692,113 @@ fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
     check_world_count(&mut errors, levels);
     check_similarity(&mut errors, levels, first_idx);
     check_asymmetry(&mut errors, levels, scope.planned_total);
+    check_row_reuse(&mut errors, levels, first_idx);
+    check_mechanic_order(&mut errors, levels, first_idx);
     errors
+}
+
+/// Whether a row is exempt from the reuse cap: blank, or its shape cells (portals ignored, as in
+/// the shape metrics) are one char in one contiguous run.
+fn is_reuse_exempt(row: &str) -> bool {
+    let cells: Vec<char> = row.chars().collect();
+    let is_set = |c: &char| is_shape_cell(*c);
+    let Some(start) = cells.iter().position(is_set) else {
+        return true;
+    };
+    let end = cells.iter().rposition(is_set).unwrap_or(start);
+    cells[start..=end].iter().all(|&c| c == cells[start])
+}
+
+/// A non-exempt row string may appear in at most `MAX_ROW_REUSE` generated levels.
+fn check_row_reuse(errors: &mut Vec<ValidationError>, levels: &[LevelDef], first_idx: usize) {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for level in levels.iter().skip(LEGACY_LEVEL_COUNT) {
+        let distinct: BTreeSet<&str> = level
+            .rows
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !is_reuse_exempt(r))
+            .collect();
+        for row in distinct {
+            *counts.entry(row).or_default() += 1;
+        }
+    }
+    for level in levels.iter().skip(first_idx.max(LEGACY_LEVEL_COUNT)) {
+        let worst = level
+            .rows
+            .iter()
+            .filter(|r| !is_reuse_exempt(r))
+            .map(|r| (r, counts.get(r.as_str()).copied().unwrap_or(0)))
+            .find(|&(_, n)| n > MAX_ROW_REUSE);
+        if let Some((row, n)) = worst {
+            push_error(
+                errors,
+                level.id,
+                format!("row {row:?} is reused by {n} generated levels (max {MAX_ROW_REUSE})"),
+            );
+        }
+    }
+}
+
+/// Mechanic teaching order over generated levels (see `MECHANIC_DEBUTS`): none before its
+/// debut world, the first use is a regular level in the first block of the debut world, and a
+/// complete debut world must contain it.
+fn check_mechanic_order(errors: &mut Vec<ValidationError>, levels: &[LevelDef], first_idx: usize) {
+    for &(mechanic, debut) in &MECHANIC_DEBUTS {
+        let mut first_use: Option<usize> = None;
+        for (idx, level) in levels.iter().enumerate().skip(LEGACY_LEVEL_COUNT) {
+            if !level.rows.iter().any(|r| r.contains(mechanic)) {
+                continue;
+            }
+            let world = campaign_world(idx);
+            if idx >= first_idx && world < debut {
+                push_error(
+                    errors,
+                    level.id,
+                    format!("mechanic {mechanic:?} is used before its debut world {debut}"),
+                );
+            }
+            if first_use.is_none() {
+                first_use = Some(idx);
+                let sector = idx - (world - 1) * SECTORS_PER_WORLD;
+                if idx >= first_idx && world == debut {
+                    if level.boss {
+                        push_error(
+                            errors,
+                            level.id,
+                            format!("mechanic {mechanic:?} is introduced by a boss level"),
+                        );
+                    } else if sector >= SECTORS_PER_BLOCK {
+                        push_error(
+                            errors,
+                            level.id,
+                            format!(
+                                "mechanic {mechanic:?} is introduced at sector {}, after the first {SECTORS_PER_BLOCK} of world {debut}",
+                                sector + 1
+                            ),
+                        );
+                    }
+                } else if idx >= first_idx && world > debut {
+                    push_error(
+                        errors,
+                        level.id,
+                        format!(
+                            "mechanic {mechanic:?} first appears in world {world}, after its debut world {debut}"
+                        ),
+                    );
+                }
+            }
+        }
+        let debut_end = debut * SECTORS_PER_WORLD;
+        let introduced = first_use.is_some_and(|idx| campaign_world(idx) <= debut);
+        if levels.len() >= debut_end && !introduced && debut_end > first_idx {
+            push_error(
+                errors,
+                levels[debut_end - 1].id,
+                format!("mechanic {mechanic:?} never appears in its debut world {debut}"),
+            );
+        }
+    }
 }
 
 fn check_world_count(errors: &mut Vec<ValidationError>, levels: &[LevelDef]) {
@@ -599,30 +850,87 @@ fn check_similarity(errors: &mut Vec<ValidationError>, levels: &[LevelDef], firs
     }
 }
 
-/// Every world that contains generated levels needs a share of asymmetric ones. While a pack
-/// is being built (`planned_total` beyond `levels.len()`), the share only has to remain
-/// reachable if every still-missing level of that world turned out asymmetric.
+/// Smallest count that reaches `percent` of `total`.
+fn share_needed(total: usize, percent: usize) -> usize {
+    (total * percent).div_ceil(PERCENT)
+}
+
+/// Per-world tallies of the generated levels, used by [`check_asymmetry`].
+struct WorldCounts {
+    first_id: usize,
+    total: usize,
+    regular: usize,
+    asymmetric: usize,
+    symmetric: usize,
+}
+
+/// Every world that contains generated levels needs a share of asymmetric levels and a share of
+/// exactly mirror-symmetric regular levels. While a pack is being built (`planned_total` beyond
+/// `levels.len()`), the shares only have to remain reachable together: the levels still missing
+/// from the world must be able to cover both shortfalls (an upper bound that assumes every
+/// missing level is a regular one).
 fn check_asymmetry(errors: &mut Vec<ValidationError>, levels: &[LevelDef], planned_total: usize) {
-    // world -> (first generated level id, generated count, asymmetric count)
-    let mut per_world: BTreeMap<usize, (usize, usize, usize)> = BTreeMap::new();
+    let mut per_world: BTreeMap<usize, WorldCounts> = BTreeMap::new();
     for level in levels.iter().skip(LEGACY_LEVEL_COUNT) {
-        let entry = per_world.entry(level.world).or_insert((level.id, 0, 0));
-        entry.1 += 1;
+        let entry = per_world.entry(level.world).or_insert(WorldCounts {
+            first_id: level.id,
+            total: 0,
+            regular: 0,
+            asymmetric: 0,
+            symmetric: 0,
+        });
+        entry.total += 1;
         if is_asymmetric(level) {
-            entry.2 += 1;
+            entry.asymmetric += 1;
+        }
+        if !level.boss {
+            entry.regular += 1;
+            if is_mirror_symmetric(level) {
+                entry.symmetric += 1;
+            }
         }
     }
-    for (world, (first_id, total, asymmetric)) in per_world {
+    for (world, counts) in per_world {
         let world_start = (world.saturating_sub(1) * SECTORS_PER_WORLD).max(LEGACY_LEVEL_COUNT);
         let world_end = (world * SECTORS_PER_WORLD).min(planned_total);
-        let missing = world_end.saturating_sub(world_start).saturating_sub(total);
-        let planned = total + missing;
-        if (asymmetric + missing) * PERCENT < planned * MIN_ASYMMETRIC_PERCENT {
+        let missing = world_end
+            .saturating_sub(world_start)
+            .saturating_sub(counts.total);
+        let planned = counts.total + missing;
+        let planned_regular = counts.regular + missing;
+        let need_asymmetric =
+            share_needed(planned, MIN_ASYMMETRIC_PERCENT).saturating_sub(counts.asymmetric);
+        let need_symmetric =
+            share_needed(planned_regular, MIN_SYMMETRIC_PERCENT).saturating_sub(counts.symmetric);
+        if need_asymmetric > missing {
             push_error(
                 errors,
-                first_id,
+                counts.first_id,
                 format!(
-                    "world {world}: only {asymmetric}/{total} generated levels are asymmetric (min {MIN_ASYMMETRIC_PERCENT}% of {planned})"
+                    "world {world}: only {}/{} generated levels are asymmetric (min {MIN_ASYMMETRIC_PERCENT}% of {planned})",
+                    counts.asymmetric, counts.total
+                ),
+            );
+        }
+        if need_symmetric > missing {
+            push_error(
+                errors,
+                counts.first_id,
+                format!(
+                    "world {world}: only {}/{} regular levels are exactly mirror-symmetric (min {MIN_SYMMETRIC_PERCENT}% of {planned_regular})",
+                    counts.symmetric, counts.regular
+                ),
+            );
+        }
+        if need_asymmetric <= missing
+            && need_symmetric <= missing
+            && need_asymmetric + need_symmetric > missing
+        {
+            push_error(
+                errors,
+                counts.first_id,
+                format!(
+                    "world {world}: {need_symmetric} more symmetric and {need_asymmetric} more asymmetric levels are needed but only {missing} slots remain"
                 ),
             );
         }
@@ -638,9 +946,22 @@ mod tests {
     /// Fill probability (out of 100) of the pseudo-random test patterns.
     const TEST_FILL_PERCENT: u64 = 62;
 
+    /// Levels per world in the shipped legacy layout.
+    const LEGACY_LEVELS_PER_WORLD: usize = 5;
+
+    /// The shipped legacy reference levels with their legacy world layout, whatever else the
+    /// installed pack holds after them.
     fn legacy_pack() -> Vec<LevelDef> {
         let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels.json");
         pack.levels
+            .into_iter()
+            .take(LEGACY_LEVEL_COUNT)
+            .enumerate()
+            .map(|(idx, mut level)| {
+                level.world = idx / LEGACY_LEVELS_PER_WORLD + 1;
+                level
+            })
+            .collect()
     }
 
     /// Deterministic pseudo-random rows: asymmetric, dense, no steel, no portals.
@@ -669,14 +990,102 @@ mod tests {
         rows
     }
 
+    /// Rows per designed test level.
+    const DESIGNED_ROWS: usize = 6;
+    /// Margin profiles (cells left empty on each side of a symmetric row), one per seed modulo
+    /// the number of profiles, so consecutive seeds get clearly different shapes.
+    const DESIGNED_PROFILES: [[usize; DESIGNED_ROWS]; 5] = [
+        [1, 1, 2, 2, 3, 3],
+        [3, 3, 2, 2, 1, 1],
+        [1, 2, 3, 3, 2, 1],
+        [3, 2, 1, 1, 2, 3],
+        [1, 3, 1, 3, 1, 3],
+    ];
+    /// Number of colours cycled by the designed rows.
+    const DESIGNED_COLOURS: u64 = 4;
+    /// Seeds whose remainder modulo `DESIGNED_SEED_PERIOD` equals `DESIGNED_ASYMMETRIC_REMAINDER`
+    /// get an asymmetric designed level; the others are mirror-symmetric.
+    const DESIGNED_SEED_PERIOD: u64 = 3;
+    const DESIGNED_ASYMMETRIC_REMAINDER: u64 = 1;
+    /// An asymmetric row keeps its profile margin minus this on one side and plus
+    /// `DESIGNED_SHIFT_RIGHT` on the other, so it differs from its mirror by 3 cells per side.
+    const DESIGNED_SHIFT_LEFT: usize = 1;
+    const DESIGNED_SHIFT_RIGHT: usize = 2;
+    /// Letters of the alphabet, for digit-free test names.
+    const ALPHABET: u64 = 26;
+
+    /// Digit-free name: `prefix` and the base-26 letters of `k`.
+    fn letter_name(prefix: &str, k: usize) -> String {
+        let mut n = k as u64;
+        let mut letters = String::new();
+        loop {
+            letters.insert(0, char::from(b'A' + (n % ALPHABET) as u8));
+            n /= ALPHABET;
+            if n == 0 {
+                break;
+            }
+        }
+        format!("{prefix} {letters}")
+    }
+
+    /// One run of a single colour per row, rows overlapping: a few big colour regions, one
+    /// component, no dust. Symmetric runs are centred; asymmetric ones are shifted to one side.
+    fn designed_rows(seed: u64, symmetric: bool) -> Vec<String> {
+        let profile = DESIGNED_PROFILES[(seed % DESIGNED_PROFILES.len() as u64) as usize];
+        let flip = (seed / DESIGNED_PROFILES.len() as u64) % 2 == 1;
+        profile
+            .iter()
+            .enumerate()
+            .map(|(r, &margin)| {
+                let (left, right) = if symmetric {
+                    (margin, margin)
+                } else if flip {
+                    (margin + DESIGNED_SHIFT_RIGHT, margin - DESIGNED_SHIFT_LEFT)
+                } else {
+                    (margin - DESIGNED_SHIFT_LEFT, margin + DESIGNED_SHIFT_RIGHT)
+                };
+                let colour =
+                    char::from_digit(((seed + r as u64) % DESIGNED_COLOURS) as u32 + 1, 10)
+                        .unwrap_or('1');
+                (0..EDITOR_COLS)
+                    .map(|c| {
+                        if c >= left && c < EDITOR_COLS - right {
+                            colour
+                        } else {
+                            '0'
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Whether the designed level of `seed` is mirror-symmetric.
+    fn designed_is_symmetric(seed: u64) -> bool {
+        seed % DESIGNED_SEED_PERIOD != DESIGNED_ASYMMETRIC_REMAINDER
+    }
+
+    /// A boss gets noisy random rows; a regular level a designed one that satisfies every
+    /// generated-level rule.
     fn make_level(idx: usize, name: &str, boss: bool, seed: u64) -> LevelDef {
         LevelDef {
             id: idx + 1,
             world: idx / SECTORS_PER_WORLD + 1,
             name: name.to_string(),
             boss,
-            rows: random_rows(seed, boss),
+            rows: if boss {
+                random_rows(seed, true)
+            } else {
+                designed_rows(seed, designed_is_symmetric(seed))
+            },
         }
+    }
+
+    /// Like `make_level` with an explicit symmetry choice.
+    fn make_designed(idx: usize, name: &str, seed: u64, symmetric: bool) -> LevelDef {
+        let mut level = make_level(idx, name, false, seed);
+        level.rows = designed_rows(seed, symmetric);
+        level
     }
 
     /// Legacy pack plus `extra` regular generated levels and a final boss.
@@ -689,7 +1098,7 @@ mod tests {
             let idx = levels.len();
             levels.push(make_level(
                 idx,
-                &format!("TEST SECTOR {k}"),
+                &letter_name("TEST SECTOR", k),
                 false,
                 1000 + k as u64,
             ));
@@ -909,7 +1318,7 @@ mod tests {
             let idx = pack.len();
             pack.push(make_level(
                 idx,
-                &format!("W SECTOR {next}"),
+                &letter_name("W SECTOR", next),
                 false,
                 5000 + next as u64,
             ));
@@ -1051,5 +1460,311 @@ mod tests {
         // Without a portal inside, the sealed chamber is rejected.
         pack[15].rows[2] = "11111#111#11111".to_string();
         assert!(has_error(&validate_pack(&pack), "unreachable"));
+    }
+
+    fn rows_of(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|r| r.to_string()).collect()
+    }
+
+    /// Legacy levels (world 1) plus regular designed levels up to `total` levels, no final boss.
+    fn regular_pack(total: usize) -> Vec<LevelDef> {
+        let mut levels = legacy_pack();
+        for level in &mut levels {
+            level.world = 1;
+        }
+        while levels.len() < total {
+            let idx = levels.len();
+            let seed = 2000 + idx as u64;
+            levels.push(make_level(
+                idx,
+                &letter_name("FILLER SECTOR", idx),
+                false,
+                seed,
+            ));
+        }
+        levels
+    }
+
+    /// Sets one cell of a level's first row.
+    fn put_cell(level: &mut LevelDef, col: usize, ch: char) {
+        level.rows[0].replace_range(col..col + 1, &ch.to_string());
+    }
+
+    #[test]
+    fn dust_and_components_are_counted_on_eight_connectivity() {
+        let solid = rows_of(&["111100000000000", "111100000000000"]);
+        assert_eq!(dust_and_components(&solid), (0, 1));
+        // A diagonal touch joins two cells into one component.
+        let diagonal = rows_of(&["100000000000000", "010000000000000"]);
+        assert_eq!(dust_and_components(&diagonal), (1, 1));
+        // A lone cell and a 3-cell fragment are dust, a 4-cell block is not; portals are ignored.
+        let mixed = rows_of(&["100011100001100", "00000000000000T"]);
+        assert_eq!(dust_and_components(&mixed), (3, 3));
+        let block = rows_of(&["110000000000000", "110000000000000"]);
+        assert_eq!(dust_and_components(&block), (0, 1));
+    }
+
+    #[test]
+    fn generated_regular_level_with_dust_is_rejected_but_a_boss_is_exempt() {
+        let pack = extended_pack(3);
+        assert!(!has_error(&validate_pack(&pack), "dust"));
+        // A lone cell far from the body of a regular level.
+        let mut dusty = pack.clone();
+        dusty[15].rows[0] = "100000000000000".to_string();
+        dusty[15].rows[1] = "0".repeat(EDITOR_COLS);
+        assert!(has_error(&validate_pack(&dusty), "dust fragments"));
+        // The final boss of the baseline pack is full of fragments and still passes.
+        let last = pack.last().expect("final boss");
+        assert!(dust_and_components(&last.rows).0 > MAX_DUST);
+        assert!(!validate_pack(&pack).iter().any(|e| e.level_id == last.id));
+    }
+
+    #[test]
+    fn too_many_components_are_rejected() {
+        let blocks = |count: usize| -> Vec<String> {
+            let row: String = (0..EDITOR_COLS)
+                .map(|c| if c % 3 < 2 && c / 3 < count { '1' } else { '0' })
+                .collect();
+            vec![row; 3]
+        };
+        assert_eq!(
+            dust_and_components(&blocks(MAX_COMPONENTS_8)).1,
+            MAX_COMPONENTS_8
+        );
+        let mut pack = extended_pack(3);
+        pack[15].rows = blocks(MAX_COMPONENTS_8);
+        assert!(!has_error(&validate_pack(&pack), "connected components"));
+        pack[15].rows = blocks(MAX_COMPONENTS_8 + 1);
+        assert!(has_error(&validate_pack(&pack), "connected components"));
+    }
+
+    #[test]
+    fn colour_fragmentation_is_rejected() {
+        // Four colours in 2x2 tiles: no two neighbours share a colour, every cell is a region.
+        let tiles: Vec<String> = (0..DESIGNED_ROWS)
+            .map(|r| {
+                (0..EDITOR_COLS)
+                    .map(|c| char::from_digit(((r % 2) * 2 + c % 2 + 1) as u32, 10).unwrap_or('1'))
+                    .collect()
+            })
+            .collect();
+        assert!(colour_regions_per_cell(&tiles) > MAX_COLOUR_REGIONS_PER_CELL);
+        let mut pack = extended_pack(3);
+        pack[15].rows = tiles;
+        assert!(has_error(&validate_pack(&pack), "colour fragmentation"));
+        // Bands of one colour per row are calm.
+        let bands = designed_rows(1002, true);
+        assert!(colour_regions_per_cell(&bands) <= MAX_COLOUR_REGIONS_PER_CELL);
+        assert!(!has_error(
+            &validate_pack(&extended_pack(3)),
+            "colour fragmentation"
+        ));
+        assert_eq!(colour_regions_per_cell(&rows_of(&["000", "0T0"])), 0.0);
+    }
+
+    #[test]
+    fn mirror_symmetry_is_exact() {
+        let sym = make_designed(20, "SYM", 1002, true);
+        let asym = make_designed(21, "ASYM", 1002, false);
+        assert!(is_mirror_symmetric(&sym));
+        assert!(!is_mirror_symmetric(&asym));
+        let mut nearly = sym.clone();
+        put_cell(&mut nearly, 4, '2');
+        assert!(!is_mirror_symmetric(&nearly));
+    }
+
+    #[test]
+    fn symmetric_share_per_world_is_enforced() {
+        let mut pack = extended_pack(5);
+        for k in 0..5 {
+            let idx = LEGACY_LEVEL_COUNT + k;
+            pack[idx] = make_designed(idx, &letter_name("TEST SECTOR", k), 1000 + k as u64, false);
+        }
+        assert!(has_error(&validate_pack(&pack), "mirror-symmetric"));
+        assert!(!has_error(
+            &validate_pack(&extended_pack(5)),
+            "mirror-symmetric"
+        ));
+    }
+
+    #[test]
+    fn candidate_mode_checks_both_symmetry_shares_together() {
+        // Two slots of the world are used (one symmetric, one asymmetric) and the candidate is
+        // neither; one slot remains but one symmetric and one asymmetric level are still needed.
+        let mut prefix = legacy_pack();
+        for level in &mut prefix {
+            level.world = 1;
+        }
+        prefix.push(make_designed(15, "ONE SECTOR", 1000, true));
+        prefix.push(make_designed(16, "TWO SECTOR", 1001, false));
+        let total = LEGACY_LEVEL_COUNT + 4;
+        let mut neither = make_designed(17, "THREE SECTOR", 1002, true);
+        put_cell(&mut neither, 4, '2');
+        assert!(!is_mirror_symmetric(&neither) && !is_asymmetric(&neither));
+        let errors = validate_candidate(&prefix, &neither, false, total);
+        assert!(has_error(&errors, "slots remain"), "{errors:#?}");
+        // A symmetric candidate leaves one slot for the one asymmetric level still needed.
+        let sym = make_designed(17, "THREE SECTOR", 1002, true);
+        let errors = validate_candidate(&prefix, &sym, false, total);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_row_is_reused_by_at_most_sixteen_levels() {
+        let reused = "120120120120120";
+        let mut pack = extended_pack(MAX_ROW_REUSE + 2);
+        for level in pack.iter_mut().skip(LEGACY_LEVEL_COUNT).take(MAX_ROW_REUSE) {
+            level.rows[1] = reused.to_string();
+        }
+        assert!(!has_error(&validate_pack(&pack), "reused by"));
+        pack[LEGACY_LEVEL_COUNT + MAX_ROW_REUSE].rows[1] = reused.to_string();
+        let errors = validate_pack(&pack);
+        assert!(
+            has_error(&errors, "reused by 17 generated levels"),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn single_run_rows_and_legacy_rows_are_exempt_from_reuse() {
+        assert!(is_reuse_exempt("000000000000000"));
+        assert!(is_reuse_exempt("111111111111111"));
+        assert!(is_reuse_exempt("000333330000000"));
+        assert!(!is_reuse_exempt("110011000000000"));
+        assert!(!is_reuse_exempt("111222000000000"));
+        // A portal is not a shape cell: it neither breaks a blank row nor counts as a run.
+        assert!(is_reuse_exempt("T00000000000T00"));
+        assert!(is_reuse_exempt("T00333330000T00"));
+        assert!(!is_reuse_exempt("T0033T330000000"));
+        let mut pack = extended_pack(MAX_ROW_REUSE + 2);
+        for level in pack.iter_mut().skip(LEGACY_LEVEL_COUNT) {
+            level.rows[1] = "000333330000000".to_string();
+        }
+        assert!(!has_error(&validate_pack(&pack), "reused by"));
+        // Legacy levels do not count toward the cap.
+        let mut pack = extended_pack(MAX_ROW_REUSE);
+        let row = "120120120120120".to_string();
+        for level in pack.iter_mut().take(LEGACY_LEVEL_COUNT) {
+            level.rows[0] = row.clone();
+        }
+        for level in pack
+            .iter_mut()
+            .skip(LEGACY_LEVEL_COUNT)
+            .take(MAX_ROW_REUSE - 1)
+        {
+            level.rows[1] = row.clone();
+        }
+        assert!(!has_error(&validate_pack(&pack), "reused by"));
+    }
+
+    #[test]
+    fn generated_names_end_without_a_digit_and_do_not_start_with_final() {
+        let mut pack = extended_pack(3);
+        pack[15].name = "SECTOR 7".to_string();
+        assert!(has_error(
+            &validate_pack(&pack),
+            "must not end with a digit"
+        ));
+        pack[15].name = "SECTOR SEVEN".to_string();
+        assert!(!has_error(
+            &validate_pack(&pack),
+            "must not end with a digit"
+        ));
+
+        pack[15].name = "FINAL APPROACH".to_string();
+        assert!(has_error(&validate_pack(&pack), "must not start with"));
+        pack[15].name = "THE FINAL APPROACH".to_string();
+        assert!(!has_error(&validate_pack(&pack), "must not start with"));
+        // The level carrying the final boss suffix may start with the word.
+        let last = pack.len() - 1;
+        pack[last].name = "FINAL TEST [FINAL BOSS]".to_string();
+        assert!(!has_error(&validate_pack(&pack), "must not start with"));
+        // Legacy names are exempt.
+        let mut pack = extended_pack(3);
+        pack[1].name = "LEGACY 9".to_string();
+        assert!(!has_error(
+            &validate_pack(&pack),
+            "must not end with a digit"
+        ));
+    }
+
+    #[test]
+    fn mechanics_are_rejected_before_their_debut_world() {
+        let mut pack = regular_pack(LEGACY_LEVEL_COUNT + 3);
+        put_cell(&mut pack[16], 7, 'G');
+        let errors = validate_pack(&pack);
+        assert!(
+            has_error(&errors, "before its debut world 2"),
+            "{errors:#?}"
+        );
+        // Legacy levels keep their mechanics (the shipped pack uses them in early worlds).
+        assert!(!has_error(
+            &validate_pack(&regular_pack(LEGACY_LEVEL_COUNT + 3)),
+            "debut world"
+        ));
+    }
+
+    #[test]
+    fn a_mechanic_debuts_in_the_first_block_of_its_world_on_a_regular_level() {
+        let first_of_world_2 = SECTORS_PER_WORLD;
+        let build = |idx: usize, boss: bool| {
+            let mut pack = regular_pack(2 * SECTORS_PER_WORLD);
+            put_cell(&mut pack[idx], 7, 'G');
+            pack[idx].boss = boss;
+            validate_pack(&pack)
+        };
+        let ok = build(first_of_world_2, false);
+        assert!(!has_error(&ok, "mechanic 'G'"), "{ok:#?}");
+        let last_of_block = build(first_of_world_2 + SECTORS_PER_BLOCK - 1, false);
+        assert!(
+            !has_error(&last_of_block, "mechanic 'G'"),
+            "{last_of_block:#?}"
+        );
+        let late = build(first_of_world_2 + SECTORS_PER_BLOCK, false);
+        assert!(has_error(&late, "after the first"), "{late:#?}");
+        let boss = build(first_of_world_2 + 1, true);
+        assert!(has_error(&boss, "introduced by a boss"), "{boss:#?}");
+    }
+
+    #[test]
+    fn a_complete_debut_world_must_contain_its_mechanic() {
+        let pack = regular_pack(2 * SECTORS_PER_WORLD);
+        assert!(has_error(
+            &validate_pack(&pack),
+            "never appears in its debut world 2"
+        ));
+        // An unfinished debut world is not judged.
+        let pack = regular_pack(2 * SECTORS_PER_WORLD - 1);
+        assert!(!has_error(&validate_pack(&pack), "never appears"));
+        // Later in the pack is too late.
+        let mut pack = regular_pack(3 * SECTORS_PER_WORLD);
+        put_cell(&mut pack[2 * SECTORS_PER_WORLD], 7, 'G');
+        let errors = validate_pack(&pack);
+        assert!(has_error(&errors, "after its debut world 2"), "{errors:#?}");
+        assert!(has_error(&errors, "never appears in its debut world 2"));
+    }
+
+    #[test]
+    fn candidate_mode_judges_a_mechanic_introduction() {
+        let prefix = regular_pack(SECTORS_PER_WORLD + SECTORS_PER_BLOCK);
+        let total = 2 * SECTORS_PER_WORLD;
+        let idx = prefix.len();
+        let mut late = make_level(idx, "LATE GLASS", false, 3001);
+        put_cell(&mut late, 7, 'G');
+        assert!(has_error(
+            &validate_candidate(&prefix, &late, false, total),
+            "after the first"
+        ));
+
+        let prefix = regular_pack(SECTORS_PER_WORLD + 1);
+        let idx = prefix.len();
+        let mut early = make_level(idx, "EARLY GLASS", false, 3002);
+        put_cell(&mut early, 7, 'G');
+        let errors = validate_candidate(&prefix, &early, false, total);
+        assert!(!has_error(&errors, "mechanic"), "{errors:#?}");
+        let mut boss = make_level(idx, "EARLY GLASS [BOSS]", true, 3003);
+        boss.rows[BOSS_CLEAR_ROWS] = format!("{}G{}", "0".repeat(7), "0".repeat(EDITOR_COLS - 8));
+        let errors = validate_candidate(&prefix, &boss, false, total);
+        assert!(has_error(&errors, "introduced by a boss"), "{errors:#?}");
     }
 }
