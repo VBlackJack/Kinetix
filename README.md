@@ -2,13 +2,27 @@
 
 > [Lire en francais](README.fr.md)
 
-**KINETIX** is a modern, high-velocity brick breaker written in Rust, with deterministic physics, hot-swappable visual renderers, and multi-platform targets (WebAssembly, Windows, Linux, Android).
+**KINETIX** is a modern, high-velocity brick breaker written in Rust, with deterministic physics, an 800-sector campaign across 8 worlds, hot-swappable visual renderers, and multi-platform targets (WebAssembly, Windows, Linux, Android).
 
 ## Architecture
 
 - [`crates/kinetix-core`](crates/kinetix-core): Pure Rust deterministic physics engine, sub-stepped collision detection, power-up synergies, JSON configuration, and i18n catalog (`en` / `fr`).
 - [`crates/kinetix-app`](crates/kinetix-app): Cross-platform hardware-accelerated renderer (`Macroquad` WebGL / Desktop / Android), real-time switchable visual themes, particle & shockwave systems.
+- [`crates/kinetix-levelforge`](crates/kinetix-levelforge): Headless campaign generator, structural validator, and deterministic bot simulator (`good` and `casual` presets).
 - [`assets/`](assets): Externalized configuration (`game_config.json`, `themes.json`, `levels.json`) and localization catalogs (`locales/en.json`, `locales/fr.json`).
+
+## Campaign Worlds (800 Sectors)
+
+The campaign spans 800 sectors across 8 worlds of 100 sectors each, with mid-world boss arenas at sector 50 of each world and world-finale boss arenas at sector 100 of each world:
+
+1. **World 1: Ignition Grid** (Sectors 1-100) - includes the 15 legacy prologue sectors and generated thermal reactor sectors.
+2. **World 2: Quantum Warp** (Sectors 101-200) - ghost silhouettes (`G`) and phase corridors.
+3. **World 3: Omega Forge** (Sectors 201-300) - moving conveyor lanes (`M`) and steel anvil bastions (`#`).
+4. **World 4: Cryo Matrix** (Sectors 301-400) - paired portal shortcuts (`T`) and frost lattices.
+5. **World 5: Solar Citadel** (Sectors 401-500) - bumper pinball bays (`B`) and explosive caldera chains (`E`).
+6. **World 6: Prism Labyrinth** (Sectors 501-600) - regenerating crystal shields (`R`) and prism facets.
+7. **World 7: Void Horizon** (Sectors 601-700) - multi-mechanic synthesis across asymmetric void arenas.
+8. **World 8: Singularity Throne** (Sectors 701-800) - endgame gauntlet culminating in `APEX ARCHON [FINAL BOSS]` at Sector 800.
 
 ## Visual Renderers (Hot-Swappable via `F1`)
 
@@ -39,19 +53,25 @@ cargo run -p kinetix-app
 # Run test suite
 cargo test
 
+# Validate and simulate the campaign level pack
+cargo run --release -p kinetix-levelforge -- validate
+cargo run --release -p kinetix-levelforge -- simulate
+
 # Build and serve WebAssembly version on http://localhost:8080
 .\scripts\Build-Web.ps1 -Serve
 ```
 
-## Sound and Save Data
+## Sound, Save Data, and Campaign Migration
 
-Sound is web-only for now: native builds are silent. Progress (high score, unlocked sectors, theme, language) is saved on every platform: in the browser storage on the web, and in a `progress.json` file on native builds:
+Sound is web-only for now: native builds are silent. Progress (high score, unlocked sectors, theme, language) is saved on every platform: in the browser storage on the web (16-bit sector unlock packing), and in a `progress.json` file on native builds:
 
 - Windows: `%APPDATA%\Kinetix\progress.json`
 - macOS: `$HOME/Library/Application Support/Kinetix/progress.json`
 - Linux and others: `$XDG_DATA_HOME/kinetix/progress.json`, or `$HOME/.local/share/kinetix/progress.json` when `XDG_DATA_HOME` is unset
 
 A missing file starts from the defaults. A file that cannot be read (corrupt, or written by a newer version) is kept as `progress.json.bak` before the first save of the session, and the game starts from the defaults. If no user data directory can be resolved, progress is not saved. Delete the file to reset your progress.
+
+**Save compatibility and legacy boss re-tiering**: The original 15 sectors (1-15) preserve their exact brick layouts and boss flags inside **World 1: Ignition Grid** (Sectors 1-100). Legacy bosses at sectors 5 (`IGNITION WARDEN`), 10 (`CHRONO ARCHON`), and 15 (`OMEGA EMPEROR`) are re-tiered to World 1 (`HP = 18`). Existing saves that had unlocked any sector in 1-15 keep that exact sector unlocked in World 1; Worlds 2 (Sectors 101-200) and 3 (Sectors 201-300) now start at sectors 101 and 201, so saves that had only reached sectors 6-15 will see Worlds 2 and 3 locked until sector 101 / 201 is reached.
 
 ## Licenses
 

@@ -18,7 +18,12 @@
   "campaigns": {
     "c1": "WORLD 1: IGNITION GRID",
     "c2": "WORLD 2: QUANTUM WARP",
-    "c3": "WORLD 3: OMEGA FORGE"
+    "c3": "WORLD 3: OMEGA FORGE",
+    "c4": "WORLD 4: CRYO MATRIX",
+    "c5": "WORLD 5: SOLAR CITADEL",
+    "c6": "WORLD 6: PRISM LABYRINTH",
+    "c7": "WORLD 7: VOID HORIZON",
+    "c8": "WORLD 8: SINGULARITY THRONE"
   },
   "hud": {
     "score": "SCORE",

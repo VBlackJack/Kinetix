@@ -18,7 +18,12 @@
   "campaigns": {
     "c1": "MONDE 1 : GRILLE D'IGNITION",
     "c2": "MONDE 2 : DISTORSION QUANTIQUE",
-    "c3": "MONDE 3 : FORGE OMEGA"
+    "c3": "MONDE 3 : FORGE OMEGA",
+    "c4": "MONDE 4 : MATRICE CRYO",
+    "c5": "MONDE 5 : CITADELLE SOLAIRE",
+    "c6": "MONDE 6 : LABYRINTHE PRISME",
+    "c7": "MONDE 7 : HORIZON DU VIDE",
+    "c8": "MONDE 8 : TRÔNE DE SINGULARITÉ"
   },
   "hud": {
     "score": "SCORE",
