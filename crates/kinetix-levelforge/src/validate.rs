@@ -63,6 +63,15 @@ pub const MAX_COMPONENTS_8: usize = 4;
 /// generated level. Legacy measurement: max 0.390, median 0.32 (measured 2026-11-09; the rejected noisy
 /// candidate pack has a median of about 0.55).
 pub const MAX_COLOUR_REGIONS_PER_CELL: f32 = 0.42;
+/// Widest run of fully empty columns allowed inside the bounding box of an asymmetric regular
+/// generated level (the widest gap of a hand-authored motif is 3): a wider one reads as two
+/// unrelated pieces.
+pub const MAX_INNER_GAP_COLS: usize = 3;
+/// Tallest run of fully empty rows allowed inside the bounding box of an asymmetric regular
+/// generated level. Measured 2026-11-09: no legacy level, no motif and none of the 471 asymmetric
+/// regular levels of the previous pack has an empty row inside its shape (max 0); one empty row
+/// still reads as a deliberate band break, two split a 5..=9 row shape into two pieces.
+pub const MAX_INNER_GAP_ROWS: usize = 1;
 /// A non-empty row string may appear in at most this many generated levels (about 2% of 800);
 /// a row whose non-empty cells are one char in one contiguous run is exempt.
 pub const MAX_ROW_REUSE: usize = 16;
@@ -320,6 +329,46 @@ pub fn dust_and_components(rows: &[String]) -> (usize, usize) {
     let sizes = region_sizes(rows, |_, _| true);
     let dust = sizes.iter().filter(|&&s| s <= DUST_MAX_CELLS).count();
     (dust, sizes.len())
+}
+
+/// Longest run of values `false` strictly between the first and the last `true`.
+fn longest_inner_false_run(occupied: &[bool]) -> usize {
+    let (Some(first), Some(last)) = (
+        occupied.iter().position(|&o| o),
+        occupied.iter().rposition(|&o| o),
+    ) else {
+        return 0;
+    };
+    let mut best = 0usize;
+    let mut run = 0usize;
+    for &o in &occupied[first..=last] {
+        run = if o { 0 } else { run + 1 };
+        best = best.max(run);
+    }
+    best
+}
+
+/// Longest run of fully empty columns inside the bounding box of the shape cells (every char
+/// shape cells (see `is_shape_cell`).
+pub fn inner_gap_cols(rows: &[String]) -> usize {
+    let width = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+    let occupied: Vec<bool> = (0..width)
+        .map(|c| {
+            rows.iter()
+                .any(|row| row.chars().nth(c).is_some_and(is_shape_cell))
+        })
+        .collect();
+    longest_inner_false_run(&occupied)
+}
+
+/// Longest run of fully empty rows inside the bounding box of the shape cells (every char
+/// shape cells (see `is_shape_cell`).
+pub fn inner_gap_rows(rows: &[String]) -> usize {
+    let occupied: Vec<bool> = rows
+        .iter()
+        .map(|row| row.chars().any(is_shape_cell))
+        .collect();
+    longest_inner_false_run(&occupied)
 }
 
 /// Colour regions (8-connected same-char regions of non-empty cells) divided by the number of
@@ -651,6 +700,28 @@ fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
                     lid,
                     format!("{components} connected components, max {MAX_COMPONENTS_8}"),
                 );
+            }
+            if is_asymmetric(level) {
+                let gap_cols = inner_gap_cols(&level.rows);
+                if gap_cols > MAX_INNER_GAP_COLS {
+                    push_error(
+                        &mut errors,
+                        lid,
+                        format!(
+                            "asymmetric level reads as separate pieces: {gap_cols} empty columns inside the shape, max {MAX_INNER_GAP_COLS}"
+                        ),
+                    );
+                }
+                let gap_rows = inner_gap_rows(&level.rows);
+                if gap_rows > MAX_INNER_GAP_ROWS {
+                    push_error(
+                        &mut errors,
+                        lid,
+                        format!(
+                            "asymmetric level reads as separate pieces: {gap_rows} empty rows inside the shape, max {MAX_INNER_GAP_ROWS}"
+                        ),
+                    );
+                }
             }
             let regions = colour_regions_per_cell(&level.rows);
             if regions > MAX_COLOUR_REGIONS_PER_CELL {
@@ -1536,6 +1607,98 @@ mod tests {
         assert!(!has_error(&validate_pack(&pack), "connected components"));
         pack[15].rows = blocks(MAX_COMPONENTS_8 + 1);
         assert!(has_error(&validate_pack(&pack), "connected components"));
+    }
+
+    /// Asymmetric rows made of two blocks of `block_rows` rows separated by `gap_rows` empty rows.
+    fn two_blocks_stacked(block_rows: usize, gap_rows: usize) -> Vec<String> {
+        let mut rows = vec!["111111000000000".to_string(); block_rows];
+        rows.extend(vec!["0".repeat(EDITOR_COLS); gap_rows]);
+        rows.extend(vec!["000000111111000".to_string(); block_rows]);
+        rows
+    }
+
+    #[test]
+    fn inner_gaps_are_measured_inside_the_shape_bounding_box() {
+        let padded = rows_of(&["000000000000000", "011000000000110", "000000000000000"]);
+        assert_eq!(inner_gap_rows(&padded), 0);
+        assert_eq!(inner_gap_cols(&padded), 9);
+        assert_eq!(inner_gap_rows(&two_blocks_stacked(2, 2)), 2);
+        assert_eq!(inner_gap_rows(&two_blocks_stacked(2, 0)), 0);
+        // Portals are not shape cells, so they neither fill a gap nor widen the box.
+        let portals = rows_of(&["T00000000000000", "000011000000000", "00000000000000T"]);
+        assert_eq!(inner_gap_cols(&portals), 0);
+        assert_eq!(inner_gap_rows(&portals), 0);
+        assert_eq!(inner_gap_rows(&[]), 0);
+        assert_eq!(inner_gap_cols(&[]), 0);
+    }
+
+    #[test]
+    fn asymmetric_level_with_a_wide_empty_column_gap_is_rejected() {
+        let wide: Vec<String> = vec!["111100000001111".to_string(); 3]
+            .into_iter()
+            .chain(vec!["111000000001100".to_string(); 3])
+            .collect();
+        assert!(inner_gap_cols(&wide) > MAX_INNER_GAP_COLS);
+        let mut pack = extended_pack(3);
+        pack[15].rows = wide.clone();
+        assert!(has_error(&validate_pack(&pack), "empty columns inside"));
+        // The same rule runs when a generator checks one candidate.
+        let prefix = extended_pack(2);
+        let prefix = &prefix[..prefix.len() - 1];
+        let mut candidate = make_level(prefix.len(), "NEXT SECTOR", false, 4242);
+        candidate.rows = wide;
+        assert!(has_error(
+            &validate_candidate(prefix, &candidate, false, 100),
+            "empty columns inside"
+        ));
+        // A gap of exactly the cap is fine.
+        let narrow = rows_of(&["111100011111000", "111000011111100", "111100011110000"]);
+        assert_eq!(inner_gap_cols(&narrow), MAX_INNER_GAP_COLS);
+        pack[15].rows = narrow;
+        assert!(!has_error(&validate_pack(&pack), "empty columns inside"));
+    }
+
+    #[test]
+    fn asymmetric_level_with_a_tall_empty_row_gap_is_rejected() {
+        let split = two_blocks_stacked(2, MAX_INNER_GAP_ROWS + 1);
+        assert!(is_asymmetric(&sample_level(
+            1,
+            1,
+            "X",
+            vec![&split[0], &split[2]]
+        )));
+        let mut pack = extended_pack(3);
+        pack[15].rows = split.clone();
+        assert!(has_error(&validate_pack(&pack), "empty rows inside"));
+        let prefix = extended_pack(2);
+        let prefix = &prefix[..prefix.len() - 1];
+        let mut candidate = make_level(prefix.len(), "NEXT SECTOR", false, 4242);
+        candidate.rows = split;
+        assert!(has_error(
+            &validate_candidate(prefix, &candidate, false, 100),
+            "empty rows inside"
+        ));
+        // A gap of exactly the cap is fine.
+        pack[15].rows = two_blocks_stacked(2, MAX_INNER_GAP_ROWS);
+        assert!(!has_error(&validate_pack(&pack), "empty rows inside"));
+    }
+
+    #[test]
+    fn symmetric_boss_and_legacy_levels_are_exempt_from_the_inner_gap_rule() {
+        let mirrored: Vec<String> = vec!["111000000000111".to_string(); 3]
+            .into_iter()
+            .chain(vec!["0".repeat(EDITOR_COLS); MAX_INNER_GAP_ROWS + 2])
+            .chain(vec!["111000000000111".to_string(); 3])
+            .collect();
+        let mut pack = extended_pack(3);
+        pack[15].rows = mirrored;
+        let errors = validate_pack(&pack);
+        assert!(!has_error(&errors, "empty columns inside"));
+        assert!(!has_error(&errors, "empty rows inside"));
+        // A legacy level is never judged, even asymmetric and split.
+        let mut pack = extended_pack(3);
+        pack[0].rows = two_blocks_stacked(2, MAX_INNER_GAP_ROWS + 2);
+        assert!(!has_error(&validate_pack(&pack), "empty rows inside"));
     }
 
     #[test]

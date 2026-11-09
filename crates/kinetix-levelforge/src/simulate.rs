@@ -609,17 +609,27 @@ fn is_generated_level(level_id: usize) -> bool {
     level_id > LEGACY_LEVEL_COUNT
 }
 
-#[allow(clippy::too_many_arguments)]
-fn check_metric(
-    issues: &mut Vec<String>,
-    who: &str,
-    metric: &str,
+/// One metric of one level to compare against its calibrated band.
+struct MetricCheck<'a> {
+    who: &'a str,
+    metric: &'a str,
     value: f32,
     band: MetricBand,
     abs_margin: f32,
     side: BandSide,
     hard: HardBound,
-) {
+}
+
+fn check_metric(issues: &mut Vec<String>, params: MetricCheck<'_>) {
+    let MetricCheck {
+        who,
+        metric,
+        value,
+        band,
+        abs_margin,
+        side,
+        hard,
+    } = params;
     let (lo, hi) = band_bounds(band, abs_margin);
     let enforce_lower = side == BandSide::Both || hard == HardBound::Lower;
     let enforce_upper = side == BandSide::Both || hard == HardBound::Upper;
@@ -671,49 +681,57 @@ fn check_preset(
     }
     check_metric(
         issues,
-        &who,
-        "clear rate",
-        sum.clear_rate,
-        bands.clear_rate,
-        BAND_MARGIN_RATE_ABS,
-        side,
-        HardBound::Lower,
+        MetricCheck {
+            who: &who,
+            metric: "clear rate",
+            value: sum.clear_rate,
+            band: bands.clear_rate,
+            abs_margin: BAND_MARGIN_RATE_ABS,
+            side,
+            hard: HardBound::Lower,
+        },
     );
     // The casual preset legitimately clears nothing on some levels, so a missing median
     // is only a problem through the clear-rate checks above.
     if let Some(t) = sum.median_clear_time {
         check_metric(
             issues,
-            &who,
-            "median clear time",
-            t,
-            bands.median_clear_time,
-            0.0,
-            side,
-            HardBound::Upper,
+            MetricCheck {
+                who: &who,
+                metric: "median clear time",
+                value: t,
+                band: bands.median_clear_time,
+                abs_margin: 0.0,
+                side,
+                hard: HardBound::Upper,
+            },
         );
     }
     check_metric(
         issues,
-        &who,
-        "losses per run",
-        sum.losses_per_run,
-        bands.losses_per_run,
-        BAND_MARGIN_LOSSES_ABS,
-        side,
-        HardBound::Upper,
+        MetricCheck {
+            who: &who,
+            metric: "losses per run",
+            value: sum.losses_per_run,
+            band: bands.losses_per_run,
+            abs_margin: BAND_MARGIN_LOSSES_ABS,
+            side,
+            hard: HardBound::Upper,
+        },
     );
     // Generated levels use the explicit cap above instead of the band-derived bound.
     if !generated {
         check_metric(
             issues,
-            &who,
-            "sudden-death share",
-            sum.sudden_death_share,
-            bands.sudden_death_share,
-            BAND_MARGIN_RATE_ABS,
-            side,
-            HardBound::Upper,
+            MetricCheck {
+                who: &who,
+                metric: "sudden-death share",
+                value: sum.sudden_death_share,
+                band: bands.sudden_death_share,
+                abs_margin: BAND_MARGIN_RATE_ABS,
+                side,
+                hard: HardBound::Upper,
+            },
         );
     }
 }
