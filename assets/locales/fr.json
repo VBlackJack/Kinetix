@@ -48,6 +48,32 @@
     "pause_hint": "[P / ÉCHAP] Pause",
     "restart_hint": "[R] Recommencer"
   },
+  "dev": {
+    "badge": "DEV",
+    "toast": {
+      "on": "MODE DEV ACTIF (progression non sauvegardée)",
+      "off": "MODE DEV INACTIF"
+    },
+    "level": {
+      "prompt": "Secteur 1-{max} : {value}_"
+    },
+    "powerup": {
+      "selected": "Bonus : {name}"
+    },
+    "status": {
+      "invulnerable_on": "Invulnérable : OUI",
+      "invulnerable_off": "Invulnérable : NON"
+    },
+    "help": {
+      "level": "Chiffres + [Entrée] : aller au secteur  [Retour] Corriger  [Échap] Annuler",
+      "step": "[Page préc.] / [Page suiv.] : secteur précédent / suivant",
+      "powerup_select": "[ [ ] / [ ] ] ou [Haut] / [Bas] : choisir un bonus",
+      "powerup_apply": "[G] Appliquer le bonus  [H] Le lâcher en capsule",
+      "helpers": "[L] Balle invulnérable  [K] Vider le secteur",
+      "panel": "[F9] Afficher / masquer cette aide",
+      "toggle": "[Ctrl+Maj+D] Quitter le mode dev"
+    }
+  },
   "editor": {
     "banner": "ARCHITECTE DE SECTEUR (MODE ÉDITEUR)",
     "instructions": "CLIC G: Poser | CLIC D: Gommer | [1-6] Std [E] Expl [H] Acier [T] Portail [G] Fantôme [V] Mobile [U] Propuls [R] Régén | [X] Exporter [I] Importer [C] Vider [F4] Jouer",
