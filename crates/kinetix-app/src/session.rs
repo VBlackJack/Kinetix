@@ -19,10 +19,11 @@
 
 use crate::dev::{DevState, ProgressGuard};
 use crate::tuning::HIGH_SCORE_SAVE_INTERVAL_SEC;
+use kinetix_app::menu::MenuAction;
 use kinetix_app::persistence::{high_score_save_due, save_progress};
 use kinetix_app::play_source::{progress_frozen, PlaySource};
 use kinetix_core::config::LevelDef;
-use kinetix_core::physics::GameWorld;
+use kinetix_core::physics::{GameWorld, SessionStatus};
 
 /// State of the current play session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,41 @@ pub(crate) fn restart_level(
     world.lives = world.config.gameplay.initial_lives;
     world.score = 0;
     world.load_pack_level(world.current_level_idx, levels, source.pack_rules());
+}
+
+/// What a pause menu action changed outside the world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PauseOutcome {
+    /// Nothing for the pause flow to do (settings actions are handled by the caller).
+    None,
+    /// The run goes on (resumed or restarted).
+    Resumed,
+    /// The player left for the title screen; the world is left exactly as it is.
+    ToTitle,
+}
+
+/// Applies a pause menu action to the session. Resume and Restart put the world back to
+/// playing; Quit to menu leaves the world, the progress and the developer taint untouched, like
+/// the Tab key does.
+pub(crate) fn apply_pause_action(
+    action: MenuAction,
+    world: &mut GameWorld,
+    dev: &mut DevState,
+    levels: &[LevelDef],
+    source: PlaySource,
+) -> PauseOutcome {
+    match action {
+        MenuAction::Resume => {
+            world.status = SessionStatus::Playing;
+            PauseOutcome::Resumed
+        }
+        MenuAction::Restart => {
+            restart_level(world, dev, levels, source);
+            PauseOutcome::Resumed
+        }
+        MenuAction::QuitToTitle => PauseOutcome::ToTitle,
+        _ => PauseOutcome::None,
+    }
 }
 
 /// Moves on to the sector after a win. The score carries over and a taint is never cleared.
@@ -281,5 +317,109 @@ mod tests {
         sync_progress(&mut guard, &dev, &mut world, PlaySource::Satisfaction);
         assert_eq!(world.max_unlocked_level, 0);
         assert_eq!(world.high_score, 1);
+    }
+
+    fn paused_world(dev: &mut DevState) -> (GameWorld, LevelPack) {
+        let (mut world, pack) = dev_test_world();
+        start_run_from_title(&mut world, dev, &pack.levels, 2, PlaySource::Campaign);
+        world.status = SessionStatus::Paused;
+        (world, pack)
+    }
+
+    #[test]
+    fn resume_puts_a_paused_world_back_to_playing() {
+        let mut dev = DevState::default();
+        let (mut world, pack) = paused_world(&mut dev);
+        world.score = 700;
+        let outcome = apply_pause_action(
+            MenuAction::Resume,
+            &mut world,
+            &mut dev,
+            &pack.levels,
+            PlaySource::Campaign,
+        );
+        assert_eq!(outcome, PauseOutcome::Resumed);
+        assert_eq!(world.status, SessionStatus::Playing);
+        assert_eq!(world.score, 700, "resume keeps the score");
+    }
+
+    #[test]
+    fn restart_reloads_the_current_sector_with_a_fresh_score() {
+        let mut dev = DevState::default();
+        let (mut world, pack) = paused_world(&mut dev);
+        world.score = 700;
+        let outcome = apply_pause_action(
+            MenuAction::Restart,
+            &mut world,
+            &mut dev,
+            &pack.levels,
+            PlaySource::Campaign,
+        );
+        assert_eq!(outcome, PauseOutcome::Resumed);
+        assert_eq!(world.status, SessionStatus::Playing);
+        assert_eq!(world.score, 0);
+        assert_eq!(world.current_level_idx, 2);
+    }
+
+    #[test]
+    fn restart_from_the_pause_menu_keeps_the_developer_taint() {
+        let mut dev = DevState::default();
+        let (mut world, pack) = paused_world(&mut dev);
+        dev.toggle();
+        dev.toggle();
+        assert!(dev.tainted);
+        apply_pause_action(
+            MenuAction::Restart,
+            &mut world,
+            &mut dev,
+            &pack.levels,
+            PlaySource::Campaign,
+        );
+        assert!(dev.tainted);
+    }
+
+    #[test]
+    fn quit_to_menu_leaves_the_world_and_the_taint_alone() {
+        let mut dev = DevState::default();
+        let (mut world, pack) = paused_world(&mut dev);
+        dev.toggle();
+        dev.toggle();
+        world.score = 700;
+        let outcome = apply_pause_action(
+            MenuAction::QuitToTitle,
+            &mut world,
+            &mut dev,
+            &pack.levels,
+            PlaySource::Campaign,
+        );
+        assert_eq!(outcome, PauseOutcome::ToTitle);
+        assert_eq!(world.status, SessionStatus::Paused);
+        assert_eq!(world.score, 700);
+        assert_eq!(world.current_level_idx, 2);
+        assert!(dev.tainted);
+    }
+
+    #[test]
+    fn settings_and_unrelated_actions_are_left_to_the_caller() {
+        let mut dev = DevState::default();
+        let (mut world, pack) = paused_world(&mut dev);
+        for action in [
+            MenuAction::None,
+            MenuAction::ToggleSfx,
+            MenuAction::CycleRenderer,
+            MenuAction::PersistRenderer,
+            MenuAction::StartSector(0),
+            MenuAction::QuitApp,
+        ] {
+            let outcome = apply_pause_action(
+                action,
+                &mut world,
+                &mut dev,
+                &pack.levels,
+                PlaySource::Campaign,
+            );
+            assert_eq!(outcome, PauseOutcome::None);
+            assert_eq!(world.status, SessionStatus::Paused);
+        }
     }
 }

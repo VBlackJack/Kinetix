@@ -40,7 +40,8 @@ use kinetix_core::physics::{
 };
 use macroquad::prelude::*;
 use session::{
-    next_sector, restart_level, start_run_from_title, sync_progress, SaveTracker, Session,
+    apply_pause_action, next_sector, restart_level, start_run_from_title, sync_progress,
+    PauseOutcome, SaveTracker, Session,
 };
 use std::collections::BTreeSet;
 use title::{
@@ -247,6 +248,61 @@ fn persist_audio_settings(sfx: &SoundBank) {
     });
 }
 
+/// What the settings actions of the menu change, shared by the title and the pause menu.
+struct SettingsContext<'a> {
+    lang: &'a mut Language,
+    theme_idx: &'a mut usize,
+    theme_count: usize,
+    sfx: &'a mut SoundBank,
+    save_tracker: &'a mut SaveTracker,
+    world: &'a GameWorld,
+    now_sec: f64,
+}
+
+/// Performs the settings actions (language, renderer, sound, music). Returns false when
+/// `action` is not a settings action, so the caller handles it.
+fn apply_settings_action(action: MenuAction, ctx: &mut SettingsContext) -> bool {
+    match action {
+        MenuAction::SetLanguage(language) => {
+            *ctx.lang = language;
+            set_document_lang(language == Language::Fr);
+            ctx.save_tracker.persist(
+                ctx.world,
+                *ctx.theme_idx,
+                language == Language::Fr,
+                ctx.now_sec,
+            );
+        }
+        MenuAction::CycleRenderer => {
+            *ctx.theme_idx = (*ctx.theme_idx + 1) % ctx.theme_count;
+        }
+        MenuAction::PersistRenderer => {
+            ctx.save_tracker.persist(
+                ctx.world,
+                *ctx.theme_idx,
+                *ctx.lang == Language::Fr,
+                ctx.now_sec,
+            );
+        }
+        MenuAction::ToggleSfx => {
+            ctx.sfx.muted = !ctx.sfx.muted;
+            persist_audio_settings(ctx.sfx);
+        }
+        MenuAction::ToggleMusic => {
+            ctx.sfx.music_enabled = !ctx.sfx.music_enabled;
+            persist_audio_settings(ctx.sfx);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// True when the menu is on screen: the title, or the pause page over a paused run.
+fn menu_is_visible(screen: AppScreen, status: SessionStatus) -> bool {
+    screen == AppScreen::TitleMenu
+        || (screen == AppScreen::InGame && status == SessionStatus::Paused)
+}
+
 /// Opens the level editor on a fresh paddle and ball (the F4 entry).
 fn enter_editor(screen: &mut AppScreen, world: &mut GameWorld) {
     *screen = AppScreen::Editor;
@@ -254,25 +310,25 @@ fn enter_editor(screen: &mut AppScreen, world: &mut GameWorld) {
     world.status = SessionStatus::Playing;
 }
 
-/// Which menu gestures start play from the title: a click on the widget under the pointer, and
-/// Enter / Space on the focused widget.
+/// Which menu gestures start play (from the title or the pause menu): a click on the widget
+/// under the pointer, and Enter / Space on the focused widget.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-struct TitlePlay {
+struct MenuPlay {
     click: bool,
     key: bool,
 }
 
 /// Input gestures that will make the pointer lock wanted from the given state (see
 /// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
-fn resume_mask_for(screen: AppScreen, status: SessionStatus, title_play: TitlePlay) -> u32 {
+fn resume_mask_for(screen: AppScreen, status: SessionStatus, menu_play: MenuPlay) -> u32 {
     match screen {
         AppScreen::TitleMenu => {
             let mut base = RESUME_CHEAT_MASK;
             // A click or a key only counts when it would start play from the menu.
-            if title_play.click {
+            if menu_play.click {
                 base |= RESUME_CLICK;
             }
-            if title_play.key {
+            if menu_play.key {
                 base |= RESUME_SPACE | RESUME_ENTER;
             }
             // Tab from the title enters the game and wants the lock when the world is playing.
@@ -285,7 +341,18 @@ fn resume_mask_for(screen: AppScreen, status: SessionStatus, title_play: TitlePl
         AppScreen::Editor => RESUME_F4 | RESUME_CHEAT_MASK,
         AppScreen::InGame => match status {
             SessionStatus::Playing => 0,
-            SessionStatus::Paused => RESUME_P | RESUME_R | RESUME_CHEAT_MASK,
+            // Escape is never listed: the browser uses it to release the pointer lock. A click
+            // or a key only counts when it hits Resume or Restart in the pause menu.
+            SessionStatus::Paused => {
+                let mut base = RESUME_P | RESUME_R | RESUME_CHEAT_MASK;
+                if menu_play.click {
+                    base |= RESUME_CLICK;
+                }
+                if menu_play.key {
+                    base |= RESUME_SPACE | RESUME_ENTER;
+                }
+                base
+            }
             SessionStatus::Victory | SessionStatus::GameOver => {
                 RESUME_CLICK | RESUME_SPACE | RESUME_R | RESUME_CHEAT_MASK
             }
@@ -476,8 +543,10 @@ async fn main() {
     let mut menu_model = MenuModelCache::new();
     // Sector started last from the menu, focused first when its world is opened again.
     let mut last_started_sector: Option<usize> = None;
-    // Arena position of the pointer on the title, for the resume mask.
-    let mut title_pointer: Option<(f32, f32)> = None;
+    // Arena position of the pointer over the menu (title or pause), for the resume mask.
+    let mut menu_pointer: Option<(f32, f32)> = None;
+    // True while the menu shows the pause page for the current pause.
+    let mut pause_menu_open = false;
 
     let mut events: Vec<GameEvent> = Vec::with_capacity(MAX_EVENTS);
     let mut particles: Vec<Particle> = Vec::with_capacity(MAX_PARTICLES);
@@ -554,13 +623,16 @@ async fn main() {
             world.status = SessionStatus::Playing;
         }
         if is_key_pressed(KeyCode::Tab) {
-            if screen == AppScreen::TitleMenu && menu.renderer_dirty() {
+            if menu.renderer_dirty() {
                 save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
             }
             screen = match screen {
                 AppScreen::TitleMenu => AppScreen::InGame,
                 _ => AppScreen::TitleMenu,
             };
+            if screen == AppScreen::TitleMenu {
+                menu.open_home();
+            }
         }
         if is_key_pressed(KeyCode::M) {
             sfx.muted = !sfx.muted;
@@ -746,34 +818,40 @@ async fn main() {
             grab_session_live = false;
         }
 
-        match screen {
-            AppScreen::TitleMenu => {
-                let key = MenuModelKey {
-                    language: lang,
+        if screen != AppScreen::Editor {
+            let key = MenuModelKey {
+                language: lang,
+                max_unlocked: world.max_unlocked_level,
+                preferred_sector: last_started_sector,
+                theme_idx,
+                sfx_on: !sfx.muted,
+                music_on: sfx.music_enabled,
+                library_len: library.entries.len(),
+                library_next_id: library.next_id,
+            };
+            menu_model.get(key, || {
+                build_menu_model(&MenuModelSource {
+                    i18n,
+                    levels: &level_pack.levels,
+                    worlds: &worlds,
                     max_unlocked: world.max_unlocked_level,
                     preferred_sector: last_started_sector,
-                    theme_idx,
+                    satisfaction_names: &satisfaction_names,
+                    library: &library,
+                    quit_supported: cfg!(not(target_arch = "wasm32")),
+                    language: lang,
+                    renderer_name: i18n.t(&theme.name_key).to_owned(),
                     sfx_on: !sfx.muted,
                     music_on: sfx.music_enabled,
-                    library_len: library.entries.len(),
-                    library_next_id: library.next_id,
-                };
-                let model = menu_model.get(key, || {
-                    build_menu_model(&MenuModelSource {
-                        i18n,
-                        levels: &level_pack.levels,
-                        worlds: &worlds,
-                        max_unlocked: world.max_unlocked_level,
-                        preferred_sector: last_started_sector,
-                        satisfaction_names: &satisfaction_names,
-                        library: &library,
-                        quit_supported: cfg!(not(target_arch = "wasm32")),
-                        language: lang,
-                        renderer_name: i18n.t(&theme.name_key).to_owned(),
-                        sfx_on: !sfx.muted,
-                        music_on: sfx.music_enabled,
-                    })
-                });
+                })
+            });
+        }
+        if screen != AppScreen::InGame {
+            pause_menu_open = false;
+        }
+
+        match screen {
+            AppScreen::TitleMenu => {
                 let pointer = pointer_frame(
                     (mx, my),
                     is_mouse_button_pressed(MouseButton::Left),
@@ -787,60 +865,66 @@ async fn main() {
                     dev_enter_consumed,
                     dev_esc_consumed,
                 );
-                title_pointer = input.pointer;
-                match menu.update(&input, model) {
-                    MenuAction::StartSector(idx)
-                        if is_sector_unlocked(idx, world.max_unlocked_level)
-                            && idx < level_pack.levels.len() =>
-                    {
-                        if menu.renderer_dirty() {
-                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                menu_pointer = input.pointer;
+                let action = menu.update(&input, menu_model.current());
+                let handled = apply_settings_action(
+                    action,
+                    &mut SettingsContext {
+                        lang: &mut lang,
+                        theme_idx: &mut theme_idx,
+                        theme_count: theme_reg.themes.len(),
+                        sfx: &mut sfx,
+                        save_tracker: &mut save_tracker,
+                        world: &world,
+                        now_sec,
+                    },
+                );
+                if !handled {
+                    match action {
+                        MenuAction::StartSector(idx)
+                            if is_sector_unlocked(idx, world.max_unlocked_level)
+                                && idx < level_pack.levels.len() =>
+                        {
+                            if menu.renderer_dirty() {
+                                save_tracker.persist(
+                                    &world,
+                                    theme_idx,
+                                    lang == Language::Fr,
+                                    now_sec,
+                                );
+                            }
+                            start_run_from_title(
+                                &mut world,
+                                &mut dev_state,
+                                &level_pack.levels,
+                                idx,
+                                session.source,
+                            );
+                            last_started_sector = Some(idx);
+                            menu.open_home();
+                            screen = AppScreen::InGame;
                         }
-                        start_run_from_title(
-                            &mut world,
-                            &mut dev_state,
-                            &level_pack.levels,
-                            idx,
-                            session.source,
-                        );
-                        last_started_sector = Some(idx);
-                        menu.open_home();
-                        screen = AppScreen::InGame;
-                    }
-                    MenuAction::OpenEditor => {
-                        if menu.renderer_dirty() {
-                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                        MenuAction::OpenEditor => {
+                            if menu.renderer_dirty() {
+                                save_tracker.persist(
+                                    &world,
+                                    theme_idx,
+                                    lang == Language::Fr,
+                                    now_sec,
+                                );
+                            }
+                            menu.open_home();
+                            enter_editor(&mut screen, &mut world);
                         }
-                        menu.open_home();
-                        enter_editor(&mut screen, &mut world);
+                        #[cfg(not(target_arch = "wasm32"))]
+                        MenuAction::QuitApp => {
+                            set_native_cursor_grab(false);
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                            break;
+                        }
+                        // Satisfaction and library actions are wired in a later lot.
+                        _ => {}
                     }
-                    MenuAction::SetLanguage(language) => {
-                        lang = language;
-                        set_document_lang(lang == Language::Fr);
-                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                    }
-                    MenuAction::CycleRenderer => {
-                        theme_idx = (theme_idx + 1) % theme_reg.themes.len();
-                    }
-                    MenuAction::PersistRenderer => {
-                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                    }
-                    MenuAction::ToggleSfx => {
-                        sfx.muted = !sfx.muted;
-                        persist_audio_settings(&sfx);
-                    }
-                    MenuAction::ToggleMusic => {
-                        sfx.music_enabled = !sfx.music_enabled;
-                        persist_audio_settings(&sfx);
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    MenuAction::QuitApp => {
-                        set_native_cursor_grab(false);
-                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                        break;
-                    }
-                    // Satisfaction, library and pause actions are wired in later lots.
-                    _ => {}
                 }
             }
             AppScreen::Editor => {
@@ -946,6 +1030,65 @@ async fn main() {
                     );
                 }
 
+                // The pause menu drives the paused session. A frame it handled never fires or
+                // launches, so a Space that activates Resume does not also launch the ball.
+                let pause_menu_shown = world.status == SessionStatus::Paused;
+                if pause_menu_shown {
+                    if !pause_menu_open {
+                        menu.open_pause();
+                        pause_menu_open = true;
+                    }
+                    let pointer = pointer_frame(
+                        (mx, my),
+                        is_mouse_button_pressed(MouseButton::Left),
+                        is_mouse_button_released(MouseButton::Left),
+                        &touches(),
+                        miniquad::window::dpi_scale(),
+                    );
+                    let input = read_menu_input(
+                        pointer,
+                        |x, y| screen_to_arena(x, y, view_scale, view_ox, view_oy),
+                        dev_enter_consumed,
+                        dev_esc_consumed,
+                    );
+                    menu_pointer = input.pointer;
+                    let action = menu.update(&input, menu_model.current());
+                    let handled = apply_settings_action(
+                        action,
+                        &mut SettingsContext {
+                            lang: &mut lang,
+                            theme_idx: &mut theme_idx,
+                            theme_count: theme_reg.themes.len(),
+                            sfx: &mut sfx,
+                            save_tracker: &mut save_tracker,
+                            world: &world,
+                            now_sec,
+                        },
+                    );
+                    if !handled
+                        && apply_pause_action(
+                            action,
+                            &mut world,
+                            &mut dev_state,
+                            &level_pack.levels,
+                            session.source,
+                        ) == PauseOutcome::ToTitle
+                    {
+                        if menu.renderer_dirty() {
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                        }
+                        menu.open_home();
+                        pause_menu_open = false;
+                        screen = AppScreen::TitleMenu;
+                    }
+                } else if pause_menu_open {
+                    // Resumed with P while a previewed renderer was still unsaved.
+                    if menu.renderer_dirty() {
+                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                    }
+                    pause_menu_open = false;
+                }
+
                 world.set_paddle_target(paddle_mx);
 
                 let kb_speed = KEYBOARD_PADDLE_SPEED * dt;
@@ -970,8 +1113,9 @@ async fn main() {
                     );
                 }
 
-                let action_triggered =
-                    is_mouse_button_pressed(MouseButton::Left) || is_key_pressed(KeyCode::Space);
+                let action_triggered = !pause_menu_shown
+                    && (is_mouse_button_pressed(MouseButton::Left)
+                        || is_key_pressed(KeyCode::Space));
                 if action_triggered {
                     match world.status {
                         SessionStatus::Playing => world.launch_or_fire(&mut events),
@@ -1048,16 +1192,17 @@ async fn main() {
 
         // Tell the page which gestures will make the lock wanted next, so it can request the
         // lock synchronously inside the input handler (required by Firefox).
-        let title_play = if screen == AppScreen::TitleMenu {
+        let menu_visible = menu_is_visible(screen, world.status);
+        let menu_play = if menu_visible {
             let model = menu_model.current();
-            TitlePlay {
-                click: title_pointer.is_some_and(|p| menu.starts_play_at(model, p)),
+            MenuPlay {
+                click: menu_pointer.is_some_and(|p| menu.starts_play_at(model, p)),
                 key: menu.focused_starts_play(model),
             }
         } else {
-            TitlePlay::default()
+            MenuPlay::default()
         };
-        let resume_mask = resume_mask_for(screen, world.status, title_play);
+        let resume_mask = resume_mask_for(screen, world.status, menu_play);
         if last_resume_mask != Some(resume_mask) {
             set_resume_mask(resume_mask);
             last_resume_mask = Some(resume_mask);
@@ -1413,7 +1558,7 @@ async fn main() {
             rt_h,
         });
 
-        if screen == AppScreen::TitleMenu {
+        if menu_visible {
             draw_menu(
                 &menu,
                 menu_model.current(),
@@ -2203,15 +2348,8 @@ fn draw_hud(ctx: &HudContext) {
     }
 
     match world.status {
-        SessionStatus::Paused => {
-            draw_overlay_box(
-                font,
-                i18n.t("status.paused"),
-                i18n.t("status.paused_sub"),
-                pri,
-                acc,
-            );
-        }
+        // The pause menu draws the paused state.
+        SessionStatus::Paused => {}
         SessionStatus::Victory => {
             draw_overlay_box(
                 font,
@@ -2492,7 +2630,7 @@ mod tests {
             resume_mask_for(
                 AppScreen::TitleMenu,
                 SessionStatus::Paused,
-                TitlePlay { click, key },
+                MenuPlay { click, key },
             )
         };
         let none = mask(false, false);
@@ -2512,7 +2650,7 @@ mod tests {
             resume_mask_for(
                 AppScreen::TitleMenu,
                 SessionStatus::Playing,
-                TitlePlay::default()
+                MenuPlay::default()
             ) & RESUME_TAB,
             0
         );
@@ -2524,35 +2662,35 @@ mod tests {
             resume_mask_for(
                 AppScreen::InGame,
                 SessionStatus::Playing,
-                TitlePlay::default()
+                MenuPlay::default()
             ),
             0
         );
         let paused = resume_mask_for(
             AppScreen::InGame,
             SessionStatus::Paused,
-            TitlePlay::default(),
+            MenuPlay::default(),
         );
         assert_eq!(paused, RESUME_P | RESUME_R | RESUME_CHEAT_MASK);
         let over = resume_mask_for(
             AppScreen::InGame,
             SessionStatus::GameOver,
-            TitlePlay::default(),
+            MenuPlay::default(),
         );
         assert_eq!(
             over,
             resume_mask_for(
                 AppScreen::InGame,
                 SessionStatus::Victory,
-                TitlePlay::default()
+                MenuPlay::default()
             )
         );
         assert_eq!(over & RESUME_P, 0);
-        let click_play = TitlePlay {
+        let click_play = MenuPlay {
             click: true,
             key: false,
         };
-        let key_play = TitlePlay {
+        let key_play = MenuPlay {
             click: false,
             key: true,
         };
@@ -2573,10 +2711,74 @@ mod tests {
             resume_mask_for(
                 AppScreen::Editor,
                 SessionStatus::Playing,
-                TitlePlay::default()
+                MenuPlay::default()
             ),
             RESUME_F4 | RESUME_CHEAT_MASK
         );
+    }
+
+    #[test]
+    fn paused_resume_mask_follows_the_pause_widget_and_has_no_escape_bit() {
+        let mask = |click, key| {
+            resume_mask_for(
+                AppScreen::InGame,
+                SessionStatus::Paused,
+                MenuPlay { click, key },
+            )
+        };
+        let base = RESUME_P | RESUME_R | RESUME_CHEAT_MASK;
+        assert_eq!(mask(false, false), base);
+        assert_eq!(mask(true, false), base | RESUME_CLICK);
+        assert_eq!(mask(false, true), base | RESUME_SPACE | RESUME_ENTER);
+        assert_eq!(
+            mask(true, true),
+            base | RESUME_CLICK | RESUME_SPACE | RESUME_ENTER
+        );
+    }
+
+    #[test]
+    fn the_pause_menu_only_resumes_play_from_resume_and_restart() {
+        use kinetix_app::menu::{Menu, MenuInput, MenuModel};
+        let model = MenuModel::empty();
+        let mut menu = Menu::new();
+        menu.open_pause();
+        // Resume is focused first and starts play; Escape does nothing on the pause page.
+        assert!(menu.focused_starts_play(&model));
+        let escape = MenuInput {
+            escape: true,
+            ..MenuInput::default()
+        };
+        assert_eq!(menu.update(&escape, &model), MenuAction::None);
+        let enter = MenuInput {
+            enter: true,
+            ..MenuInput::default()
+        };
+        assert_eq!(menu.update(&enter, &model), MenuAction::Resume);
+        // Options does not start play, and Escape from it goes back to the pause page.
+        let down = MenuInput {
+            down: true,
+            ..MenuInput::default()
+        };
+        menu.update(&down, &model);
+        assert!(menu.focused_starts_play(&model));
+        menu.update(&down, &model);
+        assert!(!menu.focused_starts_play(&model));
+        menu.update(&enter, &model);
+        assert_ne!(menu.page(), kinetix_app::menu::PageId::Pause);
+        menu.update(&escape, &model);
+        assert_eq!(menu.page(), kinetix_app::menu::PageId::Pause);
+    }
+
+    #[test]
+    fn the_menu_is_visible_on_the_title_and_while_paused_in_game() {
+        assert!(menu_is_visible(
+            AppScreen::TitleMenu,
+            SessionStatus::Playing
+        ));
+        assert!(menu_is_visible(AppScreen::InGame, SessionStatus::Paused));
+        assert!(!menu_is_visible(AppScreen::InGame, SessionStatus::Playing));
+        assert!(!menu_is_visible(AppScreen::InGame, SessionStatus::Victory));
+        assert!(!menu_is_visible(AppScreen::Editor, SessionStatus::Paused));
     }
 
     pub(crate) fn text_width(face: &ttf_parser::Face, text: &str, size: f32) -> f32 {
