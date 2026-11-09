@@ -242,6 +242,19 @@
     // Pointer lock is requested only when the game asks for it (kinetix_set_pointer_lock).
     window.addEventListener("contextmenu", (e) => e.preventDefault());
 
+    // Physical key code of the Ctrl+Shift chord the game uses; Chromium would bind it to
+    // "bookmark all tabs". Only the default action is cancelled: the game still gets the event.
+    const GAME_CHORD_KEY_CODE = "KeyD";
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.ctrlKey && e.shiftKey && e.code === GAME_CHORD_KEY_CODE) {
+          e.preventDefault();
+        }
+      },
+      true
+    );
+
     function requestLock() {
       if (!glCanvas.requestPointerLock) return;
       try {
