@@ -16,7 +16,9 @@
 
 //! CLI tool for validating, simulating, generating, writing, and inspecting the KINETIX level campaign.
 
+pub mod bosses;
 pub mod generate;
+pub mod motifs;
 pub mod simulate;
 pub mod validate;
 
@@ -328,16 +330,69 @@ fn cmd_generate(levels_path: &str, max_world: usize, seed: u64, out_path: &str) 
     }
 
     let mut used_names: BTreeSet<String> = pack.levels.iter().map(|l| l.name.clone()).collect();
+    let legacy_sims = simulate_levels(&config, &pack.levels, &DEFAULT_SEEDS);
+    let mut good_rates: Vec<f32> = legacy_sims.iter().map(|s| s.good.clear_rate).collect();
+
+    const HARD_RATE_THRESHOLD: f32 = 0.375;
+    const EARLY_ACCEPT_TOLERANCE: f32 = 0.13;
+    const MAX_FAIR_CANDIDATES_TO_SCORE: usize = 6;
+    const ATTEMPT_LIMIT: u64 = GENERATE_ATTEMPT_BUDGET * 2;
 
     for idx in pack.levels.len()..target_total {
         let id = idx + 1;
         let world = idx / SECTORS_PER_WORLD + 1;
         let sector_in_world = idx % SECTORS_PER_WORLD + 1;
         let is_last = idx + 1 == target_total;
+        let world_planned_total = world * SECTORS_PER_WORLD;
+
+        let prev_one_hard = good_rates.last().is_some_and(|&r| r <= HARD_RATE_THRESHOLD);
+        let prev_two_hard = good_rates.len() >= 2
+            && good_rates[good_rates.len() - 1] <= HARD_RATE_THRESHOLD
+            && good_rates[good_rates.len() - 2] <= HARD_RATE_THRESHOLD;
+
+        // Compute the previous 10-sector block mean within the same world (or prologue for W1 S11-20)
+        // so we can steer candidates toward a smooth non-increasing curve.
+        let block_idx = (sector_in_world - 1) / simulate::SECTORS_PER_BLOCK;
+        let prev_block_mean = if world == 1 && block_idx == 1 {
+            Some(good_rates[..LEGACY_LEVEL_COUNT].iter().sum::<f32>() / (LEGACY_LEVEL_COUNT as f32))
+        } else if block_idx > 0 {
+            let prev_start =
+                (world - 1) * SECTORS_PER_WORLD + (block_idx - 1) * simulate::SECTORS_PER_BLOCK;
+            let prev_start = prev_start.max(LEGACY_LEVEL_COUNT);
+            let prev_end =
+                (world - 1) * SECTORS_PER_WORLD + block_idx * simulate::SECTORS_PER_BLOCK;
+            if prev_end > prev_start && prev_end <= good_rates.len() {
+                let slice = &good_rates[prev_start..prev_end];
+                Some(slice.iter().sum::<f32>() / (slice.len() as f32))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let cur_block_start = ((world - 1) * SECTORS_PER_WORLD
+            + block_idx * simulate::SECTORS_PER_BLOCK)
+            .max(LEGACY_LEVEL_COUNT);
+        let cur_slice = &good_rates[cur_block_start..idx];
+        let base_target = generate::target_good_clear_rate(world, sector_in_world);
+        let block_goal = match prev_block_mean {
+            Some(prev_m) => base_target.min((prev_m - 0.015).max(0.44)),
+            None => base_target,
+        };
+        let desired_rate = if cur_slice.is_empty() {
+            block_goal
+        } else {
+            let sum_so_far: f32 = cur_slice.iter().sum();
+            let n_so_far = cur_slice.len() as f32;
+            ((block_goal * (n_so_far + 1.0)) - sum_so_far).clamp(0.42, 0.95)
+        };
 
         let mut last_issues = Vec::new();
-        let mut accepted = None;
-        for attempt in 0..GENERATE_ATTEMPT_BUDGET {
+        let mut best: Option<(f32, f32, LevelDef, BTreeSet<String>)> = None;
+        let mut fair_seen = 0usize;
+
+        for attempt in 0..ATTEMPT_LIMIT {
             let mut candidate_names = used_names.clone();
             let candidate = match generate_sector(
                 id,
@@ -354,23 +409,59 @@ fn cmd_generate(levels_path: &str, max_world: usize, seed: u64, out_path: &str) 
                     return ExitCode::FAILURE;
                 }
             };
-            let issues = candidate_issues(&config, &pack.levels, &candidate, is_last, target_total);
-            if issues.is_empty() {
-                used_names = candidate_names;
-                accepted = Some(candidate);
+
+            let issues = candidate_issues(
+                &config,
+                &pack.levels,
+                &candidate,
+                is_last,
+                world_planned_total,
+            );
+            if !issues.is_empty() {
+                last_issues = issues;
+                continue;
+            }
+
+            let sims = simulate_levels(&config, std::slice::from_ref(&candidate), &DEFAULT_SEEDS);
+            let rate = sims[0].good.clear_rate;
+            if candidate.boss {
+                best = Some((0.0, rate, candidate, candidate_names));
                 break;
             }
-            last_issues = issues;
+
+            fair_seen += 1;
+            let hard_penalty = if rate <= HARD_RATE_THRESHOLD && prev_two_hard {
+                10.0
+            } else if rate <= HARD_RATE_THRESHOLD && prev_one_hard {
+                1.5
+            } else {
+                0.0
+            };
+            let score = (rate - desired_rate).abs() + hard_penalty;
+            let is_better = best
+                .as_ref()
+                .is_none_or(|(best_s, _, _, _)| score < *best_s);
+            if is_better {
+                best = Some((score, rate, candidate, candidate_names));
+            }
+            if hard_penalty == 0.0 && (rate - desired_rate).abs() <= EARLY_ACCEPT_TOLERANCE {
+                break;
+            }
+            if fair_seen >= MAX_FAIR_CANDIDATES_TO_SCORE {
+                break;
+            }
         }
-        let Some(level) = accepted else {
+        let Some((_, chosen_rate, level, chosen_names)) = best else {
             eprintln!(
-                "FAIL: no candidate for level {id} (world {world}, sector {sector_in_world}) passed after {GENERATE_ATTEMPT_BUDGET} attempts. Last attempt:"
+                "FAIL: no candidate for level {id} (world {world}, sector {sector_in_world}) passed after {ATTEMPT_LIMIT} attempts. Last attempt:"
             );
             for issue in &last_issues {
                 eprintln!("  - {issue}");
             }
             return ExitCode::FAILURE;
         };
+        used_names = chosen_names;
+        good_rates.push(chosen_rate);
         pack.levels.push(level);
     }
 
