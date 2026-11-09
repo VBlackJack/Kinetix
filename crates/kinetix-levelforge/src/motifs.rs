@@ -209,12 +209,12 @@ pub static MOTIFS: [MotifTemplate; 48] = [
         name: "GLYPH_K_X",
         family: MotifFamily::Glyph,
         rows: &[
-            "YY...YY.YY...YY",
+            "YY...YYYYY...YY",
             "YY..YY...YY.YY.",
             "YYYYE.....YZY..",
             "YYYYY.....YEY..",
             "YY..YY...YY.YY.",
-            "YY...YY.YY...YY",
+            "YY...YYYYY...YY",
         ],
     },
     MotifTemplate {
@@ -249,7 +249,7 @@ pub static MOTIFS: [MotifTemplate; 48] = [
         rows: &[
             "YYYY.YYYY..YYYY",
             "Y..Y.Y..Y..Y..Y",
-            "YEEY.Y.EY..Y.EY",
+            "YEEYYY.EYYYY.EY",
             "Y..Y.Y..Y..Y..Y",
             "YYYY.YYYY..YYYY",
         ],
@@ -260,7 +260,7 @@ pub static MOTIFS: [MotifTemplate; 48] = [
         rows: &[
             "YY..YY..YYYYYYY",
             "YY..YY.......YY",
-            "YYYYZYY.YYYYYYY",
+            "YYYYZYYYYYYYYYY",
             "....YY..YY..E..",
             "....YY..YY.....",
             "....YY..YYYYYYY",
@@ -444,7 +444,7 @@ pub static MOTIFS: [MotifTemplate; 48] = [
             "..YYX...YYE.ZYY",
             ".YYX...YYX.ZYY.",
             "YYX...YYX.ZYY..",
-            "YX...YYX.ZYY...",
+            "YXXXXYYXXZYY...",
         ],
     },
     MotifTemplate {
@@ -457,7 +457,7 @@ pub static MOTIFS: [MotifTemplate; 48] = [
             ".YYZ.XYY...XYY.",
             "..YYZ.XYY...XYY",
             "...YYZ.EYY...XY",
-            "....YYZ.XYY...Y",
+            "....YYZ.XYYXXXY",
         ],
     },
     MotifTemplate {
@@ -493,7 +493,7 @@ pub static MOTIFS: [MotifTemplate; 48] = [
             "YYYYYEX........",
             "ZZZZZZX.XXXXXXX",
             "XXXXXXX.XEYYYYY",
-            "........XZZZZZZ",
+            ".......XXZZZZZZ",
             "........XXXXXXX",
         ],
     },
@@ -506,8 +506,8 @@ pub static MOTIFS: [MotifTemplate; 48] = [
         rows: &[
             "YY...YY...YY...",
             ".YY...YY...YY..",
-            "..YYE..YYE..YYZ",
-            "..YYE..YYE..YYZ",
+            "..YYEYYYYEYYYYZ",
+            "..YYEYYYYEYYYYZ",
             ".YY...YY...YY..",
             "YY...YY...YY...",
         ],
@@ -534,7 +534,7 @@ pub static MOTIFS: [MotifTemplate; 48] = [
             "..YEY.....YEY..",
             ".YY.YY...YY.YY.",
             "YY...YY.YY...YY",
-            ".ZZZZZ...ZZZZZ.",
+            ".ZZZZZZZZZZZZZ.",
         ],
     },
     MotifTemplate {
@@ -606,9 +606,9 @@ pub static MOTIFS: [MotifTemplate; 48] = [
         family: MotifFamily::Staircase,
         rows: &[
             "YYYYYYYYYYY....",
-            "........YYYYYY.",
+            ".......YYYYYYY.",
             "...YYYYYYYYY...",
-            ".YYYYY.........",
+            ".YYYYY..YY.....",
             "...YYYYYEYYYYY.",
             "..........YYYYY",
             ".YYYYYYYYYYY...",
@@ -675,7 +675,8 @@ pub static MOTIFS: [MotifTemplate; 48] = [
 mod tests {
     use super::*;
     use crate::validate::{
-        colour_regions_per_cell, dust_and_components, MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8,
+        colour_regions_per_cell, dust_and_components, main_piece_share,
+        MAX_COLOUR_REGIONS_PER_CELL, MAX_COMPONENTS_8, MIN_MAIN_PIECE_SHARE,
     };
     use kinetix_core::level_code::EDITOR_COLS;
     use std::collections::BTreeSet;
@@ -750,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn every_motif_is_a_dust_free_shape_with_few_components_and_colour_regions() {
+    fn every_motif_is_a_dust_free_shape_with_a_main_piece_and_few_colour_regions() {
         for m in &MOTIFS {
             let cells = motif_cells(m);
             let (dust, components) = dust_and_components(&cells);
@@ -758,6 +759,12 @@ mod tests {
             assert!(
                 components <= MAX_COMPONENTS_8,
                 "motif {} has {components} components",
+                m.name
+            );
+            let share = main_piece_share(&cells);
+            assert!(
+                share >= MIN_MAIN_PIECE_SHARE,
+                "motif {} main piece holds only {share:.2} of the shape",
                 m.name
             );
             let regions = colour_regions_per_cell(&cells);
