@@ -61,6 +61,11 @@ pub const POPUP_MULTIPLIER_HIDDEN_MAX: u32 = 1;
 // ---- Menu placeholders ----
 /// Placeholder replaced by the number of selectable worlds in locale strings.
 pub const COUNT_PLACEHOLDER: &str = "{count}";
+/// Placeholders replaced by the first and last sector ids of a world in `menu.sector_range`.
+pub const FIRST_PLACEHOLDER: &str = "{first}";
+pub const LAST_PLACEHOLDER: &str = "{last}";
+/// Number of sectors skipped by a single PageUp / PageDown key press in the title menu.
+pub const MENU_SECTOR_PAGE_STEP: usize = 10;
 
 // ---- Game feel ----
 /// Multiplier applied to the raw mouse delta while the native cursor grab is active.
@@ -211,6 +216,8 @@ pub const MENU_LOCKED_ALPHA: f32 = 0.4;
 pub const MENU_LOCK_LABEL_PAD: f32 = 30.0;
 pub const MENU_SECTOR_Y: f32 = 735.0;
 pub const MENU_SECTOR_SIZE: u16 = 32;
+pub const MENU_SECTOR_SIZE_MIN: u16 = 18;
+pub const MENU_SECTOR_MAX_W: f32 = 880.0;
 pub const MENU_CTA_X: f32 = 470.0;
 pub const MENU_CTA_Y: f32 = 775.0;
 pub const MENU_CTA_W: f32 = 980.0;
@@ -266,6 +273,13 @@ pub const HUD_FOOTER_Y: f32 = 1058.0;
 pub const HUD_HINT_X: f32 = 380.0;
 pub const HUD_HINT_Y: f32 = 1060.0;
 pub const HUD_FOOTER_SIZE: u16 = 22;
+/// Arena width the editor help line is laid out in (the footer is centred on `HUD_BANNER_X`).
+pub const HUD_FOOTER_ARENA_W: f32 = 1920.0;
+/// Widest the editor help line may be: the arena width minus the banner margin on both sides.
+pub const HUD_FOOTER_MAX_W: f32 = HUD_FOOTER_ARENA_W - 2.0 * HUD_BANNER_X;
+/// Separator between the sector label, id and name on the title menu sector line.
+pub const MENU_SECTOR_ID_PREFIX: &str = " #";
+pub const MENU_SECTOR_NAME_SEPARATOR: &str = " - ";
 pub const TOAST_Y: f32 = 82.0;
 pub const TOAST_H: f32 = 38.0;
 pub const TOAST_RADIUS: f32 = 10.0;
@@ -309,3 +323,22 @@ pub const RESUME_TAB: u32 = 128;
 pub const LEVEL_CHEAT_ENABLED: bool = cfg!(debug_assertions);
 /// Resume gestures contributed by the F3 cheat: none when the cheat is compiled out.
 pub const RESUME_CHEAT_MASK: u32 = if LEVEL_CHEAT_ENABLED { RESUME_F3 } else { 0 };
+
+// ---- Special brick drawing ----
+/// Decorative glyphs drawn on moving, bumper and regenerating bricks (not translatable text).
+pub const MOVING_GLYPH: &str = "<>";
+pub const BUMPER_GLYPH: &str = ">>";
+pub const REGEN_GLYPH: &str = "+";
+/// Glyph offsets from the brick centre (x) and shared baseline offset (y).
+pub const MOVING_GLYPH_DX: f32 = -12.0;
+pub const BUMPER_GLYPH_DX: f32 = -12.0;
+pub const REGEN_GLYPH_DX: f32 = -7.0;
+pub const BRICK_GLYPH_DY: f32 = 8.0;
+/// Font sizes of the brick glyphs.
+pub const BRICK_GLYPH_SIZE: u16 = 22;
+pub const REGEN_GLYPH_SIZE: u16 = 24;
+/// Bumper pulsing ring: base radius, pulse amplitude, pulse rate (rad/s) and line thickness.
+pub const BUMPER_RING_RADIUS: f32 = 9.0;
+pub const BUMPER_RING_PULSE_AMP: f32 = 3.5;
+pub const BUMPER_RING_PULSE_RATE: f32 = 11.0;
+pub const BUMPER_RING_THICKNESS: f32 = 2.5;

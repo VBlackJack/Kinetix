@@ -6,7 +6,8 @@
   "menu": {
     "play": "CLIQUEZ OU APPUYEZ SUR [ENTRÉE / ESPACE] POUR LANCER LA CAMPAGNE",
     "campaigns": "CHOIX DU MONDE ([GAUCHE / DROITE] ou [1-{count}])",
-    "sector_select": "SECTEUR DE DÉPART ([HAUT / BAS]) :",
+    "sector_select": "SECTEUR [HAUT/BAS] [PG.PREC/SUIV] [DÉBUT/FIN] :",
+    "sector_range": "(Secteurs {first}-{last})",
     "editor_btn": "[F4] ARCHITECTE DE NIVEAU (ÉDITEUR)",
     "theme_btn": "[F1] MOTEUR DE RENDU",
     "lang_btn": "[F2] LANGUE",
@@ -15,9 +16,9 @@
     "best_score": "RECORD ABSOLU"
   },
   "campaigns": {
-    "c1": "MONDE 1 : GRILLE D'IGNITION (Secteurs 1-5)",
-    "c2": "MONDE 2 : DISTORSION QUANTIQUE (Secteurs 6-10)",
-    "c3": "MONDE 3 : FORGE OMEGA (Secteurs 11-15)"
+    "c1": "MONDE 1 : GRILLE D'IGNITION",
+    "c2": "MONDE 2 : DISTORSION QUANTIQUE",
+    "c3": "MONDE 3 : FORGE OMEGA"
   },
   "hud": {
     "score": "SCORE",
@@ -44,7 +45,7 @@
   },
   "editor": {
     "banner": "ARCHITECTE DE SECTEUR (MODE ÉDITEUR)",
-    "instructions": "CLIC G: Poser | CLIC D: Gommer | [1-6] Std [E] Expl [H] Acier [T] Portail [G] Fantôme [V] Mobile | [X] Exporter [I] Importer [C] Vider [F4] Jouer",
+    "instructions": "CLIC G: Poser | CLIC D: Gommer | [1-6] Std [E] Expl [H] Acier [T] Portail [G] Fantôme [V] Mobile [U] Propuls [R] Régén | [X] Exporter [I] Importer [C] Vider [F4] Jouer",
     "exported": "CODE DU NIVEAU EXPORTÉ !",
     "imported": "NIVEAU PERSONNALISÉ IMPORTÉ !",
     "share_prompt": "Code du niveau (à copier pour le partager) :",

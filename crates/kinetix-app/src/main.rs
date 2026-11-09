@@ -26,7 +26,10 @@ use audio::{
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
-use kinetix_core::physics::{BrickKind, GameEvent, GameWorld, SessionStatus};
+use kinetix_core::physics::{
+    BrickKind, GameEvent, GameWorld, SessionStatus, BUMPER_BRICK_HP, BUMPER_COLOR_IDX,
+    MOVING_BRICK_COLOR_IDX, MOVING_BRICK_HP, REGEN_BRICK_COLOR_IDX, REGEN_BRICK_HP,
+};
 use macroquad::prelude::*;
 use persistence::{high_score_save_due, load_progress, save_progress};
 use std::collections::BTreeSet;
@@ -208,6 +211,55 @@ fn clamp_sector(selected: usize, max_unlocked: usize, last_sector: usize) -> usi
     selected.min(max_unlocked).min(last_sector)
 }
 
+/// Direction / jump kind for start-sector navigation in the title menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectorNav {
+    Prev,
+    Next,
+    PagePrev,
+    PageNext,
+    WorldHome,
+    WorldEnd,
+}
+
+/// Pure start-sector navigation: computes the new `(selected_world_pos, selected_sector_idx)`,
+/// clamped to unlocked sectors. `WorldHome` and `WorldEnd` jump to the first / last unlocked
+/// sector belonging to the currently selected world.
+fn navigate_sector(
+    nav: SectorNav,
+    worlds: &[(usize, usize)],
+    levels: &[LevelDef],
+    world_pos: usize,
+    sector_idx: usize,
+    max_unlocked: usize,
+) -> (usize, usize) {
+    if levels.is_empty() {
+        return (world_pos, 0);
+    }
+    let last_sector = levels.len() - 1;
+    let target = match nav {
+        SectorNav::Next => sector_idx.saturating_add(1),
+        SectorNav::Prev => sector_idx.saturating_sub(1),
+        SectorNav::PageNext => sector_idx.saturating_add(MENU_SECTOR_PAGE_STEP),
+        SectorNav::PagePrev => sector_idx.saturating_sub(MENU_SECTOR_PAGE_STEP),
+        SectorNav::WorldHome => worlds.get(world_pos).map(|&(_, first)| first).unwrap_or(0),
+        SectorNav::WorldEnd => {
+            if let Some(&(_, first)) = worlds.get(world_pos) {
+                let next_first = worlds
+                    .get(world_pos + 1)
+                    .map(|&(_, nf)| nf)
+                    .unwrap_or(levels.len());
+                next_first.saturating_sub(1).max(first)
+            } else {
+                last_sector
+            }
+        }
+    };
+    let new_sector = clamp_sector(target, max_unlocked, last_sector);
+    let new_world_pos = world_pos_for_level(worlds, levels, new_sector, world_pos);
+    (new_world_pos, new_sector)
+}
+
 /// Position of the next unlocked world after `from` in the given direction, wrapping around and
 /// skipping locked worlds; `from` itself when no other world is unlocked.
 fn step_unlocked_world(
@@ -273,6 +325,54 @@ impl SaveTracker {
 /// Replaces the count placeholder of a locale string with the number of worlds.
 fn substitute_count(template: &str, count: usize) -> String {
     template.replace(COUNT_PLACEHOLDER, &count.to_string())
+}
+
+/// Ids of the first and last sector of the world at `pos` in `worlds`.
+fn world_sector_range(
+    worlds: &[(usize, usize)],
+    levels: &[LevelDef],
+    pos: usize,
+) -> Option<(usize, usize)> {
+    let &(_, first_idx) = worlds.get(pos)?;
+    let last_idx = worlds
+        .get(pos + 1)
+        .map_or(levels.len(), |&(_, next_first)| next_first)
+        .checked_sub(1)?;
+    Some((levels.get(first_idx)?.id, levels.get(last_idx)?.id))
+}
+
+/// Title menu line naming the highlighted start sector.
+fn sector_line(label: &str, sector: &LevelDef) -> String {
+    format!(
+        "{label}{MENU_SECTOR_ID_PREFIX}{}{MENU_SECTOR_NAME_SEPARATOR}{}",
+        sector.id, sector.name
+    )
+}
+
+/// Fills the sector range placeholders of a locale string.
+fn substitute_range(template: &str, first: usize, last: usize) -> String {
+    template
+        .replace(FIRST_PLACEHOLDER, &first.to_string())
+        .replace(LAST_PLACEHOLDER, &last.to_string())
+}
+
+/// Label of a world row: its localized name followed by the sector range computed from the data.
+fn world_row_label(
+    i18n: &I18nCatalog,
+    world_id: usize,
+    worlds: &[(usize, usize)],
+    levels: &[LevelDef],
+    pos: usize,
+) -> String {
+    let key = format!("campaigns.c{world_id}");
+    let name = i18n.t(&key);
+    match world_sector_range(worlds, levels, pos) {
+        Some((first, last)) => format!(
+            "{name} {}",
+            substitute_range(i18n.t("menu.sector_range"), first, last)
+        ),
+        None => name.to_string(),
+    }
 }
 
 /// Text of a brick score popup: the points, plus the combo multiplier when it exceeds 1.
@@ -433,6 +533,7 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
         .copied()
         .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
         .chain(MENU_WORLD_TEXT_SIZE_FLOOR..=MENU_WORLD_TEXT_SIZE)
+        .chain(MENU_SECTOR_SIZE_MIN..=MENU_SECTOR_SIZE)
         .map(physical)
         .collect();
     for size in sizes {
@@ -748,24 +849,24 @@ async fn main() {
                     }
                 }
                 let last_sector = level_pack.levels.len().saturating_sub(1);
-                if is_key_pressed(KeyCode::Up) {
-                    selected_sector_idx =
-                        clamp_sector(selected_sector_idx + 1, max_unlocked, last_sector);
-                    selected_world_pos = world_pos_for_level(
-                        &worlds,
-                        &level_pack.levels,
-                        selected_sector_idx,
-                        selected_world_pos,
-                    );
-                }
-                if is_key_pressed(KeyCode::Down) {
-                    selected_sector_idx = selected_sector_idx.saturating_sub(1);
-                    selected_world_pos = world_pos_for_level(
-                        &worlds,
-                        &level_pack.levels,
-                        selected_sector_idx,
-                        selected_world_pos,
-                    );
+                for (key, nav) in [
+                    (KeyCode::Up, SectorNav::Next),
+                    (KeyCode::Down, SectorNav::Prev),
+                    (KeyCode::PageUp, SectorNav::PageNext),
+                    (KeyCode::PageDown, SectorNav::PagePrev),
+                    (KeyCode::Home, SectorNav::WorldHome),
+                    (KeyCode::End, SectorNav::WorldEnd),
+                ] {
+                    if is_key_pressed(key) {
+                        (selected_world_pos, selected_sector_idx) = navigate_sector(
+                            nav,
+                            &worlds,
+                            &level_pack.levels,
+                            selected_world_pos,
+                            selected_sector_idx,
+                            max_unlocked,
+                        );
+                    }
                 }
                 selected_sector_idx = clamp_sector(selected_sector_idx, max_unlocked, last_sector);
 
@@ -815,9 +916,17 @@ async fn main() {
                 }
                 if is_key_pressed(KeyCode::V) {
                     editor_brush = BrickKind::Moving {
-                        hp: 2,
-                        color_idx: 3,
+                        hp: MOVING_BRICK_HP,
+                        color_idx: MOVING_BRICK_COLOR_IDX,
                     };
+                }
+                if is_key_pressed(KeyCode::U) {
+                    editor_brush = BrickKind::Bumper {
+                        hp: BUMPER_BRICK_HP,
+                    };
+                }
+                if is_key_pressed(KeyCode::R) {
+                    editor_brush = BrickKind::Regenerating { hp: REGEN_BRICK_HP };
                 }
                 if is_key_pressed(KeyCode::C) {
                     world.clear_bricks();
@@ -1462,8 +1571,11 @@ fn draw_title_menu(
         } else {
             MENU_UNSELECTED_PREFIX
         };
-        let label_key = format!("campaigns.c{world_id}");
-        let row_text = format!("{}{}", prefix, i18n.t(&label_key));
+        let row_text = format!(
+            "{}{}",
+            prefix,
+            world_row_label(i18n, world_id, worlds, &levels.levels, pos)
+        );
         let text_x = MENU_PANEL_X + MENU_WORLD_TEXT_DX;
         let pill_right = MENU_PANEL_X + MENU_WORLD_PILL_DX + MENU_WORLD_PILL_W;
         // A locked row reserves room for its label on the right and shrinks the name to fit.
@@ -1502,18 +1614,19 @@ fn draw_title_menu(
     }
 
     let sec_def = &levels.levels[selected_sector_idx % levels.levels.len()];
-    let sec_line = format!(
-        "{} #{} - {}",
-        i18n.t("menu.sector_select"),
-        sec_def.id,
-        sec_def.name
+    let sec_line = sector_line(i18n.t("menu.sector_select"), sec_def);
+    let sec_size = fit_font_size(
+        |size| measure_text(&sec_line, Some(font), size, 1.0).width,
+        MENU_SECTOR_SIZE,
+        MENU_SECTOR_SIZE_MIN,
+        MENU_SECTOR_MAX_W,
     );
     txt(
         font,
         &sec_line,
         MENU_PANEL_X + MENU_LABEL_DX,
         MENU_SECTOR_Y,
-        MENU_SECTOR_SIZE,
+        sec_size,
         acc,
     );
 
@@ -1733,6 +1846,14 @@ fn draw_bricks(world: &GameWorld, theme: &ThemeDef, font: &Font, time: f32) {
                 rgba(theme.paddle_accent),
                 if revealed { 0.94 } else { 0.24 },
             ),
+            BrickKind::Bumper { .. } => (
+                rgba(theme.brick_palette[BUMPER_COLOR_IDX % theme.brick_palette.len()]),
+                1.0,
+            ),
+            BrickKind::Regenerating { .. } => (
+                rgba(theme.brick_palette[REGEN_BRICK_COLOR_IDX % theme.brick_palette.len()]),
+                1.0,
+            ),
         };
 
         let (bx, by) = brick.center();
@@ -1885,7 +2006,43 @@ fn draw_bricks(world: &GameWorld, theme: &ThemeDef, font: &Font, time: f32) {
                 draw_circle(bx, by, 4.5, rgba(theme.paddle_accent));
             }
             BrickKind::Moving { hp, .. } => {
-                txt(font, "<>", bx - 12.0, by + 8.0, 22, WHITE);
+                txt(
+                    font,
+                    MOVING_GLYPH,
+                    bx + MOVING_GLYPH_DX,
+                    by + BRICK_GLYPH_DY,
+                    BRICK_GLYPH_SIZE,
+                    WHITE,
+                );
+                if hp == 1 {
+                    draw_crack(rx, ry, rw, rh);
+                }
+            }
+            BrickKind::Bumper { hp } => {
+                let ring_r = BUMPER_RING_RADIUS
+                    + (time * BUMPER_RING_PULSE_RATE).sin().abs() * BUMPER_RING_PULSE_AMP;
+                draw_circle_lines(bx, by, ring_r, BUMPER_RING_THICKNESS, WHITE);
+                txt(
+                    font,
+                    BUMPER_GLYPH,
+                    bx + BUMPER_GLYPH_DX,
+                    by + BRICK_GLYPH_DY,
+                    BRICK_GLYPH_SIZE,
+                    WHITE,
+                );
+                if hp == 1 {
+                    draw_crack(rx, ry, rw, rh);
+                }
+            }
+            BrickKind::Regenerating { hp } => {
+                txt(
+                    font,
+                    REGEN_GLYPH,
+                    bx + REGEN_GLYPH_DX,
+                    by + BRICK_GLYPH_DY,
+                    REGEN_GLYPH_SIZE,
+                    WHITE,
+                );
                 if hp == 1 {
                     draw_crack(rx, ry, rw, rh);
                 }
@@ -2213,14 +2370,14 @@ fn draw_hud(ctx: &HudContext) {
             HUD_BANNER_SIZE,
             acc,
         );
-        txt(
-            font,
-            i18n.t("editor.instructions"),
-            HUD_BANNER_X,
-            HUD_FOOTER_Y,
+        let help = i18n.t("editor.instructions");
+        let help_size = fit_font_size(
+            |size| measure_text(help, Some(font), size, 1.0).width,
             HUD_FOOTER_SIZE,
-            pri,
+            BADGE_FONT_SIZE_MIN,
+            HUD_FOOTER_MAX_W,
         );
+        txt(font, help, HUD_BANNER_X, HUD_FOOTER_Y, help_size, pri);
         return;
     }
 
@@ -2379,6 +2536,7 @@ fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kinetix_core::config::MAX_LEVEL_NAME_LEN;
 
     #[test]
     fn absolute_input_is_detected_by_oversized_deltas() {
@@ -2603,6 +2761,51 @@ mod tests {
     }
 
     #[test]
+    fn sector_navigation_handles_step_page_and_world_bounds() {
+        let levels: Vec<LevelDef> = (0..30).map(|i| level(i + 1, (i / 10) + 1)).collect();
+        let worlds = build_worlds(&levels);
+        let max_unlocked = 16; // World 1 (0..=9) full, World 2 (10..=16) partial, World 3 locked
+
+        assert_eq!(
+            navigate_sector(SectorNav::Next, &worlds, &levels, 0, 0, max_unlocked),
+            (0, 1)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::Prev, &worlds, &levels, 0, 0, max_unlocked),
+            (0, 0)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::PageNext, &worlds, &levels, 0, 2, max_unlocked),
+            (1, 12)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::PageNext, &worlds, &levels, 1, 12, max_unlocked),
+            (1, 16)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::PagePrev, &worlds, &levels, 1, 15, max_unlocked),
+            (0, 5)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::WorldEnd, &worlds, &levels, 0, 3, max_unlocked),
+            (0, 9)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::WorldHome, &worlds, &levels, 0, 9, max_unlocked),
+            (0, 0)
+        );
+        // World 2 end is clamped to max_unlocked (16 instead of 19).
+        assert_eq!(
+            navigate_sector(SectorNav::WorldEnd, &worlds, &levels, 1, 10, max_unlocked),
+            (1, 16)
+        );
+        assert_eq!(
+            navigate_sector(SectorNav::WorldHome, &worlds, &levels, 1, 16, max_unlocked),
+            (1, 10)
+        );
+    }
+
+    #[test]
     fn world_unlock_boundary_is_its_first_sector() {
         assert!(is_world_unlocked(5, 5));
         assert!(!is_world_unlocked(5, 4));
@@ -2664,6 +2867,115 @@ mod tests {
             .filter_map(|g| face.glyph_hor_advance(g))
             .map(|a| a as f32 * scale)
             .sum()
+    }
+
+    fn catalogs() -> [(&'static str, I18nCatalog); 2] {
+        [
+            (
+                "en",
+                I18nCatalog::from_json_str(RAW_EN).expect("en catalog"),
+            ),
+            (
+                "fr",
+                I18nCatalog::from_json_str(RAW_FR).expect("fr catalog"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn level_pack_worlds_fit_the_world_select_keys() {
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        assert!(build_worlds(&pack.levels).len() <= WORLD_SELECT_KEYS.len());
+    }
+
+    #[test]
+    fn world_rows_show_a_localized_sector_range_computed_from_the_data() {
+        let levels = [
+            level(1, 1),
+            level(2, 1),
+            level(3, 2),
+            level(4, 2),
+            level(5, 2),
+        ];
+        let worlds = build_worlds(&levels);
+        assert_eq!(world_sector_range(&worlds, &levels, 0), Some((1, 2)));
+        assert_eq!(world_sector_range(&worlds, &levels, 1), Some((3, 5)));
+        assert_eq!(world_sector_range(&worlds, &levels, 2), None);
+        let [(_, en), (_, fr)] = catalogs();
+        assert_eq!(
+            world_row_label(&en, 2, &worlds, &levels, 1),
+            "WORLD 2: QUANTUM WARP (Sectors 3-5)"
+        );
+        assert_eq!(
+            world_row_label(&fr, 1, &worlds, &levels, 0),
+            "MONDE 1 : GRILLE D'IGNITION (Secteurs 1-2)"
+        );
+    }
+
+    #[test]
+    fn locale_world_names_carry_no_sector_range() {
+        for (code, catalog) in catalogs() {
+            assert!(catalog.t("menu.sector_range").contains(FIRST_PLACEHOLDER));
+            assert!(catalog.t("menu.sector_range").contains(LAST_PLACEHOLDER));
+            for world in 1..=WORLD_SELECT_KEYS.len() {
+                let key = format!("campaigns.c{world}");
+                let name = catalog.t(&key);
+                assert!(
+                    name == key || !name.contains('('),
+                    "{code}/{key} must not embed a sector range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sector_line_fits_at_the_minimum_font_size() {
+        let face = ttf_parser::Face::parse(RAW_FONT, 0).expect("valid font");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let worst_id = 999;
+        let synthetic = LevelDef {
+            id: worst_id,
+            world: 1,
+            name: "W".repeat(MAX_LEVEL_NAME_LEN),
+            boss: false,
+            rows: Vec::new(),
+        };
+        let legacy_boss = pack
+            .levels
+            .iter()
+            .max_by_key(|l| l.name.chars().count())
+            .expect("a level")
+            .clone();
+        assert!(legacy_boss.name.chars().count() >= MAX_LEVEL_NAME_LEN);
+        for (code, catalog) in catalogs() {
+            for level in [&synthetic, &legacy_boss] {
+                let line = sector_line(catalog.t("menu.sector_select"), level);
+                let width = text_width(&face, &line, MENU_SECTOR_SIZE_MIN as f32);
+                assert!(
+                    width <= MENU_SECTOR_MAX_W,
+                    "{code}/{}: sector line is {width:.0}px, limit {MENU_SECTOR_MAX_W:.0}px",
+                    level.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editor_help_line_fits_the_arena_width() {
+        let face = ttf_parser::Face::parse(RAW_FONT, 0).expect("valid font");
+        let cfg: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        assert_eq!(HUD_FOOTER_MAX_W, cfg.arena.width - 2.0 * HUD_BANNER_X);
+        for (code, catalog) in catalogs() {
+            let width = text_width(
+                &face,
+                catalog.t("editor.instructions"),
+                HUD_FOOTER_SIZE as f32,
+            );
+            assert!(
+                width <= HUD_FOOTER_MAX_W,
+                "{code}: editor help is {width:.0}px, limit {HUD_FOOTER_MAX_W:.0}px"
+            );
+        }
     }
 
     #[test]

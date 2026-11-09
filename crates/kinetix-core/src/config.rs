@@ -16,6 +16,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum length, in characters, of a level name (boss suffix included).
+pub const MAX_LEVEL_NAME_LEN: usize = 24;
+
+/// Default speed added by a bumper hit, used when a config predates the field.
+const DEFAULT_BUMPER_SPEED_BOOST: f32 = 140.0;
+/// Default time a bumper boost takes to fade out, used when a config predates the field.
+const DEFAULT_BUMPER_BOOST_DECAY_SEC: f32 = 1.5;
+/// Default time a damaged regenerating brick needs to heal, used when a config predates the field.
+const DEFAULT_REGEN_DELAY_SEC: f32 = 4.0;
+
+fn default_bumper_speed_boost() -> f32 {
+    DEFAULT_BUMPER_SPEED_BOOST
+}
+
+fn default_bumper_boost_decay_sec() -> f32 {
+    DEFAULT_BUMPER_BOOST_DECAY_SEC
+}
+
+fn default_regen_delay_sec() -> f32 {
+    DEFAULT_REGEN_DELAY_SEC
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArenaConfig {
     pub width: f32,
@@ -46,6 +68,12 @@ pub struct BallConfig {
     pub max_speed: f32,
     pub speed_step_on_hit: f32,
     pub substeps: usize,
+    /// Temporary speed added on top of the base speed by a bumper hit.
+    #[serde(default = "default_bumper_speed_boost")]
+    pub bumper_speed_boost: f32,
+    /// Seconds a bumper boost takes to decay linearly back to zero.
+    #[serde(default = "default_bumper_boost_decay_sec")]
+    pub bumper_boost_decay_sec: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +111,9 @@ pub struct GameplayConfig {
     pub combo_max_mult: u32,
     pub multiball_spread_rad: f32,
     pub powerup_score_mult: u64,
+    /// Seconds a damaged regenerating brick waits (since its last hit) before healing.
+    #[serde(default = "default_regen_delay_sec")]
+    pub regen_delay_sec: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

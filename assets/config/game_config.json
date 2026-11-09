@@ -23,7 +23,9 @@
     "min_speed": 520.0,
     "max_speed": 1320.0,
     "speed_step_on_hit": 4.5,
-    "substeps": 6
+    "substeps": 6,
+    "bumper_speed_boost": 140.0,
+    "bumper_boost_decay_sec": 1.5
   },
   "gameplay": {
     "initial_lives": 3,
@@ -58,6 +60,7 @@
     "combo_step": 4,
     "combo_max_mult": 8,
     "multiball_spread_rad": 0.38,
-    "powerup_score_mult": 2
+    "powerup_score_mult": 2,
+    "regen_delay_sec": 4.0
   }
 }

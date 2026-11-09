@@ -184,6 +184,8 @@ fn export_import_round_trip_preserves_every_cell() {
             color_idx: 3,
         },
     );
+    paint(&mut w, 12, 0, BrickKind::Bumper { hp: 2 });
+    paint(&mut w, 13, 0, BrickKind::Regenerating { hp: 2 });
     paint(&mut w, 0, 8, BrickKind::Explosive);
     paint(&mut w, 14, 9, BrickKind::Indestructible);
     // A damaged two-hit brick keeps its colour digit.

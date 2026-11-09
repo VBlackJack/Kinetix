@@ -47,6 +47,9 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+      - name: Validate campaign levels
+        run: cargo run -p kinetix-levelforge --locked -- validate
+
       - name: Build web bundle
         shell: pwsh
         run: pwsh -NoProfile -File scripts/Build-Web.ps1

@@ -34,6 +34,8 @@ const INDESTRUCTIBLE_CELL: char = '#';
 const PORTAL_CELL: char = 'T';
 const GHOST_CELL: char = 'G';
 const MOVING_CELL: char = 'M';
+const BUMPER_CELL: char = 'B';
+const REGEN_CELL: char = 'R';
 const MIN_COLOR_DIGIT: u32 = 1;
 const MAX_COLOR_DIGIT: u32 = 6;
 /// First digit that loads as a two-hit brick (see `GameWorld::load_from_rows`).
@@ -101,7 +103,10 @@ impl fmt::Display for LevelCodeError {
 impl std::error::Error for LevelCodeError {}
 
 fn is_destructible_cell(ch: char) -> bool {
-    matches!(ch, '1'..='6' | EXPLOSIVE_CELL | GHOST_CELL | MOVING_CELL)
+    matches!(
+        ch,
+        '1'..='6' | EXPLOSIVE_CELL | GHOST_CELL | MOVING_CELL | BUMPER_CELL | REGEN_CELL
+    )
 }
 
 fn is_valid_cell(ch: char) -> bool {
@@ -205,6 +210,8 @@ impl GameWorld {
                 BrickKind::Portal => PORTAL_CELL,
                 BrickKind::Ghost { .. } => GHOST_CELL,
                 BrickKind::Moving { .. } => MOVING_CELL,
+                BrickKind::Bumper { .. } => BUMPER_CELL,
+                BrickKind::Regenerating { .. } => REGEN_CELL,
                 BrickKind::Standard {
                     max_hp, color_idx, ..
                 } => {

@@ -89,9 +89,9 @@ const GHOST_HIT_COLOR_IDX: usize = 2;
 /// Colour index used for explosive brick score events.
 const EXPLOSIVE_COLOR_IDX: usize = 5;
 /// Hit points of a freshly loaded moving brick.
-const MOVING_BRICK_HP: u8 = 2;
+pub const MOVING_BRICK_HP: u8 = 2;
 /// Colour index of moving bricks.
-const MOVING_BRICK_COLOR_IDX: usize = 3;
+pub const MOVING_BRICK_COLOR_IDX: usize = 3;
 /// First level-file digit that loads as a two-hit standard brick.
 const TOUGH_BRICK_DIGIT: usize = 5;
 /// Hit points of a two-hit standard brick.
@@ -105,6 +105,18 @@ const BOSS_LEFT_TURRET_RATIO: f32 = 0.25;
 const BOSS_RIGHT_TURRET_RATIO: f32 = 0.75;
 /// Boss damage dealt by a mega or fire ball.
 const BOSS_POWER_DAMAGE: u32 = 2;
+/// Hit points of a freshly loaded bumper brick.
+pub const BUMPER_BRICK_HP: u8 = 2;
+/// Colour index of bumper bricks.
+pub const BUMPER_COLOR_IDX: usize = 4;
+/// Hit points of a freshly loaded regenerating brick.
+pub const REGEN_BRICK_HP: u8 = 2;
+/// Flash intensity of a brick that was just painted in the editor.
+const EDITOR_PAINT_FLASH: f32 = 0.5;
+/// Flash intensity of a regenerating brick that just healed.
+const REGEN_HEAL_FLASH: f32 = 0.6;
+/// Colour index of regenerating bricks.
+pub const REGEN_BRICK_COLOR_IDX: usize = 1;
 
 /// Single definition of the brick grid, shared by level loading, editor painting and export.
 #[derive(Debug, Clone, Copy)]
@@ -246,6 +258,12 @@ pub enum BrickKind {
         hp: u8,
         color_idx: usize,
     },
+    Bumper {
+        hp: u8,
+    },
+    Regenerating {
+        hp: u8,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,9 +275,32 @@ pub struct Brick {
     pub vx: f32,
     pub kind: BrickKind,
     pub hit_flash: f32,
+    /// Seconds left before a damaged regenerating brick heals (unused by other kinds).
+    #[serde(default)]
+    pub regen_timer: f32,
+}
+
+impl Ball {
+    /// Speed actually travelled: base plus the bumper boost, never above `max_speed`.
+    pub fn effective_speed(&self, max_speed: f32) -> f32 {
+        (self.speed + self.boost).min(max_speed)
+    }
 }
 
 impl Brick {
+    pub fn new(x: f32, y: f32, w: f32, h: f32, vx: f32, kind: BrickKind, hit_flash: f32) -> Self {
+        Self {
+            x,
+            y,
+            w,
+            h,
+            vx,
+            kind,
+            hit_flash,
+            regen_timer: 0.0,
+        }
+    }
+
     pub fn is_destructible(&self) -> bool {
         !matches!(self.kind, BrickKind::Indestructible | BrickKind::Portal)
     }
@@ -383,7 +424,10 @@ pub struct Ball {
     pub y: f32,
     pub vx: f32,
     pub vy: f32,
+    /// Base speed, changed by hits and the slow / fast power-ups.
     pub speed: f32,
+    /// Temporary bumper boost added on top of `speed`, decaying to zero.
+    pub boost: f32,
     pub radius: f32,
     pub stuck_offset: Option<f32>,
     pub fireball: bool,
@@ -619,6 +663,13 @@ impl GameWorld {
                     '#' => (BrickKind::Indestructible, 0.0),
                     'T' => (BrickKind::Portal, 0.0),
                     'G' => (BrickKind::Ghost { revealed: false }, 0.0),
+                    'B' => (
+                        BrickKind::Bumper {
+                            hp: BUMPER_BRICK_HP,
+                        },
+                        0.0,
+                    ),
+                    'R' => (BrickKind::Regenerating { hp: REGEN_BRICK_HP }, 0.0),
                     'M' => (
                         BrickKind::Moving {
                             hp: MOVING_BRICK_HP,
@@ -655,15 +706,8 @@ impl GameWorld {
                         0.0,
                     ),
                 };
-                self.bricks.push(Brick {
-                    x,
-                    y,
-                    w: brick_w,
-                    h: BRICK_HEIGHT,
-                    vx,
-                    kind,
-                    hit_flash: 0.0,
-                });
+                self.bricks
+                    .push(Brick::new(x, y, brick_w, BRICK_HEIGHT, vx, kind, 0.0));
             }
         }
         self.reset_paddle_and_ball();
@@ -687,6 +731,7 @@ impl GameWorld {
             vx: INITIAL_DIR_X,
             vy: INITIAL_DIR_Y,
             speed: self.config.ball.default_speed,
+            boost: 0.0,
             radius: self.config.ball.default_radius,
             stuck_offset: Some(0.0),
             fireball: false,
@@ -718,15 +763,15 @@ impl GameWorld {
             } else {
                 0.0
             };
-            self.bricks.push(Brick {
-                x: target_x,
-                y: target_y,
-                w: brick_w,
-                h: BRICK_HEIGHT,
+            self.bricks.push(Brick::new(
+                target_x,
+                target_y,
+                brick_w,
+                BRICK_HEIGHT,
                 vx,
-                kind: k,
-                hit_flash: 0.5,
-            });
+                k,
+                EDITOR_PAINT_FLASH,
+            ));
         }
     }
 
@@ -828,12 +873,32 @@ impl GameWorld {
             }
         }
 
+        // Bumper boosts fade at a constant rate on the frame clock, not per substep.
+        let boost_decay = self.config.ball.bumper_speed_boost
+            / self.config.ball.bumper_boost_decay_sec.max(f32::EPSILON)
+            * dt;
+        for ball in &mut self.balls {
+            if ball.boost > 0.0 {
+                ball.boost = (ball.boost - boost_decay).max(0.0);
+            }
+        }
+
         let moving_margin = self.config.ball.mega_radius * 2.0 + MOVING_BRICK_WALL_EXTRA_MARGIN;
         let min_bx = self.config.arena.wall_side + moving_margin;
         let max_bx = self.config.arena.width - self.config.arena.wall_side - moving_margin;
         for brick in &mut self.bricks {
             if brick.hit_flash > 0.0 {
                 brick.hit_flash = (brick.hit_flash - dt * BRICK_FLASH_DECAY).max(0.0);
+            }
+            if let BrickKind::Regenerating { hp } = &mut brick.kind {
+                if *hp < REGEN_BRICK_HP && brick.regen_timer > 0.0 {
+                    brick.regen_timer -= dt;
+                    if brick.regen_timer <= 0.0 {
+                        brick.regen_timer = 0.0;
+                        *hp = REGEN_BRICK_HP;
+                        brick.hit_flash = REGEN_HEAL_FLASH;
+                    }
+                }
             }
             if brick.vx.abs() > 0.1 {
                 brick.x += brick.vx * dt;
@@ -963,6 +1028,7 @@ impl GameWorld {
         let paddle_half_w = self.paddle_width * 0.5;
         let max_angle = self.config.paddle.max_bounce_angle_deg.to_radians();
         let shield_y = self.shield_y();
+        let max_speed = self.config.ball.max_speed;
 
         let mut pending_explosions = Vec::new();
         let mut pending_lightning = Vec::new();
@@ -992,8 +1058,9 @@ impl GameWorld {
                 ball.vy /= norm;
             }
 
-            ball.x += ball.vx * ball.speed * dt;
-            ball.y += ball.vy * ball.speed * dt;
+            let speed = ball.effective_speed(max_speed);
+            ball.x += ball.vx * speed * dt;
+            ball.y += ball.vy * speed * dt;
 
             if ball.trail.len() >= TRAIL_MAX_LEN {
                 ball.trail.remove(0);
@@ -1154,8 +1221,17 @@ impl GameWorld {
                     };
 
                     if counted {
-                        ball.speed = (ball.speed + self.config.ball.speed_step_on_hit)
-                            .min(self.config.ball.max_speed);
+                        if matches!(self.bricks[idx].kind, BrickKind::Bumper { .. }) {
+                            // The boost is temporary and never pushes the total past the cap.
+                            ball.boost = self
+                                .config
+                                .ball
+                                .bumper_speed_boost
+                                .min((max_speed - ball.speed).max(0.0));
+                        } else {
+                            ball.speed =
+                                (ball.speed + self.config.ball.speed_step_on_hit).min(max_speed);
+                        }
 
                         let center = self.bricks[idx].center();
                         let was_explosive = matches!(self.bricks[idx].kind, BrickKind::Explosive);
@@ -1238,6 +1314,47 @@ impl GameWorld {
                         x: center.0,
                         y: center.1,
                         color_idx: GHOST_HIT_COLOR_IDX,
+                        destroyed: false,
+                        points: 0,
+                        multiplier: NO_MULTIPLIER,
+                    });
+                    false
+                }
+            }
+            BrickKind::Regenerating { mut hp } => {
+                if instant_kill || hp <= 1 {
+                    self.bricks.swap_remove(idx);
+                    self.register_brick_score(center.0, center.1, REGEN_BRICK_COLOR_IDX, events);
+                    true
+                } else {
+                    hp -= 1;
+                    self.bricks[idx].kind = BrickKind::Regenerating { hp };
+                    self.bricks[idx].regen_timer = self.config.gameplay.regen_delay_sec;
+                    self.bricks[idx].hit_flash = 1.0;
+                    events.push(GameEvent::BrickHit {
+                        x: center.0,
+                        y: center.1,
+                        color_idx: REGEN_BRICK_COLOR_IDX,
+                        destroyed: false,
+                        points: 0,
+                        multiplier: NO_MULTIPLIER,
+                    });
+                    false
+                }
+            }
+            BrickKind::Bumper { mut hp } => {
+                if instant_kill || hp <= 1 {
+                    self.bricks.swap_remove(idx);
+                    self.register_brick_score(center.0, center.1, BUMPER_COLOR_IDX, events);
+                    true
+                } else {
+                    hp -= 1;
+                    self.bricks[idx].kind = BrickKind::Bumper { hp };
+                    self.bricks[idx].hit_flash = 1.0;
+                    events.push(GameEvent::BrickHit {
+                        x: center.0,
+                        y: center.1,
+                        color_idx: BUMPER_COLOR_IDX,
                         destroyed: false,
                         points: 0,
                         multiplier: NO_MULTIPLIER,

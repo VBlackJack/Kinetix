@@ -48,14 +48,33 @@ pub fn save_progress(high_score: u64, unlocked: usize, theme: usize, lang_fr: bo
     }
 }
 
+/// Bit masks and shifts for the packed web state word returned by `kinetix_load_packed`.
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_UNLOCKED_MASK: u32 = 0xFFFF;
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_THEME_SHIFT: u32 = 16;
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_THEME_MASK: u32 = 0xFF;
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_LANG_SHIFT: u32 = 24;
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_LANG_MASK: u32 = 0x1;
+
+/// Unpacks the 32-bit state word returned by `kinetix_load_packed` (pure, testable).
+/// Bits 0..16: unlocked sector index; bits 16..24: theme index; bit 24: French locale flag.
+#[cfg(any(target_arch = "wasm32", test))]
+pub fn unpack_web_state(packed: u32) -> (usize, usize, bool) {
+    let unlocked = (packed & WEB_UNLOCKED_MASK) as usize;
+    let theme = ((packed >> WEB_THEME_SHIFT) & WEB_THEME_MASK) as usize;
+    let lang_fr = ((packed >> WEB_LANG_SHIFT) & WEB_LANG_MASK) != 0;
+    (unlocked, theme, lang_fr)
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn load_progress() -> (u64, usize, usize, bool) {
     unsafe {
         let hs = kinetix_load_highscore() as u64;
-        let packed = kinetix_load_packed();
-        let unlocked = (packed & 0xFF) as usize;
-        let theme = ((packed >> 8) & 0xFF) as usize;
-        let lang_fr = ((packed >> 16) & 0xFF) != 0;
+        let (unlocked, theme, lang_fr) = unpack_web_state(kinetix_load_packed());
         (hs, unlocked, theme, lang_fr)
     }
 }
@@ -513,7 +532,7 @@ mod native {
 
 #[cfg(test)]
 mod throttle_tests {
-    use super::high_score_save_due;
+    use super::{high_score_save_due, unpack_web_state};
 
     #[test]
     fn no_save_without_a_new_high_score() {
@@ -526,5 +545,16 @@ mod throttle_tests {
         assert!(!high_score_save_due(200, 100, 12.0, 10.0, 5.0));
         assert!(high_score_save_due(200, 100, 15.0, 10.0, 5.0));
         assert!(high_score_save_due(200, 100, 99.0, 10.0, 5.0));
+    }
+
+    #[test]
+    fn web_state_unpacks_16bit_unlocked_8bit_theme_1bit_lang() {
+        assert_eq!(unpack_web_state(0), (0, 0, false));
+        let packed = 799u32 | (5u32 << 16) | (1u32 << 24);
+        assert_eq!(unpack_web_state(packed), (799, 5, true));
+        let max_packed = 0xFFFFu32 | (0xFFu32 << 16) | (1u32 << 24);
+        assert_eq!(unpack_web_state(max_packed), (65535, 255, true));
+        let en_packed = 350u32 | (7u32 << 16);
+        assert_eq!(unpack_web_state(en_packed), (350, 7, false));
     }
 }

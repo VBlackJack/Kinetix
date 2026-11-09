@@ -6,7 +6,8 @@
   "menu": {
     "play": "CLICK OR PRESS [ENTER / SPACE] TO LAUNCH CAMPAIGN",
     "campaigns": "SELECT CAMPAIGN WORLD ([LEFT / RIGHT] or [1-{count}])",
-    "sector_select": "START SECTOR ([UP / DOWN]):",
+    "sector_select": "START SECTOR [UP/DOWN] [PGUP/DN] [HOME/END]:",
+    "sector_range": "(Sectors {first}-{last})",
     "editor_btn": "[F4] LEVEL ARCHITECT (EDITOR)",
     "theme_btn": "[F1] VISUAL RENDERER",
     "lang_btn": "[F2] LANGUAGE",
@@ -15,9 +16,9 @@
     "best_score": "HIGH SCORE"
   },
   "campaigns": {
-    "c1": "WORLD 1: IGNITION GRID (Sectors 1-5)",
-    "c2": "WORLD 2: QUANTUM WARP (Sectors 6-10)",
-    "c3": "WORLD 3: OMEGA FORGE (Sectors 11-15)"
+    "c1": "WORLD 1: IGNITION GRID",
+    "c2": "WORLD 2: QUANTUM WARP",
+    "c3": "WORLD 3: OMEGA FORGE"
   },
   "hud": {
     "score": "SCORE",
@@ -44,7 +45,7 @@
   },
   "editor": {
     "banner": "SECTOR ARCHITECT (EDITOR MODE)",
-    "instructions": "L-CLICK: Paint | R-CLICK: Erase | [1-6] Std [E] Expl [H] Steel [T] Portal [G] Ghost [V] Moving | [X] Export [I] Import [C] Clear [F4] Play",
+    "instructions": "L-CLICK: Paint | R-CLICK: Erase | [1-6] Std [E] Expl [H] Steel [T] Portal [G] Ghost [V] Moving [U] Bumper [R] Regen | [X] Export [I] Import [C] Clear [F4] Play",
     "exported": "LEVEL CODE COPIED TO CLIPBOARD / PROMPT!",
     "imported": "CUSTOM LEVEL LOADED FROM CODE!",
     "share_prompt": "Level code (copy to share):",
