@@ -51,8 +51,18 @@ impl Session {
 /// was being played before, so it can never reach the campaign progress. Fresh paddle and ball.
 pub(crate) fn enter_editor(session: &mut Session, world: &mut GameWorld) {
     session.source = PlaySource::EditorTest;
+    session.editor_snapshot = None;
     world.reset_paddle_and_ball();
     world.status = SessionStatus::Playing;
+}
+
+/// Called when play resumes from the title screen (Tab): an editor test that has no snapshot yet
+/// (the editor was left through Tab, not through the test-play key) remembers the board now.
+/// An editor test that already has one keeps it, so a damaged board is never snapshotted.
+pub(crate) fn resume_play_from_title(session: &mut Session, world: &GameWorld) {
+    if session.source == PlaySource::EditorTest && session.editor_snapshot.is_none() {
+        session.editor_snapshot = Some(world.export_level_code());
+    }
 }
 
 /// Starts a test play of the editor board: the board is remembered so a restart replays it.
@@ -144,6 +154,8 @@ pub(crate) enum RestartOutcome {
     Restarted,
     /// There is nothing to restart: back to the title screen, opened on this page.
     ToTitle(PageId),
+    /// The editor test has no remembered board: back to the editor.
+    ToEditor,
 }
 
 /// Restarts the current board of the session: the same satisfaction level, the same library
@@ -165,9 +177,10 @@ pub(crate) fn restart_current(
             reload_custom_board(world, &entry.code);
         }
         PlaySource::EditorTest => {
-            if let Some(code) = &session.editor_snapshot {
-                reload_custom_board(world, code);
-            }
+            let Some(code) = &session.editor_snapshot else {
+                return RestartOutcome::ToEditor;
+            };
+            reload_custom_board(world, code);
         }
         PlaySource::Campaign | PlaySource::Satisfaction => restart_level(
             world,
@@ -315,10 +328,14 @@ pub(crate) fn default_library_name(template: &str, id: u32) -> String {
 /// touched.
 pub(crate) fn save_board_to_library(
     library: &mut Library,
+    loaded: bool,
     code: String,
     name_template: &str,
     persist: impl FnOnce(&Library) -> Result<(), SaveError>,
 ) -> LibraryOutcome {
+    if !loaded {
+        return LibraryOutcome::SaveFailed;
+    }
     if let Err(err) = parse_level_code(&code) {
         return LibraryOutcome::InvalidBoard(err);
     }
@@ -358,6 +375,8 @@ pub(crate) enum PauseOutcome {
     ToTitle,
     /// The board cannot be restarted any more: the title screen opens on this page.
     ToTitlePage(PageId),
+    /// The editor test cannot be restarted: back to the editor.
+    ToEditor,
 }
 
 /// Applies the pause menu actions that do not reload a board. Resume puts the world back to
@@ -393,6 +412,7 @@ pub(crate) fn apply_session_pause_action(
                 PauseOutcome::Resumed
             }
             RestartOutcome::ToTitle(page) => PauseOutcome::ToTitlePage(page),
+            RestartOutcome::ToEditor => PauseOutcome::ToEditor,
         };
     }
     apply_pause_action(action, world)
@@ -1101,6 +1121,7 @@ mod tests {
         let mut writes = 0;
         let outcome = save_board_to_library(
             &mut library,
+            true,
             world.export_level_code(),
             NAME_TEMPLATE,
             |_| {
@@ -1117,6 +1138,7 @@ mod tests {
 
         let outcome = save_board_to_library(
             &mut library,
+            true,
             world.export_level_code(),
             NAME_TEMPLATE,
             |_| Ok(()),
@@ -1132,6 +1154,7 @@ mod tests {
         let mut library = Library::default();
         let outcome = save_board_to_library(
             &mut library,
+            true,
             world.export_level_code(),
             NAME_TEMPLATE,
             |_| panic!("nothing to write"),
@@ -1153,6 +1176,7 @@ mod tests {
         }
         let outcome = save_board_to_library(
             &mut library,
+            true,
             world.export_level_code(),
             NAME_TEMPLATE,
             |_| panic!("nothing to write"),
@@ -1171,6 +1195,7 @@ mod tests {
         let mut library = Library::default();
         let outcome = save_board_to_library(
             &mut library,
+            true,
             world.export_level_code(),
             NAME_TEMPLATE,
             |_| Err(SaveError::Failed),
@@ -1410,5 +1435,152 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_campaign_board_under_a_non_campaign_source_stays_frozen() {
+        for source in [
+            PlaySource::Satisfaction,
+            PlaySource::Library(1),
+            PlaySource::EditorTest,
+        ] {
+            let (mut world, pack) = dev_test_world();
+            let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
+            let dev = DevState::default();
+            start_run_from_title(
+                &mut world,
+                &mut DevState::default(),
+                &pack.levels,
+                0,
+                PlaySource::Campaign,
+            );
+            assert!(world.is_campaign_board(), "the board itself is a sector");
+            world.high_score = 5_000;
+            win_current_level(&mut world);
+            sync_progress(&mut guard, &dev, &mut world, source);
+            assert_eq!(world.high_score, 1, "{source:?}");
+            assert_eq!(world.max_unlocked_level, 0, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn leaving_the_editor_through_tab_still_snapshots_the_tested_board() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let library = Library::default();
+        let mut dev = DevState::default();
+        let mut session = Session::campaign();
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+
+        // Editor entered, board edited, then Tab (title) and Tab again (play).
+        enter_editor(&mut session, &mut world);
+        let edited_bricks = world.bricks.len();
+        resume_play_from_title(&mut session, &world);
+        assert!(session.editor_snapshot.is_some());
+        world.bricks.truncate(1);
+        world.status = SessionStatus::GameOver;
+        let outcome = restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(outcome, RestartOutcome::Restarted);
+        assert_eq!(world.bricks.len(), edited_bricks);
+
+        // Tab out and back during the same test play keeps the same snapshot.
+        world.bricks.truncate(1);
+        resume_play_from_title(&mut session, &world);
+        restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(world.bricks.len(), edited_bricks, "no damaged snapshot");
+    }
+
+    #[test]
+    fn a_new_visit_to_the_editor_drops_the_stale_snapshot() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let library = Library::default();
+        let mut dev = DevState::default();
+        let mut session = Session::campaign();
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        start_editor_test(&mut session, &mut world);
+        let old_bricks = world.bricks.len();
+
+        enter_editor(&mut session, &mut world);
+        assert!(session.editor_snapshot.is_none());
+        world.bricks.truncate(2);
+        let new_bricks = world.bricks.len();
+        assert_ne!(old_bricks, new_bricks);
+        resume_play_from_title(&mut session, &world);
+        world.bricks.truncate(1);
+        restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(
+            world.bricks.len(),
+            new_bricks,
+            "the newer board, not the old one"
+        );
+    }
+
+    #[test]
+    fn an_editor_test_without_a_snapshot_returns_to_the_editor() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut dev = DevState::default();
+        let mut session = Session::campaign();
+        enter_editor(&mut session, &mut world);
+        world.status = SessionStatus::Paused;
+        let outcome = restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &Library::default(),
+        );
+        assert_eq!(outcome, RestartOutcome::ToEditor);
+        let outcome = apply_session_pause_action(
+            MenuAction::Restart,
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &Library::default(),
+        );
+        assert_eq!(outcome, PauseOutcome::ToEditor);
+        assert_eq!(world.status, SessionStatus::Paused);
+    }
+
+    #[test]
+    fn nothing_is_added_to_a_library_that_is_not_loaded() {
+        let (world, _) = dev_test_world();
+        let mut library = Library::default();
+        let outcome = save_board_to_library(
+            &mut library,
+            false,
+            world.export_level_code(),
+            NAME_TEMPLATE,
+            |_| panic!("nothing to write"),
+        );
+        assert_eq!(outcome, LibraryOutcome::SaveFailed);
+        assert_eq!(outcome.toast_key(), Some("storage.toast.save_failed"));
+        assert!(library.entries.is_empty());
+        assert_eq!(library.next_id, Library::default().next_id);
     }
 }

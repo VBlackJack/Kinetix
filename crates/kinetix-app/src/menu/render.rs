@@ -34,6 +34,10 @@ const HEADER_BAND_ALPHA: f32 = 0.05;
 /// Text colours tried on the accent-filled focused widget: the panel background and white.
 const FOCUS_TEXT_DARK: [u8; 4] = [12, 14, 30, 255];
 const FOCUS_TEXT_LIGHT: [u8; 4] = [255, 255, 255, 255];
+/// Share of the primary text colour kept on a focused but disabled widget (the rest is the pill).
+const DISABLED_FOCUS_TEXT_MIX: f32 = 0.75;
+/// Width of the accent outline of a focused disabled widget.
+const DISABLED_FOCUS_BORDER: f32 = 3.0;
 /// Linearisation of an sRGB channel (WCAG relative luminance).
 const SRGB_THRESHOLD: f32 = 0.039_28;
 const SRGB_LINEAR_DIVISOR: f32 = 12.92;
@@ -77,6 +81,21 @@ fn luminance(c: [u8; 4]) -> f32 {
 pub(crate) fn contrast_ratio(a: [u8; 4], b: [u8; 4]) -> f32 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + CONTRAST_OFFSET) / (la.min(lb) + CONTRAST_OFFSET)
+}
+
+/// Text colour of a focused disabled widget: the primary colour dimmed towards the idle pill, so
+/// it reads as disabled and stays readable.
+pub(crate) fn disabled_focus_text_color(primary: [u8; 4]) -> [u8; 4] {
+    let mix = |fg: u8, bg: u8| {
+        (f32::from(fg) * DISABLED_FOCUS_TEXT_MIX + f32::from(bg) * (1.0 - DISABLED_FOCUS_TEXT_MIX))
+            .round() as u8
+    };
+    [
+        mix(primary[0], IDLE_PILL_COLOR[0]),
+        mix(primary[1], IDLE_PILL_COLOR[1]),
+        mix(primary[2], IDLE_PILL_COLOR[2]),
+        u8::MAX,
+    ]
 }
 
 /// Text colour drawn on a widget filled with `fill`: whichever of the panel background and white
@@ -154,6 +173,8 @@ struct WidgetColors {
     accent: Color,
     /// Text on the accent-filled focused widget.
     focus_text: Color,
+    /// Text on a focused disabled widget.
+    dimmed_text: Color,
 }
 
 fn draw_widget(
@@ -169,14 +190,29 @@ fn draw_widget(
         primary,
         accent,
         focus_text,
+        dimmed_text,
     } = colors;
-    if focused {
+    let disabled_focus = focused && !widget.enabled;
+    let (color, value_color, alpha) = if disabled_focus {
+        // Idle pill with an accent outline and dimmed but readable text.
+        fill_rounded(x, y, w, h, PILL_RADIUS, accent);
+        fill_rounded(
+            x + DISABLED_FOCUS_BORDER,
+            y + DISABLED_FOCUS_BORDER,
+            w - 2.0 * DISABLED_FOCUS_BORDER,
+            h - 2.0 * DISABLED_FOCUS_BORDER,
+            PILL_RADIUS - DISABLED_FOCUS_BORDER,
+            rgba(IDLE_PILL_COLOR),
+        );
+        (dimmed_text, dimmed_text, 1.0)
+    } else if focused {
         fill_rounded(x, y, w, h, PILL_RADIUS, with_alpha(accent, alpha));
+        (focus_text, focus_text, alpha)
     } else {
         fill_rounded(x, y, w, h, PILL_RADIUS, rgba(IDLE_PILL_COLOR));
-    }
-    let color = with_alpha(if focused { focus_text } else { primary }, alpha);
-    let value_color = if focused { focus_text } else { accent };
+        (primary, accent, alpha)
+    };
+    let color = with_alpha(color, alpha);
     let baseline = y + h * 0.5 + widget.size as f32 * BASELINE_FACTOR;
     let label = widget.label.resolve(i18n);
     let inner_w = w - 2.0 * PILL_PAD_X;
@@ -275,6 +311,7 @@ pub fn draw_menu(
         primary,
         accent,
         focus_text: rgba(focus_text_color(theme.text_accent)),
+        dimmed_text: rgba(disabled_focus_text_color(theme.text_primary)),
     };
     for (index, widget) in layout.widgets.iter().enumerate() {
         draw_widget(widget, index == menu.focus(), i18n, font, colors);
@@ -304,6 +341,25 @@ mod tests {
     fn focus_text_picks_the_more_readable_of_the_two_colours() {
         assert_eq!(focus_text_color([255, 255, 80, 255]), FOCUS_TEXT_DARK);
         assert_eq!(focus_text_color([20, 30, 140, 255]), FOCUS_TEXT_LIGHT);
+    }
+
+    #[test]
+    fn focused_disabled_text_is_readable_on_the_idle_pill_for_every_theme() {
+        let registry: ThemeRegistry = serde_json::from_str(RAW_THEMES).unwrap();
+        for theme in &registry.themes {
+            let text = disabled_focus_text_color(theme.text_primary);
+            let ratio = contrast_ratio(IDLE_PILL_COLOR, text);
+            assert!(
+                ratio >= MIN_FOCUS_CONTRAST,
+                "{} disabled focus contrast {ratio}",
+                theme.name_key
+            );
+            // It is still dimmer than the enabled text, so the widget reads as disabled.
+            assert!(
+                contrast_ratio(IDLE_PILL_COLOR, text)
+                    < contrast_ratio(IDLE_PILL_COLOR, theme.text_primary)
+            );
+        }
     }
 
     #[test]

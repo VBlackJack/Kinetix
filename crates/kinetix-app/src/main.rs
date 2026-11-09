@@ -26,7 +26,9 @@ use audio::{
     set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
-use kinetix_app::library::{load_library, reload_library_if_unloaded, save_library};
+use kinetix_app::library::{
+    library_is_loaded, load_library, reload_library_if_unloaded, save_library,
+};
 use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES, SIZE_HOME_TITLE};
 use kinetix_app::persistence::{load_progress, load_settings, save_settings, Settings};
 use kinetix_app::play_source::PlaySource;
@@ -42,9 +44,10 @@ use kinetix_core::physics::{
 use macroquad::prelude::*;
 use session::{
     advance_after_victory, apply_session_pause_action, delete_library_level, enter_editor,
-    level_label, restart_current, save_board_to_library, start_editor_test, start_library_level,
-    start_run_from_title, start_satisfaction, sync_progress, victory_continues, LibraryOutcome,
-    PauseOutcome, RestartOutcome, SaveTracker, Session, VictoryOutcome,
+    level_label, restart_current, resume_play_from_title, save_board_to_library, start_editor_test,
+    start_library_level, start_run_from_title, start_satisfaction, sync_progress,
+    victory_continues, LibraryOutcome, PauseOutcome, RestartOutcome, SaveTracker, Session,
+    VictoryOutcome,
 };
 use std::collections::BTreeSet;
 use title::{
@@ -716,6 +719,8 @@ async fn main() {
             };
             if screen == AppScreen::TitleMenu {
                 menu.open_home(arena_pointer);
+            } else if screen == AppScreen::InGame {
+                resume_play_from_title(&mut session, &world);
             }
         }
         if is_key_pressed(KeyCode::M) {
@@ -1102,6 +1107,7 @@ async fn main() {
                     reload_library_if_unloaded(&mut library);
                     let outcome = save_board_to_library(
                         &mut library,
+                        library_is_loaded(),
                         world.export_level_code(),
                         i18n.t("menu.library.label.default_name"),
                         save_library,
@@ -1142,7 +1148,7 @@ async fn main() {
                     };
                 }
                 if is_key_pressed(KeyCode::R) {
-                    if let RestartOutcome::ToTitle(page) = restart_current(
+                    match restart_current(
                         &session,
                         &mut world,
                         &mut dev_state,
@@ -1150,8 +1156,15 @@ async fn main() {
                         &satisfaction_levels.levels,
                         &library,
                     ) {
-                        open_menu_page(&mut menu, menu_model.current(), page, arena_pointer);
-                        screen = AppScreen::TitleMenu;
+                        RestartOutcome::Restarted => {}
+                        RestartOutcome::ToTitle(page) => {
+                            open_menu_page(&mut menu, menu_model.current(), page, arena_pointer);
+                            screen = AppScreen::TitleMenu;
+                        }
+                        RestartOutcome::ToEditor => {
+                            screen = AppScreen::Editor;
+                            enter_editor(&mut session, &mut world);
+                        }
                     }
                 }
 
@@ -1216,6 +1229,12 @@ async fn main() {
                                 );
                                 pause_menu_open = false;
                                 screen = AppScreen::TitleMenu;
+                            }
+                            PauseOutcome::ToEditor => {
+                                pause_menu_open = false;
+                                menu.open_home(arena_pointer);
+                                screen = AppScreen::Editor;
+                                enter_editor(&mut session, &mut world);
                             }
                             PauseOutcome::None | PauseOutcome::Resumed => {}
                         }
@@ -1287,7 +1306,7 @@ async fn main() {
                         }
                         SessionStatus::GameOver => {
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                            if let RestartOutcome::ToTitle(page) = restart_current(
+                            match restart_current(
                                 &session,
                                 &mut world,
                                 &mut dev_state,
@@ -1295,13 +1314,20 @@ async fn main() {
                                 &satisfaction_levels.levels,
                                 &library,
                             ) {
-                                open_menu_page(
-                                    &mut menu,
-                                    menu_model.current(),
-                                    page,
-                                    arena_pointer,
-                                );
-                                screen = AppScreen::TitleMenu;
+                                RestartOutcome::Restarted => {}
+                                RestartOutcome::ToTitle(page) => {
+                                    open_menu_page(
+                                        &mut menu,
+                                        menu_model.current(),
+                                        page,
+                                        arena_pointer,
+                                    );
+                                    screen = AppScreen::TitleMenu;
+                                }
+                                RestartOutcome::ToEditor => {
+                                    screen = AppScreen::Editor;
+                                    enter_editor(&mut session, &mut world);
+                                }
                             }
                         }
                         SessionStatus::Paused => {}

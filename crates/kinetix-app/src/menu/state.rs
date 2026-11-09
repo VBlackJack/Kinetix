@@ -91,19 +91,22 @@ impl Menu {
     }
 
     /// Shows `page` the way a player gets there from Home: Back returns to Home with the button
-    /// that leads to `page` focused. Home and Pause open as their own roots.
+    /// that leads to `page` focused. Home and Pause open as their own roots. A page no enabled
+    /// Home button leads to is not opened: the menu stays on Home.
     pub fn open_page(&mut self, page: PageId, model: &MenuModel, pointer: Option<(f32, f32)>) {
         match page {
             PageId::Home => self.open_home(pointer),
             PageId::Pause => self.open_pause(pointer),
             _ => {
                 self.open_home(pointer);
-                let focus = self
+                let Some(focus) = self
                     .layout(model)
                     .widgets
                     .iter()
-                    .position(|w| w.activation == Activation::Navigate(page))
-                    .unwrap_or(0);
+                    .position(|w| w.enabled && w.activation == Activation::Navigate(page))
+                else {
+                    return;
+                };
                 self.stack.push(Frame {
                     page: PageId::Home,
                     focus,
@@ -1077,6 +1080,13 @@ mod tests {
         m
     }
 
+    /// Opens the sectors of the first world the way a player does: Chapters, then the world.
+    fn open_sectors(menu: &mut Menu, m: &MenuModel) {
+        menu.open_page(PageId::Chapters, m, None);
+        menu.update(&enter(), m);
+        assert_eq!(menu.page(), PageId::Sectors(0));
+    }
+
     fn open_library(menu: &mut Menu, m: &MenuModel) {
         menu.open_page(PageId::Library, m, None);
         assert_eq!(menu.page(), PageId::Library);
@@ -1157,6 +1167,17 @@ mod tests {
     }
 
     #[test]
+    fn open_page_stays_on_home_when_no_button_leads_there() {
+        let m = model();
+        for page in [PageId::Sectors(0), PageId::Controls] {
+            let mut menu = Menu::new();
+            menu.open_page(page, &m, None);
+            assert_eq!(menu.page(), PageId::Home, "{page:?}");
+            assert!(!menu.can_go_back());
+        }
+    }
+
+    #[test]
     fn open_page_treats_home_and_pause_as_roots() {
         let m = model();
         let mut menu = Menu::new();
@@ -1194,7 +1215,7 @@ mod tests {
     fn a_widget_that_starts_play_acts_on_the_press() {
         let m = model();
         let mut menu = Menu::new();
-        menu.open_page(PageId::Sectors(0), &m, None);
+        open_sectors(&mut menu, &m);
         let at = center(&menu, &m, 0);
         assert_eq!(menu.update(&press(at), &m), MenuAction::StartSector(0));
         // The release that follows the press does nothing more.
@@ -1222,7 +1243,7 @@ mod tests {
         let mut m = model();
         m.worlds[0].sectors[0].unlocked = false;
         let mut menu = Menu::new();
-        menu.open_page(PageId::Sectors(0), &m, None);
+        open_sectors(&mut menu, &m);
         let at = center(&menu, &m, 0);
         assert_eq!(menu.update(&press(at), &m), MenuAction::None);
         assert_eq!(menu.update(&release(at), &m), MenuAction::None);
@@ -1344,7 +1365,7 @@ mod tests {
     fn the_next_and_previous_buttons_turn_list_pages_by_pointer() {
         let m = model();
         let mut menu = Menu::new();
-        menu.open_page(PageId::Sectors(0), &m, None);
+        open_sectors(&mut menu, &m);
         assert_eq!(menu.list_page(), 0);
         let next = menu
             .layout(&m)
@@ -1402,7 +1423,7 @@ mod tests {
     fn a_disabled_paging_button_does_nothing() {
         let m = model();
         let mut menu = Menu::new();
-        menu.open_page(PageId::Sectors(0), &m, None);
+        open_sectors(&mut menu, &m);
         let prev = menu
             .layout(&m)
             .widgets
@@ -1437,7 +1458,7 @@ mod tests {
     fn keyboard_focus_skips_the_pointer_only_paging_buttons() {
         let m = model();
         let mut menu = Menu::new();
-        menu.open_page(PageId::Sectors(0), &m, None);
+        open_sectors(&mut menu, &m);
         let focusable = menu.layout(&m).focusable_count();
         for _ in 0..(3 * focusable) {
             menu.update(&down(), &m);
@@ -1453,7 +1474,7 @@ mod tests {
     fn up_from_a_hovered_paging_button_comes_back_to_the_list() {
         let m = model();
         let mut menu = Menu::new();
-        menu.open_page(PageId::Sectors(0), &m, None);
+        open_sectors(&mut menu, &m);
         let next = menu
             .layout(&m)
             .widgets

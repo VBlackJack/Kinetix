@@ -367,6 +367,18 @@ pub fn reload_library_if_unloaded(library: &mut Library) {
     }
 }
 
+/// True when the library in memory is the stored one (always on the web).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn library_is_loaded() -> bool {
+    !native::is_unloaded()
+}
+
+/// True when the library in memory is the stored one (always on the web).
+#[cfg(target_arch = "wasm32")]
+pub fn library_is_loaded() -> bool {
+    true
+}
+
 /// The web storage cannot fail a read apart from a missing key: there is nothing to reload.
 #[cfg(target_arch = "wasm32")]
 pub fn reload_library_if_unloaded(_library: &mut Library) {}
