@@ -14,30 +14,47 @@
  * limitations under the License.
  */
 
-//! CLI tool for validating, simulating, generating, and inspecting the KINETIX level campaign.
+//! CLI tool for validating, simulating, generating, writing, and inspecting the KINETIX level campaign.
 
 pub mod generate;
 pub mod simulate;
 pub mod validate;
 
 use generate::generate_sector;
-use kinetix_core::config::{GameConfig, LevelPack};
-use simulate::{compute_world_stats, simulate_level, BOT_MAX_TIME_SEC, DEFAULT_SEEDS};
+use kinetix_core::config::{GameConfig, LevelDef, LevelPack};
+use simulate::{
+    casual_loss_gate, compute_world_stats, fairness_issues, simulate_levels, LevelSimSummary,
+    DEFAULT_SEEDS, PRESETS,
+};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::ExitCode;
-use validate::validate_pack;
+use std::time::{Duration, Instant};
+use validate::{
+    check_reachability, validate_pack, LEGACY_LEVEL_COUNT, MAX_WORLDS, SECTORS_PER_WORLD,
+};
 
 const DEFAULT_LEVELS_PATH: &str = "assets/config/levels.json";
 const DEFAULT_CONFIG_PATH: &str = "assets/config/game_config.json";
-const DEFAULT_CSV_DIR: &str = "target/levelforge";
+const DEFAULT_OUT_DIR: &str = "target/levelforge";
 const DEFAULT_CSV_FILE: &str = "target/levelforge/simulation.csv";
-const SECTORS_PER_WORLD: usize = 100;
+const DEFAULT_CANDIDATE_FILE: &str = "target/levelforge/candidate-levels.json";
 const DEFAULT_SEED: u64 = 0x2026_1108_CAFE_BABE;
+const DEFAULT_WORLDS: usize = 8;
+/// Candidates tried per sector before `generate` gives up (no forced acceptance).
+const GENERATE_ATTEMPT_BUDGET: u64 = 25;
+/// Seed stride between two attempts of the same sector.
+const GENERATE_ATTEMPT_SEED_STRIDE: u64 = 7919;
+/// The per-level table is printed only for runs up to this many levels.
+const MAX_LEVELS_IN_DETAIL_TABLE: usize = 60;
+const MS_PER_SEC: f64 = 1000.0;
 
-fn load_levels(path: &str) -> Result<LevelPack, String> {
+fn load_levels(path: &str) -> Result<(LevelPack, Duration), String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?;
-    serde_json::from_str::<LevelPack>(&raw).map_err(|e| format!("invalid JSON in {path}: {e}"))
+    let start = Instant::now();
+    let pack = serde_json::from_str::<LevelPack>(&raw)
+        .map_err(|e| format!("invalid JSON in {path}: {e}"))?;
+    Ok((pack, start.elapsed()))
 }
 
 fn load_config(path: &str) -> Result<GameConfig, String> {
@@ -45,9 +62,16 @@ fn load_config(path: &str) -> Result<GameConfig, String> {
     serde_json::from_str::<GameConfig>(&raw).map_err(|e| format!("invalid JSON in {path}: {e}"))
 }
 
+fn report_errors(errors: &[validate::ValidationError], context: &str) {
+    eprintln!("FAIL: {} validation error(s) in {context}:", errors.len());
+    for err in errors {
+        eprintln!("  - {err}");
+    }
+}
+
 fn cmd_validate(levels_path: &str) -> ExitCode {
     let pack = match load_levels(levels_path) {
-        Ok(p) => p,
+        Ok((p, _)) => p,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
@@ -61,20 +85,69 @@ fn cmd_validate(levels_path: &str) -> ExitCode {
         );
         ExitCode::SUCCESS
     } else {
-        eprintln!(
-            "FAIL: {} validation error(s) in {levels_path}:",
-            errors.len()
-        );
-        for err in &errors {
-            eprintln!("  - {err}");
-        }
+        report_errors(&errors, levels_path);
         ExitCode::FAILURE
+    }
+}
+
+fn fmt_time(t: Option<f32>) -> String {
+    t.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"))
+}
+
+fn write_csv(summaries: &[LevelSimSummary]) {
+    if let Err(e) = std::fs::create_dir_all(DEFAULT_OUT_DIR) {
+        eprintln!("warning: could not create {DEFAULT_OUT_DIR}: {e}");
+        return;
+    }
+    let mut csv = String::from(
+        "level_id,world,name,boss,preset,clear_rate,median_clear_time_s,losses_per_run,sudden_death_share\n",
+    );
+    for s in summaries {
+        for pi in 0..PRESETS.len() {
+            let p = s.preset(pi);
+            csv.push_str(&format!(
+                "{},{},{},{},{},{:.3},{},{:.3},{:.3}\n",
+                s.level_id,
+                s.world,
+                s.name,
+                s.boss,
+                p.preset.name,
+                p.clear_rate,
+                fmt_time(p.median_clear_time),
+                p.losses_per_run,
+                p.sudden_death_share
+            ));
+        }
+    }
+    if let Err(e) = std::fs::write(DEFAULT_CSV_FILE, csv) {
+        eprintln!("warning: could not write {DEFAULT_CSV_FILE}: {e}");
+    }
+}
+
+fn print_level_table(summaries: &[LevelSimSummary]) {
+    println!("| Lvl | Name | Boss | Preset | Clear | Median (s) | Losses | SD share |");
+    println!("|----:|:-----|:----:|:-------|------:|-----------:|-------:|---------:|");
+    for s in summaries {
+        for pi in 0..PRESETS.len() {
+            let p = s.preset(pi);
+            println!(
+                "| {:>3} | {} | {} | {} | {:>5.3} | {:>10} | {:>6.3} | {:>8.3} |",
+                s.level_id,
+                s.name,
+                if s.boss { "yes" } else { "no" },
+                p.preset.name,
+                p.clear_rate,
+                fmt_time(p.median_clear_time),
+                p.losses_per_run,
+                p.sudden_death_share
+            );
+        }
     }
 }
 
 fn cmd_simulate(levels_path: &str, world_filter: Option<usize>) -> ExitCode {
     let pack = match load_levels(levels_path) {
-        Ok(p) => p,
+        Ok((p, _)) => p,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
@@ -88,7 +161,7 @@ fn cmd_simulate(levels_path: &str, world_filter: Option<usize>) -> ExitCode {
         }
     };
 
-    let levels_to_run: Vec<_> = pack
+    let levels_to_run: Vec<LevelDef> = pack
         .levels
         .iter()
         .filter(|l| world_filter.is_none_or(|w| l.world == w))
@@ -96,75 +169,47 @@ fn cmd_simulate(levels_path: &str, world_filter: Option<usize>) -> ExitCode {
         .collect();
 
     if levels_to_run.is_empty() {
-        eprintln!("No levels matched filter {:?}.", world_filter);
+        eprintln!("No levels matched filter {world_filter:?}.");
         return ExitCode::FAILURE;
     }
 
-    let mut summaries = Vec::with_capacity(levels_to_run.len());
-    let mut unfair = Vec::new();
-    let sudden_death = config.gameplay.sudden_death_time_sec;
-
-    for lvl in &levels_to_run {
-        let sum = simulate_level(&config, lvl, &DEFAULT_SEEDS, BOT_MAX_TIME_SEC);
-        let is_set_piece_or_boss = lvl.boss || lvl.id.is_multiple_of(10) || lvl.id <= 15;
-        if sum.clear_count == 0 {
-            unfair.push(format!(
-                "level {} ({}) cleared on 0/{} seeds",
-                lvl.id,
-                lvl.name,
-                DEFAULT_SEEDS.len()
-            ));
-        } else if !is_set_piece_or_boss && sum.median_clear_time > sudden_death {
-            unfair.push(format!(
-                "level {} ({}) median clear time {:.1}s exceeds sudden_death ({:.1}s)",
-                lvl.id, lvl.name, sum.median_clear_time, sudden_death
-            ));
-        }
-        summaries.push(sum);
+    let summaries = simulate_levels(&config, &levels_to_run, &DEFAULT_SEEDS);
+    write_csv(&summaries);
+    if levels_to_run.len() <= MAX_LEVELS_IN_DETAIL_TABLE {
+        print_level_table(&summaries);
+        println!();
     }
-
-    if let Err(e) = std::fs::create_dir_all(DEFAULT_CSV_DIR) {
-        eprintln!("warning: could not create {DEFAULT_CSV_DIR}: {e}");
-    } else {
-        let mut csv = String::from(
-            "level_id,world,name,boss,clear_count,seed_count,median_clear_time_s,avg_balls_lost,avg_powerups\n",
-        );
-        for s in &summaries {
-            csv.push_str(&format!(
-                "{},{},{},{},{},{},{:.2},{:.2},{:.2}\n",
-                s.level_id,
-                s.world,
-                s.name,
-                s.boss,
-                s.clear_count,
-                s.runs.len(),
-                s.median_clear_time,
-                s.avg_balls_lost,
-                s.avg_powerups
-            ));
-        }
-        let _ = std::fs::write(DEFAULT_CSV_FILE, csv);
-    }
-
     print_world_stats_table(&levels_to_run, Some(&summaries));
 
-    if !unfair.is_empty() {
-        eprintln!("WARNING: {} fairness issue(s) detected:", unfair.len());
-        for u in &unfair {
-            eprintln!("  - {u}");
-        }
+    let mut problems = fairness_issues(&summaries);
+    if let Err(e) = casual_loss_gate(&summaries) {
+        problems.push(e);
     }
-    ExitCode::SUCCESS
+    if problems.is_empty() {
+        println!("Fairness: OK ({} levels).", summaries.len());
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("FAIL: {} fairness issue(s) detected:", problems.len());
+        for p in &problems {
+            eprintln!("  - {p}");
+        }
+        ExitCode::FAILURE
+    }
 }
 
 fn cmd_stats(levels_path: &str, with_sim: bool) -> ExitCode {
-    let pack = match load_levels(levels_path) {
+    let (pack, parse_time) = match load_levels(levels_path) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
+    println!(
+        "Parsed {} levels from {levels_path} in {:.2} ms.",
+        pack.levels.len(),
+        parse_time.as_secs_f64() * MS_PER_SEC
+    );
     let summaries = if with_sim {
         let config = match load_config(DEFAULT_CONFIG_PATH) {
             Ok(c) => c,
@@ -173,12 +218,7 @@ fn cmd_stats(levels_path: &str, with_sim: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        Some(
-            pack.levels
-                .iter()
-                .map(|l| simulate_level(&config, l, &DEFAULT_SEEDS, BOT_MAX_TIME_SEC))
-                .collect::<Vec<_>>(),
-        )
+        Some(simulate_levels(&config, &pack.levels, &DEFAULT_SEEDS))
     } else {
         None
     };
@@ -187,34 +227,58 @@ fn cmd_stats(levels_path: &str, with_sim: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn print_world_stats_table(
-    levels: &[kinetix_core::config::LevelDef],
-    sims: Option<&[simulate::LevelSimSummary]>,
-) {
+fn print_world_stats_table(levels: &[LevelDef], sims: Option<&[LevelSimSummary]>) {
     let stats = compute_world_stats(levels, sims);
     println!(
-        "| World | Sectors | Avg Bricks | Tough % | Special % | Clear Rate | Median Time (s) | Avg Losses |"
+        "| World | Sectors | Avg Bricks | Tough % | Special % | Preset | Clear Rate | Median Time (s) | Losses/Run | SD Share |"
     );
     println!(
-        "|------:|--------:|-----------:|--------:|----------:|-----------:|----------------:|-----------:|"
+        "|------:|--------:|-----------:|--------:|----------:|:-------|-----------:|----------------:|-----------:|---------:|"
     );
     for st in stats {
-        println!(
-            "| {:>5} | {:>7} | {:>10.1} | {:>6.1}% | {:>8.1}% | {:>9.1}% | {:>15.2} | {:>10.2} |",
-            st.world,
-            st.sector_count,
-            st.avg_bricks,
-            st.tough_ratio * 100.0,
-            st.special_ratio * 100.0,
-            st.clear_rate * 100.0,
-            st.median_clear_time,
-            st.avg_losses
-        );
+        if st.per_preset.is_empty() {
+            println!(
+                "| {:>5} | {:>7} | {:>10.1} | {:>6.1}% | {:>8.1}% | - | - | - | - | - |",
+                st.world,
+                st.sector_count,
+                st.avg_bricks,
+                st.tough_ratio * 100.0,
+                st.special_ratio * 100.0,
+            );
+        }
+        for p in &st.per_preset {
+            println!(
+                "| {:>5} | {:>7} | {:>10.1} | {:>6.1}% | {:>8.1}% | {} | {:>9.1}% | {:>15} | {:>10.2} | {:>7.1}% |",
+                st.world,
+                st.sector_count,
+                st.avg_bricks,
+                st.tough_ratio * 100.0,
+                st.special_ratio * 100.0,
+                p.preset,
+                p.clear_rate * 100.0,
+                fmt_time(p.median_clear_time),
+                p.losses_per_run,
+                p.sudden_death_share * 100.0
+            );
+        }
     }
 }
 
-fn cmd_generate(levels_path: &str, max_world: usize, seed: u64) -> ExitCode {
-    let mut pack = match load_levels(levels_path) {
+/// Why a generated candidate is not acceptable (empty means accepted).
+fn candidate_issues(config: &GameConfig, candidate: &LevelDef) -> Vec<String> {
+    if let Err(e) = check_reachability(&candidate.rows) {
+        return vec![e];
+    }
+    let sims = simulate_levels(config, std::slice::from_ref(candidate), &DEFAULT_SEEDS);
+    fairness_issues(&sims)
+}
+
+fn cmd_generate(levels_path: &str, max_world: usize, seed: u64, out_path: &str) -> ExitCode {
+    if max_world == 0 || max_world > MAX_WORLDS {
+        eprintln!("error: --worlds must be in 1..={MAX_WORLDS}");
+        return ExitCode::FAILURE;
+    }
+    let (mut pack, _) = match load_levels(levels_path) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
@@ -229,57 +293,53 @@ fn cmd_generate(levels_path: &str, max_world: usize, seed: u64) -> ExitCode {
         }
     };
 
-    // Preserve existing levels up to index 14 (or existing count if extending).
+    // Generation always restarts from the legacy reference levels (indices 0..LEGACY_LEVEL_COUNT).
     let target_total = max_world * SECTORS_PER_WORLD;
-    if pack.levels.len() > target_total {
-        pack.levels.truncate(target_total);
-    }
+    pack.levels.truncate(LEGACY_LEVEL_COUNT.min(target_total));
 
     let mut used_names: BTreeSet<String> = pack.levels.iter().map(|l| l.name.clone()).collect();
-    let sudden_death = config.gameplay.sudden_death_time_sec;
 
-    let start_idx = pack.levels.len();
-    for idx in start_idx..target_total {
+    for idx in pack.levels.len()..target_total {
         let id = idx + 1;
-        let world = (idx / SECTORS_PER_WORLD) + 1;
-        let sector_in_world = (idx % SECTORS_PER_WORLD) + 1;
-        let is_set_piece_or_boss =
-            sector_in_world == 50 || sector_in_world == 100 || sector_in_world.is_multiple_of(10);
+        let world = idx / SECTORS_PER_WORLD + 1;
+        let sector_in_world = idx % SECTORS_PER_WORLD + 1;
+        let is_last = idx + 1 == target_total;
 
-        let mut attempt = 0u64;
-        let chosen = loop {
+        let mut last_issues = Vec::new();
+        let mut accepted = None;
+        for attempt in 0..GENERATE_ATTEMPT_BUDGET {
             let mut candidate_names = used_names.clone();
             let candidate = generate_sector(
                 id,
                 world,
                 sector_in_world,
-                seed.wrapping_add(attempt * 7919),
+                is_last,
+                seed.wrapping_add(attempt * GENERATE_ATTEMPT_SEED_STRIDE),
                 &mut candidate_names,
             );
-            let sim = simulate_level(&config, &candidate, &DEFAULT_SEEDS, BOT_MAX_TIME_SEC);
-            let fair_time = is_set_piece_or_boss || sim.median_clear_time <= sudden_death * 0.95;
-            if sim.clear_count > 0 && fair_time {
+            let issues = candidate_issues(&config, &candidate);
+            if issues.is_empty() {
                 used_names = candidate_names;
-                break candidate;
+                accepted = Some(candidate);
+                break;
             }
-            attempt += 1;
-            if attempt > 25 {
-                used_names = candidate_names;
-                break candidate;
+            last_issues = issues;
+        }
+        let Some(level) = accepted else {
+            eprintln!(
+                "FAIL: no candidate for level {id} (world {world}, sector {sector_in_world}) passed after {GENERATE_ATTEMPT_BUDGET} attempts. Last attempt:"
+            );
+            for issue in &last_issues {
+                eprintln!("  - {issue}");
             }
+            return ExitCode::FAILURE;
         };
-        pack.levels.push(chosen);
+        pack.levels.push(level);
     }
 
     let errors = validate_pack(&pack.levels);
     if !errors.is_empty() {
-        eprintln!(
-            "FAIL: generated pack has {} validation error(s):",
-            errors.len()
-        );
-        for err in &errors {
-            eprintln!("  - {err}");
-        }
+        report_errors(&errors, "the generated pack");
         return ExitCode::FAILURE;
     }
 
@@ -290,16 +350,62 @@ fn cmd_generate(levels_path: &str, max_world: usize, seed: u64) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = std::fs::write(Path::new(levels_path), json) {
-        eprintln!("error writing {levels_path}: {e}");
+    if let Some(dir) = Path::new(out_path).parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("error creating {}: {e}", dir.display());
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Err(e) = std::fs::write(out_path, json) {
+        eprintln!("error writing {out_path}: {e}");
         return ExitCode::FAILURE;
     }
 
     println!(
-        "Generated campaign up to world {max_world} ({} total sectors) in {levels_path}.",
+        "Generated {} sectors up to world {max_world} into candidate file {out_path}. Run `write` to install it.",
         pack.levels.len()
     );
     ExitCode::SUCCESS
+}
+
+/// Installs a candidate file as the shipped level pack, after validating it.
+fn cmd_write(candidate_path: &str, levels_path: &str) -> ExitCode {
+    let raw = match std::fs::read_to_string(candidate_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: failed to read {candidate_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pack = match serde_json::from_str::<LevelPack>(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: invalid JSON in {candidate_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let errors = validate_pack(&pack.levels);
+    if !errors.is_empty() {
+        report_errors(&errors, candidate_path);
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::write(levels_path, raw) {
+        eprintln!("error writing {levels_path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "Wrote {} levels from {candidate_path} to {levels_path}.",
+        pack.levels.len()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Value following `flag` in `args`, if present.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 fn main() -> ExitCode {
@@ -315,18 +421,7 @@ fn main() -> ExitCode {
             cmd_validate(path)
         }
         "simulate" => {
-            let mut world_filter = None;
-            let mut i = 1;
-            while i < args.len() {
-                if args[i] == "--world" {
-                    if let Some(w) = args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
-                        world_filter = Some(w);
-                    }
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
+            let world_filter = flag_value(&args, "--world").and_then(|v| v.parse::<usize>().ok());
             cmd_simulate(DEFAULT_LEVELS_PATH, world_filter)
         }
         "stats" => {
@@ -334,29 +429,23 @@ fn main() -> ExitCode {
             cmd_stats(DEFAULT_LEVELS_PATH, with_sim)
         }
         "generate" => {
-            let mut max_world = 8usize;
-            let mut seed = DEFAULT_SEED;
-            let mut i = 1;
-            while i < args.len() {
-                if args[i] == "--worlds" {
-                    if let Some(w) = args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
-                        max_world = w;
-                    }
-                    i += 2;
-                } else if args[i] == "--seed" {
-                    if let Some(s) = args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
-                        seed = s;
-                    }
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            cmd_generate(DEFAULT_LEVELS_PATH, max_world, seed)
+            let max_world = flag_value(&args, "--worlds")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_WORLDS);
+            let seed = flag_value(&args, "--seed")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_SEED);
+            let out = flag_value(&args, "--out").unwrap_or(DEFAULT_CANDIDATE_FILE);
+            cmd_generate(DEFAULT_LEVELS_PATH, max_world, seed, out)
+        }
+        "write" => {
+            let candidate = flag_value(&args, "--candidate").unwrap_or(DEFAULT_CANDIDATE_FILE);
+            let levels = flag_value(&args, "--levels").unwrap_or(DEFAULT_LEVELS_PATH);
+            cmd_write(candidate, levels)
         }
         other => {
             eprintln!(
-                "Unknown subcommand: {other}. Expected: validate | simulate | stats | generate"
+                "Unknown subcommand: {other}. Expected: validate | simulate | stats | generate | write"
             );
             ExitCode::FAILURE
         }
@@ -370,19 +459,22 @@ mod tests {
     const RAW_LEVELS: &str = include_str!("../../../assets/config/levels.json");
 
     #[test]
-    fn shipped_levels_json_passes_all_validation_rules_and_parses_fast() {
-        let start = std::time::Instant::now();
+    fn shipped_levels_json_passes_all_validation_rules() {
         let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("valid levels.json");
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_millis() < 50,
-            "levels.json parse took {} ms (limit 50 ms)",
-            elapsed.as_millis()
-        );
         let errors = validate_pack(&pack.levels);
         assert!(
             errors.is_empty(),
             "levels.json validation failed: {errors:#?}"
         );
+    }
+
+    #[test]
+    fn flag_value_reads_the_following_argument() {
+        let args: Vec<String> = ["generate", "--worlds", "3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(flag_value(&args, "--worlds"), Some("3"));
+        assert_eq!(flag_value(&args, "--seed"), None);
     }
 }

@@ -17,6 +17,7 @@
 //! Deterministic procedural campaign generator from curated motif families,
 //! parameterized by world identity, sector position, and difficulty curve.
 
+use crate::validate::{BOSS_SUFFIX, FINAL_BOSS_SUFFIX, MAX_LEVEL_NAME_LEN};
 use kinetix_core::config::LevelDef;
 use kinetix_core::level_code::EDITOR_COLS;
 use std::collections::BTreeSet;
@@ -177,13 +178,20 @@ impl Rng {
     }
 }
 
-/// Generates a unique <=24-char uppercase name for a sector.
+/// Generates a unique uppercase name of at most `MAX_LEVEL_NAME_LEN` chars for a sector.
+/// Boss names end with `BOSS_SUFFIX`, or `FINAL_BOSS_SUFFIX` for the last level of the pack.
 pub fn generate_unique_name(
     world: usize,
     sector_in_world: usize,
     boss: bool,
+    final_boss: bool,
     used: &mut BTreeSet<String>,
 ) -> String {
+    let suffix = if final_boss {
+        FINAL_BOSS_SUFFIX
+    } else {
+        BOSS_SUFFIX
+    };
     let w_idx = world.saturating_sub(1).min(7);
     let adjs = WORLD_ADJECTIVES[w_idx];
     let mut attempt = 0usize;
@@ -191,11 +199,11 @@ pub fn generate_unique_name(
         let a = adjs[(sector_in_world * 3 + attempt * 7) % adjs.len()];
         let n = NOUNS[(sector_in_world * 5 + attempt * 11 + w_idx * 3) % NOUNS.len()];
         let candidate = if boss {
-            let base = format!("{a} {n} [BOSS]");
-            if base.len() <= 24 {
+            let base = format!("{a} {n}{suffix}");
+            if base.len() <= MAX_LEVEL_NAME_LEN {
                 base
             } else {
-                format!("{a} [BOSS]")
+                format!("{a}{suffix}")
             }
         } else if attempt == 0 {
             format!("{a} {n}")
@@ -203,7 +211,7 @@ pub fn generate_unique_name(
             let roman_or_num = attempt + 1;
             format!("{a} {n} {roman_or_num}")
         };
-        if candidate.len() <= 24 && used.insert(candidate.clone()) {
+        if candidate.len() <= MAX_LEVEL_NAME_LEN && used.insert(candidate.clone()) {
             return candidate;
         }
         attempt += 1;
@@ -227,18 +235,20 @@ pub fn target_brick_count(world: usize, sector_in_world: usize) -> usize {
     (base + rise + wave).round().clamp(32.0, 68.0) as usize
 }
 
-/// Generates a single candidate level for `(id, world, sector_in_world)` where `sector_in_world` is 1..=100.
+/// Generates a single candidate level for `(id, world, sector_in_world)` where `sector_in_world`
+/// is 1..=100. `is_last` marks the last level of the pack, named as the final boss.
 pub fn generate_sector(
     id: usize,
     world: usize,
     sector_in_world: usize,
+    is_last: bool,
     seed: u64,
     used_names: &mut BTreeSet<String>,
 ) -> LevelDef {
     let boss = sector_in_world == 50 || sector_in_world == 100;
     let is_set_piece = !boss && sector_in_world.is_multiple_of(10);
     let is_breather = !boss && (sector_in_world % 10 == 4 || sector_in_world % 10 == 8);
-    let name = generate_unique_name(world, sector_in_world, boss, used_names);
+    let name = generate_unique_name(world, sector_in_world, boss, boss && is_last, used_names);
     let mut rng = Rng::new(seed ^ (id as u64).wrapping_mul(0x517C_C1B7_2722_0A95));
 
     if boss {
