@@ -17,3 +17,4 @@
 //! Pure, testable application logic shared with the `kinetix-app` binary.
 
 pub mod play_source;
+pub mod satisfaction;
