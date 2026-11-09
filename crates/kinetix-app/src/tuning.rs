@@ -61,13 +61,11 @@ pub const POPUP_MULTIPLIER_CLOSE: &str = ")";
 pub const POPUP_MULTIPLIER_HIDDEN_MAX: u32 = 1;
 
 // ---- Menu placeholders ----
-/// Placeholder replaced by the number of selectable worlds in locale strings.
-pub const COUNT_PLACEHOLDER: &str = "{count}";
 /// Placeholders replaced by the first and last sector ids of a world in `menu.sector_range`.
 pub const FIRST_PLACEHOLDER: &str = "{first}";
 pub const LAST_PLACEHOLDER: &str = "{last}";
-/// Number of sectors skipped by a single PageUp / PageDown key press in the title menu.
-pub const MENU_SECTOR_PAGE_STEP: usize = 10;
+/// Placeholder replaced by the new entry id in `menu.library.label.default_name`.
+pub const LIBRARY_NAME_PLACEHOLDER: &str = "{n}";
 
 // ---- Game feel ----
 /// Multiplier applied to the raw mouse delta while the native cursor grab is active.
@@ -157,84 +155,6 @@ pub const POWERUP_POPUP_DY: f32 = -28.0;
 pub const POPUP_MIN_X: f32 = 80.0;
 pub const POPUP_MAX_X: f32 = 1560.0;
 
-// ---- Title menu ----
-pub const MENU_PANEL_X: f32 = 310.0;
-pub const MENU_PANEL_Y: f32 = 110.0;
-pub const MENU_PANEL_W: f32 = 1300.0;
-pub const MENU_PANEL_H: f32 = 860.0;
-pub const MENU_PANEL_RADIUS: f32 = 26.0;
-pub const MENU_PANEL_BORDER: f32 = 4.0;
-pub const MENU_HEADER_INSET_X: f32 = 30.0;
-pub const MENU_HEADER_INSET_Y: f32 = 16.0;
-pub const MENU_HEADER_H: f32 = 90.0;
-pub const MENU_HEADER_RADIUS: f32 = 16.0;
-pub const MENU_DIM_COLOR: [u8; 4] = [5, 4, 15, 215];
-pub const MENU_PANEL_COLOR: [u8; 4] = [12, 14, 30, 245];
-pub const MENU_TITLE_DX: f32 = 435.0;
-pub const MENU_TITLE_Y: f32 = 235.0;
-pub const MENU_TITLE_SIZE: u16 = 96;
-pub const MENU_SUBTITLE_DX: f32 = 325.0;
-pub const MENU_SUBTITLE_Y: f32 = 290.0;
-pub const MENU_SUBTITLE_SIZE: u16 = 32;
-pub const MENU_BEST_PILL_DX: f32 = 370.0;
-pub const MENU_BEST_PILL_Y: f32 = 325.0;
-pub const MENU_BEST_PILL_W: f32 = 560.0;
-pub const MENU_BEST_PILL_H: f32 = 56.0;
-pub const MENU_BEST_PILL_RADIUS: f32 = 14.0;
-pub const MENU_BEST_PILL_ALPHA: f32 = 0.16;
-pub const MENU_BEST_TEXT_DX: f32 = 450.0;
-pub const MENU_BEST_TEXT_Y: f32 = 364.0;
-pub const MENU_BEST_TEXT_SIZE: u16 = 34;
-pub const MENU_LABEL_DX: f32 = 250.0;
-pub const MENU_CAMPAIGNS_Y: f32 = 445.0;
-pub const MENU_LABEL_SIZE: u16 = 28;
-pub const MENU_WORLD_LIST_Y: f32 = 475.0;
-/// Vertical gap between two world rows at full size (row step 68 = pill height 54 + gap 14).
-pub const MENU_WORLD_ROW_GAP: f32 = 14.0;
-/// Lowest y a world row may reach; keeps the list clear of the sector line below it.
-pub const MENU_WORLD_LIST_BOTTOM_Y: f32 = 705.0;
-/// Smallest pill height the world list shrinks to when there are many worlds.
-pub const MENU_WORLD_PILL_MIN_H: f32 = 24.0;
-/// Smallest text size of a world row when the pills shrink with the world count.
-pub const MENU_WORLD_TEXT_SIZE_FLOOR: u16 = 16;
-pub const MENU_WORLD_PILL_DX: f32 = 200.0;
-pub const MENU_WORLD_PILL_W: f32 = 900.0;
-pub const MENU_WORLD_PILL_H: f32 = 54.0;
-pub const MENU_WORLD_PILL_RADIUS: f32 = 14.0;
-pub const MENU_WORLD_TEXT_DX: f32 = 230.0;
-pub const MENU_WORLD_TEXT_DY: f32 = 37.0;
-pub const MENU_WORLD_TEXT_SIZE: u16 = 30;
-/// Smallest size a world row shrinks to so its text clears the right-hand "locked" label.
-pub const MENU_WORLD_TEXT_SIZE_MIN: u16 = 20;
-/// Gap kept between a world row's text and its "locked" label.
-pub const MENU_LOCK_GAP: f32 = 24.0;
-pub const MENU_PILL_SELECTED_ALPHA: f32 = 0.25;
-pub const MENU_PILL_IDLE_COLOR: [u8; 4] = [24, 28, 52, 200];
-pub const MENU_SELECTED_PREFIX: &str = ">>  ";
-pub const MENU_UNSELECTED_PREFIX: &str = "    ";
-/// Alpha of a locked world row (dimmed).
-pub const MENU_LOCKED_ALPHA: f32 = 0.4;
-/// Gap between the right edge of a world pill and its "locked" label.
-pub const MENU_LOCK_LABEL_PAD: f32 = 30.0;
-pub const MENU_SECTOR_Y: f32 = 735.0;
-pub const MENU_SECTOR_SIZE: u16 = 32;
-pub const MENU_SECTOR_SIZE_MIN: u16 = 18;
-pub const MENU_SECTOR_MAX_W: f32 = 880.0;
-pub const MENU_CTA_X: f32 = 470.0;
-pub const MENU_CTA_Y: f32 = 775.0;
-pub const MENU_CTA_W: f32 = 980.0;
-pub const MENU_CTA_H: f32 = 78.0;
-pub const MENU_CTA_RADIUS: f32 = 20.0;
-pub const MENU_CTA_BORDER: f32 = 4.0;
-pub const MENU_CTA_COLOR: [u8; 4] = [22, 16, 48, 240];
-pub const MENU_CTA_TEXT_DX: f32 = 45.0;
-pub const MENU_CTA_TEXT_Y: f32 = 825.0;
-pub const MENU_CTA_TEXT_SIZE: u16 = 29;
-pub const MENU_FOOTER_DX: f32 = 85.0;
-pub const MENU_FOOTER_Y: f32 = 920.0;
-pub const MENU_FOOTER_SIZE: u16 = 23;
-pub const MENU_FOOTER_SEPARATOR: &str = "   |   ";
-
 // ---- HUD ----
 pub const HUD_BAR_X: f32 = 48.0;
 pub const HUD_BAR_Y: f32 = 8.0;
@@ -269,6 +189,10 @@ pub const HUD_SUB_BAR_SEPARATOR: &str = "    ";
 pub const HUD_BANNER_X: f32 = 72.0;
 pub const HUD_BANNER_Y: f32 = 138.0;
 pub const HUD_BANNER_SIZE: u16 = 28;
+/// Vertical gap between the editor banner and the hint about saving the board to the library.
+pub const HUD_EDITOR_SAVE_HINT_DY: f32 = 32.0;
+/// Editor hint about saving the board to the library, drawn under the banner.
+pub const HUD_EDITOR_SAVE_HINT_Y: f32 = HUD_BANNER_Y + HUD_EDITOR_SAVE_HINT_DY;
 pub const HUD_SUDDEN_DEATH_Y: f32 = 136.0;
 pub const HUD_SUDDEN_DEATH_SIZE: u16 = 26;
 pub const HUD_FOOTER_Y: f32 = 1058.0;
@@ -309,7 +233,7 @@ pub const BOSS_LABEL_SIZE: u16 = 28;
 
 // ---- Font atlas pre-warm ----
 /// Every UI font size used by `txt` and `measure_text` (badge shrink sizes are added separately,
-/// and the title size is only warmed for the title string).
+/// and the menu title size, `SIZE_HOME_TITLE`, is only warmed for the title string).
 pub const UI_FONT_SIZES: [u16; 13] = [16, 17, 21, 22, 23, 24, 26, 28, 29, 30, 32, 34, 48];
 
 // ---- Pointer lock resume gestures (must match RESUME_* in web/index.html) ----

@@ -4,16 +4,91 @@
     "subtitle": "Modern High-Velocity Brick Breaker"
   },
   "menu": {
-    "play": "CLICK OR PRESS [ENTER / SPACE] TO LAUNCH CAMPAIGN",
-    "campaigns": "SELECT CAMPAIGN WORLD ([LEFT / RIGHT] or [1-{count}])",
-    "sector_select": "START SECTOR [UP/DOWN] [PGUP/DN] [HOME/END]:",
     "sector_range": "(Sectors {first}-{last})",
-    "editor_btn": "[F4] LEVEL ARCHITECT (EDITOR)",
-    "theme_btn": "[F1] VISUAL RENDERER",
-    "lang_btn": "[F2] LANGUAGE",
-    "music_btn": "[B] DYNAMIC SYNTHTRACK",
-    "locked": "LOCKED",
-    "best_score": "HIGH SCORE"
+    "best_score": "HIGH SCORE: {score}",
+    "home": {
+      "button": {
+        "campaign": "CAMPAIGN",
+        "satisfaction": "SATISFACTION MODE",
+        "editor": "EDITOR",
+        "options": "OPTIONS",
+        "quit": "QUIT"
+      }
+    },
+    "common": {
+      "button": {
+        "back": "BACK",
+        "prev_page": "PREV",
+        "next_page": "NEXT"
+      }
+    },
+    "chapters": {
+      "title": "CHAPTERS",
+      "label": {
+        "progress": "{done}/{total}",
+        "locked": "LOCKED"
+      }
+    },
+    "sectors": {
+      "title": "{world}",
+      "label": {
+        "page": "{page}/{pages}",
+        "locked": "LOCKED"
+      }
+    },
+    "options": {
+      "title": "OPTIONS",
+      "label": {
+        "language": "LANGUAGE",
+        "renderer": "RENDERER",
+        "sfx": "SOUND EFFECTS",
+        "music": "MUSIC"
+      },
+      "value": {
+        "on": "ON",
+        "off": "OFF"
+      },
+      "button": {
+        "controls": "CONTROLS"
+      }
+    },
+    "controls": {
+      "title": "CONTROLS"
+    },
+    "pause": {
+      "title": "PAUSED",
+      "button": {
+        "resume": "RESUME",
+        "restart": "RESTART",
+        "options": "OPTIONS",
+        "quit": "QUIT TO MENU"
+      }
+    },
+    "satisfaction": {
+      "title": "SATISFACTION MODE",
+      "label": {
+        "subtitle": "NO PROGRESS SAVED, NO TIMER"
+      }
+    },
+    "library": {
+      "title": "MY LEVELS",
+      "button": {
+        "new": "NEW LEVEL",
+        "play": "PLAY",
+        "delete": "DELETE",
+        "confirm_delete": "CONFIRM?"
+      },
+      "label": {
+        "empty": "NO SAVED LEVELS YET",
+        "count": "{count}/{max}",
+        "default_name": "LEVEL {n}"
+      },
+      "toast": {
+        "saved": "LEVEL SAVED",
+        "full": "LIBRARY FULL",
+        "deleted": "LEVEL DELETED"
+      }
+    }
   },
   "campaigns": {
     "c1": "WORLD 1: IGNITION GRID",
@@ -82,7 +157,10 @@
     "share_prompt": "Level code (copy to share):",
     "paste_prompt": "Paste a level code (KTX1:...):",
     "import_invalid": "INVALID LEVEL CODE",
-    "import_too_long": "LEVEL CODE TOO LONG"
+    "import_too_long": "LEVEL CODE TOO LONG",
+    "library": {
+      "save_hint": "[S] Save to my levels"
+    }
   },
   "status": {
     "paused": "SYSTEM PAUSED",
@@ -131,5 +209,10 @@
     "solar_magma": "6/8 Solar Magma (Volcanic Core)",
     "arctic_cryo": "7/8 Arctic Cryo (Frosted Glass)",
     "synth_sunset": "8/8 Synth Sunset (Outrun Horizon)"
+  },
+  "storage": {
+    "toast": {
+      "save_failed": "SAVE FAILED"
+    }
   }
 }

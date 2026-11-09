@@ -16,7 +16,8 @@
 
 mod audio;
 mod dev;
-mod persistence;
+mod session;
+mod title;
 mod tuning;
 mod vfx;
 
@@ -25,6 +26,13 @@ use audio::{
     set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
+use kinetix_app::library::{
+    library_is_loaded, load_library, reload_library_if_unloaded, save_library,
+};
+use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES, SIZE_HOME_TITLE};
+use kinetix_app::persistence::{load_progress, load_settings, save_settings, Settings};
+use kinetix_app::play_source::PlaySource;
+use kinetix_app::satisfaction::{level_names, satisfaction_pack};
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
@@ -34,8 +42,18 @@ use kinetix_core::physics::{
     REGEN_BRICK_HP,
 };
 use macroquad::prelude::*;
-use persistence::{high_score_save_due, load_progress, save_progress};
+use session::{
+    advance_after_victory, apply_session_pause_action, delete_library_level, enter_editor,
+    level_label, restart_current, resume_play_from_title, save_board_to_library, start_editor_test,
+    start_library_level, start_run_from_title, start_satisfaction, sync_progress,
+    victory_continues, LibraryOutcome, PauseOutcome, RestartOutcome, SaveTracker, Session,
+    VictoryOutcome,
+};
 use std::collections::BTreeSet;
+use title::{
+    build_menu_model, build_worlds, is_sector_unlocked, open_menu_page, pointer_frame,
+    read_menu_input, MenuModelCache, MenuModelKey, MenuModelSource,
+};
 use tuning::*;
 use vfx::{
     additive_material, cap_oldest, draw_modern_capsule_brick, draw_powerup_capsule,
@@ -153,229 +171,39 @@ fn error_popup(i18n: &I18nCatalog, err: &LevelCodeError) -> FloatingPopup {
     }
 }
 
-/// Keys that jump straight to the n-th world of the title menu (Key1 is the first world).
-const WORLD_SELECT_KEYS: [KeyCode; 9] = [
-    KeyCode::Key1,
-    KeyCode::Key2,
-    KeyCode::Key3,
-    KeyCode::Key4,
-    KeyCode::Key5,
-    KeyCode::Key6,
-    KeyCode::Key7,
-    KeyCode::Key8,
-    KeyCode::Key9,
-];
+/// Shows the toast that follows a library change (nothing for a change that did not happen).
+fn push_library_toast(
+    popups: &mut Vec<FloatingPopup>,
+    i18n: &I18nCatalog,
+    theme: &ThemeDef,
+    outcome: &LibraryOutcome,
+) {
+    let Some(key) = outcome.toast_key() else {
+        return;
+    };
+    let color = if outcome.is_failure() {
+        MALUS_COLOR
+    } else {
+        theme.text_accent
+    };
+    popups.push(FloatingPopup {
+        x: POPUP_X,
+        y: POPUP_Y,
+        text: i18n.t(key).to_string(),
+        life: POPUP_LIFE_SEC,
+        color: rgba(color),
+    });
+}
+
+/// Where the mouse is, in arena coordinates.
+fn current_arena_pointer(arena_w: f32, arena_h: f32) -> Option<(f32, f32)> {
+    let (mx, my) = mouse_position();
+    let (scale, ox, oy) = letterbox(screen_width(), screen_height(), arena_w, arena_h);
+    Some(screen_to_arena(mx, my, scale, ox, oy))
+}
 
 fn rand_in(range: (f32, f32)) -> f32 {
     rand::gen_range(range.0, range.1)
-}
-
-/// Worlds in campaign order as `(world id, index of the first level)`; a new entry starts
-/// whenever the world id changes along the level list.
-fn build_worlds(levels: &[LevelDef]) -> Vec<(usize, usize)> {
-    let mut worlds: Vec<(usize, usize)> = Vec::new();
-    for (idx, level) in levels.iter().enumerate() {
-        if worlds.last().map(|&(id, _)| id) != Some(level.world) {
-            worlds.push((level.world, idx));
-        }
-    }
-    worlds
-}
-
-/// Position in `worlds` of the world owning level `level_idx` (`fallback` when unknown).
-fn world_pos_for_level(
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    level_idx: usize,
-    fallback: usize,
-) -> usize {
-    levels
-        .get(level_idx)
-        .and_then(|level| {
-            worlds
-                .iter()
-                .rposition(|&(id, first)| id == level.world && first <= level_idx)
-        })
-        .unwrap_or(fallback)
-}
-
-/// A sector can be started when its index is not above the highest unlocked one.
-fn is_sector_unlocked(sector_idx: usize, max_unlocked: usize) -> bool {
-    sector_idx <= max_unlocked
-}
-
-/// A world is playable once its first sector is unlocked.
-fn is_world_unlocked(first_level_idx: usize, max_unlocked: usize) -> bool {
-    is_sector_unlocked(first_level_idx, max_unlocked)
-}
-
-/// Keeps a menu sector selection on an existing, unlocked sector.
-fn clamp_sector(selected: usize, max_unlocked: usize, last_sector: usize) -> usize {
-    selected.min(max_unlocked).min(last_sector)
-}
-
-/// Direction / jump kind for start-sector navigation in the title menu.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SectorNav {
-    Prev,
-    Next,
-    PagePrev,
-    PageNext,
-    WorldHome,
-    WorldEnd,
-}
-
-/// Pure start-sector navigation: computes the new `(selected_world_pos, selected_sector_idx)`,
-/// clamped to unlocked sectors. `WorldHome` and `WorldEnd` jump to the first / last unlocked
-/// sector belonging to the currently selected world.
-fn navigate_sector(
-    nav: SectorNav,
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    world_pos: usize,
-    sector_idx: usize,
-    max_unlocked: usize,
-) -> (usize, usize) {
-    if levels.is_empty() {
-        return (world_pos, 0);
-    }
-    let last_sector = levels.len() - 1;
-    let target = match nav {
-        SectorNav::Next => sector_idx.saturating_add(1),
-        SectorNav::Prev => sector_idx.saturating_sub(1),
-        SectorNav::PageNext => sector_idx.saturating_add(MENU_SECTOR_PAGE_STEP),
-        SectorNav::PagePrev => sector_idx.saturating_sub(MENU_SECTOR_PAGE_STEP),
-        SectorNav::WorldHome => worlds.get(world_pos).map(|&(_, first)| first).unwrap_or(0),
-        SectorNav::WorldEnd => {
-            if let Some(&(_, first)) = worlds.get(world_pos) {
-                let next_first = worlds
-                    .get(world_pos + 1)
-                    .map(|&(_, nf)| nf)
-                    .unwrap_or(levels.len());
-                next_first.saturating_sub(1).max(first)
-            } else {
-                last_sector
-            }
-        }
-    };
-    let new_sector = clamp_sector(target, max_unlocked, last_sector);
-    let new_world_pos = world_pos_for_level(worlds, levels, new_sector, world_pos);
-    (new_world_pos, new_sector)
-}
-
-/// Position of the next unlocked world after `from` in the given direction, wrapping around and
-/// skipping locked worlds; `from` itself when no other world is unlocked.
-fn step_unlocked_world(
-    worlds: &[(usize, usize)],
-    from: usize,
-    forward: bool,
-    max_unlocked: usize,
-) -> usize {
-    let count = worlds.len();
-    for step in 1..count {
-        let pos = if forward {
-            (from + step) % count
-        } else {
-            (from + count - step) % count
-        };
-        if is_world_unlocked(worlds[pos].1, max_unlocked) {
-            return pos;
-        }
-    }
-    from
-}
-
-/// Tracks the last persisted high score and save time to throttle automatic saves.
-struct SaveTracker {
-    last_saved_high_score: u64,
-    last_save_sec: f64,
-}
-
-impl SaveTracker {
-    fn new(saved_high_score: u64) -> Self {
-        Self {
-            last_saved_high_score: saved_high_score,
-            last_save_sec: f64::NEG_INFINITY,
-        }
-    }
-
-    /// Saves unconditionally and records the saved high score and time.
-    fn persist(&mut self, world: &GameWorld, theme_idx: usize, lang_fr: bool, now_sec: f64) {
-        save_progress(
-            world.high_score,
-            world.max_unlocked_level,
-            theme_idx,
-            lang_fr,
-        );
-        self.last_saved_high_score = world.high_score;
-        self.last_save_sec = now_sec;
-    }
-
-    /// Saves only when a new high score is due according to the throttle.
-    fn persist_if_due(&mut self, world: &GameWorld, theme_idx: usize, lang_fr: bool, now_sec: f64) {
-        if high_score_save_due(
-            world.high_score,
-            self.last_saved_high_score,
-            now_sec,
-            self.last_save_sec,
-            HIGH_SCORE_SAVE_INTERVAL_SEC,
-        ) {
-            self.persist(world, theme_idx, lang_fr, now_sec);
-        }
-    }
-}
-
-/// Replaces the count placeholder of a locale string with the number of worlds.
-fn substitute_count(template: &str, count: usize) -> String {
-    template.replace(COUNT_PLACEHOLDER, &count.to_string())
-}
-
-/// Ids of the first and last sector of the world at `pos` in `worlds`.
-fn world_sector_range(
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    pos: usize,
-) -> Option<(usize, usize)> {
-    let &(_, first_idx) = worlds.get(pos)?;
-    let last_idx = worlds
-        .get(pos + 1)
-        .map_or(levels.len(), |&(_, next_first)| next_first)
-        .checked_sub(1)?;
-    Some((levels.get(first_idx)?.id, levels.get(last_idx)?.id))
-}
-
-/// Title menu line naming the highlighted start sector.
-fn sector_line(label: &str, sector: &LevelDef) -> String {
-    format!(
-        "{label}{MENU_SECTOR_ID_PREFIX}{}{MENU_SECTOR_NAME_SEPARATOR}{}",
-        sector.id, sector.name
-    )
-}
-
-/// Fills the sector range placeholders of a locale string.
-fn substitute_range(template: &str, first: usize, last: usize) -> String {
-    template
-        .replace(FIRST_PLACEHOLDER, &first.to_string())
-        .replace(LAST_PLACEHOLDER, &last.to_string())
-}
-
-/// Label of a world row: its localized name followed by the sector range computed from the data.
-fn world_row_label(
-    i18n: &I18nCatalog,
-    world_id: usize,
-    worlds: &[(usize, usize)],
-    levels: &[LevelDef],
-    pos: usize,
-) -> String {
-    let key = format!("campaigns.c{world_id}");
-    let name = i18n.t(&key);
-    match world_sector_range(worlds, levels, pos) {
-        Some((first, last)) => format!(
-            "{name} {}",
-            substitute_range(i18n.t("menu.sector_range"), first, last)
-        ),
-        None => name.to_string(),
-    }
 }
 
 /// Text of a brick score popup: the points, plus the combo multiplier when it exceeds 1.
@@ -386,45 +214,6 @@ fn format_score_popup(points: u64, multiplier: u32) -> String {
         )
     } else {
         format!("{POPUP_POINTS_PREFIX}{points}")
-    }
-}
-
-/// Geometry of the title menu world list, derived from the number of worlds.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct WorldRowLayout {
-    step: f32,
-    pill_h: f32,
-    text_dy: f32,
-    text_size: u16,
-}
-
-/// Fits `count` world rows between `MENU_WORLD_LIST_Y` and `MENU_WORLD_LIST_BOTTOM_Y`. While
-/// they fit at full size the rows keep their reference look; past that the pills shrink down to
-/// `MENU_WORLD_PILL_MIN_H` and the gaps absorb the remainder.
-fn world_row_layout(count: usize) -> WorldRowLayout {
-    let count = count.min(WORLD_SELECT_KEYS.len());
-    let n = count.max(1) as f32;
-    let available = MENU_WORLD_LIST_BOTTOM_Y - MENU_WORLD_LIST_Y;
-    let full_needed = n * MENU_WORLD_PILL_H + (n - 1.0) * MENU_WORLD_ROW_GAP;
-    let pill_h = if full_needed <= available {
-        MENU_WORLD_PILL_H
-    } else {
-        let scale = available / full_needed;
-        (MENU_WORLD_PILL_H * scale).clamp(MENU_WORLD_PILL_MIN_H, MENU_WORLD_PILL_H)
-    };
-    let gap = if count <= 1 {
-        MENU_WORLD_ROW_GAP
-    } else {
-        ((available - n * pill_h) / (n - 1.0)).clamp(0.0, MENU_WORLD_ROW_GAP)
-    };
-    let ratio = pill_h / MENU_WORLD_PILL_H;
-    let text_size = ((f32::from(MENU_WORLD_TEXT_SIZE) * ratio).round() as u16)
-        .clamp(MENU_WORLD_TEXT_SIZE_FLOOR, MENU_WORLD_TEXT_SIZE);
-    WorldRowLayout {
-        step: pill_h + gap,
-        pill_h,
-        text_dy: MENU_WORLD_TEXT_DY * ratio,
-        text_size,
     }
 }
 
@@ -488,12 +277,137 @@ fn set_native_cursor_grab(grab: bool) {
     let _ = grab;
 }
 
+/// Persists the sound and music switches (single path for the hotkeys and the menu).
+fn persist_audio_settings(sfx: &SoundBank) {
+    save_settings(Settings {
+        sfx_on: !sfx.muted,
+        music_on: sfx.music_enabled,
+    });
+}
+
+/// What the settings actions of the menu change, shared by the title and the pause menu.
+struct SettingsContext<'a> {
+    lang: &'a mut Language,
+    theme_idx: &'a mut usize,
+    theme_count: usize,
+    sfx: &'a mut SoundBank,
+    save_tracker: &'a mut SaveTracker,
+    world: &'a GameWorld,
+    now_sec: f64,
+}
+
+/// Performs the settings actions (language, renderer, sound, music). Returns false when
+/// `action` is not a settings action, so the caller handles it.
+fn apply_settings_action(action: MenuAction, ctx: &mut SettingsContext) -> bool {
+    match action {
+        MenuAction::SetLanguage(language) => {
+            *ctx.lang = language;
+            set_document_lang(language == Language::Fr);
+            ctx.save_tracker.persist(
+                ctx.world,
+                *ctx.theme_idx,
+                language == Language::Fr,
+                ctx.now_sec,
+            );
+        }
+        MenuAction::CycleRenderer => {
+            *ctx.theme_idx = (*ctx.theme_idx + 1) % ctx.theme_count;
+        }
+        MenuAction::PersistRenderer => {
+            ctx.save_tracker.persist(
+                ctx.world,
+                *ctx.theme_idx,
+                *ctx.lang == Language::Fr,
+                ctx.now_sec,
+            );
+        }
+        MenuAction::ToggleSfx => {
+            ctx.sfx.muted = !ctx.sfx.muted;
+            persist_audio_settings(ctx.sfx);
+        }
+        MenuAction::ToggleMusic => {
+            ctx.sfx.music_enabled = !ctx.sfx.music_enabled;
+            persist_audio_settings(ctx.sfx);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// True when the menu is on screen: the title, or the pause page over a paused run.
+fn menu_is_visible(screen: AppScreen, status: SessionStatus) -> bool {
+    screen == AppScreen::TitleMenu
+        || (screen == AppScreen::InGame && status == SessionStatus::Paused)
+}
+
+/// Opens the editor on an empty board with fresh lives and score (the library "New" entry).
+fn enter_empty_editor(screen: &mut AppScreen, session: &mut Session, world: &mut GameWorld) {
+    world.clear_bricks();
+    world.boss = None;
+    world.lives = world.config.gameplay.initial_lives;
+    world.score = 0;
+    *screen = AppScreen::Editor;
+    enter_editor(session, world);
+}
+
+/// The F4 key: from the editor it starts a test play of the board, from anywhere else it opens
+/// the editor. Either way the board belongs to an editor test, never to the campaign.
+fn toggle_editor(screen: &mut AppScreen, session: &mut Session, world: &mut GameWorld) {
+    if *screen == AppScreen::Editor {
+        *screen = AppScreen::InGame;
+        start_editor_test(session, world);
+    } else {
+        *screen = AppScreen::Editor;
+        enter_editor(session, world);
+    }
+}
+
+/// True when the sudden death banner is due: the board has sudden death and its timer ran out.
+fn sudden_death_banner_due(world: &GameWorld) -> bool {
+    world.sudden_death_enabled()
+        && world.level_elapsed >= world.config.gameplay.sudden_death_time_sec
+}
+
+/// False for the Up / Down keys while a menu is shown: they move the menu focus there, they do not
+/// select a developer power-up.
+fn dev_key_cycles_powerup(key: KeyCode, menu_shown: bool) -> bool {
+    !(menu_shown && matches!(key, KeyCode::Up | KeyCode::Down))
+}
+
+/// True when any of `keys` was pressed this frame and may cycle the developer power-up.
+fn dev_powerup_pressed(keys: &[KeyCode], menu_shown: bool) -> bool {
+    keys.iter()
+        .any(|&key| dev_key_cycles_powerup(key, menu_shown) && is_key_pressed(key))
+}
+
+/// Which menu gestures start play (from the title or the pause menu): a click on the widget
+/// under the pointer, and Enter / Space on the focused widget.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct MenuPlay {
+    click: bool,
+    key: bool,
+}
+
 /// Input gestures that will make the pointer lock wanted from the given state (see
 /// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
-fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
+/// `victory_continues` is true when a win goes on to another board: only then does a click or a
+/// Space press after the win start play again.
+fn resume_mask_for(
+    screen: AppScreen,
+    status: SessionStatus,
+    menu_play: MenuPlay,
+    victory_continues: bool,
+) -> u32 {
     match screen {
         AppScreen::TitleMenu => {
-            let base = RESUME_CLICK | RESUME_SPACE | RESUME_ENTER | RESUME_CHEAT_MASK;
+            let mut base = RESUME_CHEAT_MASK;
+            // A click or a key only counts when it would start play from the menu.
+            if menu_play.click {
+                base |= RESUME_CLICK;
+            }
+            if menu_play.key {
+                base |= RESUME_SPACE | RESUME_ENTER;
+            }
             // Tab from the title enters the game and wants the lock when the world is playing.
             if status == SessionStatus::Playing {
                 base | RESUME_TAB
@@ -504,7 +418,19 @@ fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
         AppScreen::Editor => RESUME_F4 | RESUME_CHEAT_MASK,
         AppScreen::InGame => match status {
             SessionStatus::Playing => 0,
-            SessionStatus::Paused => RESUME_P | RESUME_R | RESUME_CHEAT_MASK,
+            // Escape is never listed: the browser uses it to release the pointer lock. A click
+            // or a key only counts when it hits Resume or Restart in the pause menu.
+            SessionStatus::Paused => {
+                let mut base = RESUME_P | RESUME_R | RESUME_CHEAT_MASK;
+                if menu_play.click {
+                    base |= RESUME_CLICK;
+                }
+                if menu_play.key {
+                    base |= RESUME_SPACE | RESUME_ENTER;
+                }
+                base
+            }
+            SessionStatus::Victory if !victory_continues => RESUME_R | RESUME_CHEAT_MASK,
             SessionStatus::Victory | SessionStatus::GameOver => {
                 RESUME_CLICK | RESUME_SPACE | RESUME_R | RESUME_CHEAT_MASK
             }
@@ -514,7 +440,13 @@ fn resume_mask_for(screen: AppScreen, status: SessionStatus) -> u32 {
 
 /// Fills the glyph atlas with every glyph and size the UI uses, before the first frame, so the
 /// atlas is never grown (and its texture recreated) in the middle of a frame.
-fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: &[&str]) {
+fn prewarm_font(
+    font: &Font,
+    raw_locales: &[&str],
+    levels: &[LevelDef],
+    titles: &[&str],
+    extra_names: &[&str],
+) {
     let mut chars: BTreeSet<char> = Font::ascii_character_list()
         .into_iter()
         .filter(|c| !c.is_control())
@@ -526,20 +458,14 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
     for level in levels {
         chars.extend(level.name.chars().filter(printable));
     }
+    for name in extra_names {
+        chars.extend(name.chars().filter(printable));
+    }
     let chars: Vec<char> = chars.into_iter().collect();
 
     // Glyphs are cached per physical pixel size (font size times the DPI scale, rounded up).
     let dpi = miniquad::window::dpi_scale();
-    let physical = |size: u16| (size as f32 * dpi).ceil() as u16;
-    let sizes: BTreeSet<u16> = UI_FONT_SIZES
-        .iter()
-        .copied()
-        .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
-        .chain(MENU_WORLD_TEXT_SIZE_FLOOR..=MENU_WORLD_TEXT_SIZE)
-        .chain(MENU_SECTOR_SIZE_MIN..=MENU_SECTOR_SIZE)
-        .map(physical)
-        .collect();
-    for size in sizes {
+    for size in full_charset_sizes(dpi) {
         font.populate_font_cache(&chars, size);
     }
 
@@ -550,12 +476,31 @@ fn prewarm_font(font: &Font, raw_locales: &[&str], levels: &[LevelDef], titles: 
         .collect::<BTreeSet<char>>()
         .into_iter()
         .collect();
-    font.populate_font_cache(&title_chars, physical(MENU_TITLE_SIZE));
+    font.populate_font_cache(&title_chars, physical_font_size(SIZE_HOME_TITLE, dpi));
+}
+
+/// Glyph cache size of a font size at the given DPI scale (rounded up).
+fn physical_font_size(size: u16, dpi: f32) -> u16 {
+    (size as f32 * dpi).ceil() as u16
+}
+
+/// Physical glyph sizes preloaded for the full character set. The menu title size is not part of
+/// it: the title is only a few characters, warmed separately.
+fn full_charset_sizes(dpi: f32) -> BTreeSet<u16> {
+    UI_FONT_SIZES
+        .iter()
+        .copied()
+        .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
+        .chain(MENU_FONT_SIZES.iter().copied())
+        .map(|size| physical_font_size(size, dpi))
+        .collect()
 }
 
 struct HudContext<'a> {
     world: &'a GameWorld,
-    levels: &'a LevelPack,
+    /// One-based number and name of the board being played.
+    level_number: usize,
+    level_name: &'a str,
     theme: &'a ThemeDef,
     i18n: &'a I18nCatalog,
     lang: Language,
@@ -611,11 +556,23 @@ async fn main() {
     let catalog_en = I18nCatalog::from_json_str(RAW_EN).expect("Invalid en.json");
     let catalog_fr = I18nCatalog::from_json_str(RAW_FR).expect("Invalid fr.json");
     let ui_font = load_ttf_font_from_bytes(RAW_FONT).expect("Failed to load embedded UI font");
+    let satisfaction_levels = satisfaction_pack();
+    let satisfaction_names: Vec<String> = level_names(&satisfaction_levels)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut library = load_library();
+    let extra_names: Vec<&str> = satisfaction_names
+        .iter()
+        .map(String::as_str)
+        .chain(library.entries.iter().map(|entry| entry.name.as_str()))
+        .collect();
     prewarm_font(
         &ui_font,
         &[RAW_EN, RAW_FR],
         &level_pack.levels,
         &[catalog_en.t("app.title"), catalog_fr.t("app.title")],
+        &extra_names,
     );
 
     let add_mat = additive_material();
@@ -637,6 +594,11 @@ async fn main() {
 
     let (saved_hs, saved_unlocked, saved_theme, saved_fr) = load_progress();
     let mut sfx = SoundBank::init().await;
+    let saved_settings = load_settings();
+    sfx.muted = !saved_settings.sfx_on;
+    sfx.music_enabled = saved_settings.music_on;
+    // Applies the saved music preference before the first frame (web: kinetix_set_music).
+    sfx.update_music(false, 0, true);
     let mut lang = if saved_fr { Language::Fr } else { Language::En };
     set_document_lang(lang == Language::Fr);
     let mut theme_idx: usize = saved_theme % theme_reg.themes.len();
@@ -649,6 +611,7 @@ async fn main() {
 
     #[cfg(not(target_arch = "wasm32"))]
     prevent_quit();
+    let mut session = Session::campaign();
     let mut save_tracker = SaveTracker::new(saved_hs);
     let mut dev_state = DevState::default();
     let mut progress_guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
@@ -665,8 +628,14 @@ async fn main() {
 
     let mut screen = AppScreen::TitleMenu;
     let worlds = build_worlds(&level_pack.levels);
-    let mut selected_world_pos: usize = 0;
-    let mut selected_sector_idx: usize = 0;
+    let mut menu = Menu::new();
+    let mut menu_model = MenuModelCache::new();
+    // Sector started last from the menu, focused first when its world is opened again.
+    let mut last_started_sector: Option<usize> = None;
+    // Arena position of the pointer over the menu (title or pause), for the resume mask.
+    let mut menu_pointer: Option<(f32, f32)> = None;
+    // True while the menu shows the pause page for the current pause.
+    let mut pause_menu_open = false;
 
     let mut events: Vec<GameEvent> = Vec::with_capacity(MAX_EVENTS);
     let mut particles: Vec<Particle> = Vec::with_capacity(MAX_PARTICLES);
@@ -712,6 +681,8 @@ async fn main() {
             Language::Fr => &catalog_fr,
         };
         let theme = &theme_reg.themes[theme_idx % theme_reg.themes.len()];
+        let arena_pointer =
+            current_arena_pointer(world.config.arena.width, world.config.arena.height);
 
         sfx.update_music(
             world.boss.is_some(),
@@ -732,27 +703,33 @@ async fn main() {
         if LEVEL_CHEAT_ENABLED && is_key_pressed(KeyCode::F3) {
             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
             world.load_level(next_lvl, &level_pack.levels);
+            session.source = PlaySource::Campaign;
             screen = AppScreen::InGame;
         }
         if is_key_pressed(KeyCode::F4) {
-            screen = match screen {
-                AppScreen::Editor => AppScreen::InGame,
-                _ => AppScreen::Editor,
-            };
-            world.reset_paddle_and_ball();
-            world.status = SessionStatus::Playing;
+            toggle_editor(&mut screen, &mut session, &mut world);
         }
         if is_key_pressed(KeyCode::Tab) {
+            if menu.renderer_dirty() {
+                save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+            }
             screen = match screen {
                 AppScreen::TitleMenu => AppScreen::InGame,
                 _ => AppScreen::TitleMenu,
             };
+            if screen == AppScreen::TitleMenu {
+                menu.open_home(arena_pointer);
+            } else if screen == AppScreen::InGame {
+                resume_play_from_title(&mut session, &world);
+            }
         }
         if is_key_pressed(KeyCode::M) {
             sfx.muted = !sfx.muted;
+            persist_audio_settings(&sfx);
         }
         if is_key_pressed(KeyCode::B) {
             sfx.music_enabled = !sfx.music_enabled;
+            persist_audio_settings(&sfx);
         }
 
         // Hidden developer mode (Ctrl+Shift+D): never persisted, never advertised.
@@ -818,13 +795,15 @@ async fn main() {
                     world.lives = world.config.gameplay.initial_lives;
                 }
                 world.load_level(idx, &level_pack.levels);
+                session.source = PlaySource::Campaign;
                 screen = AppScreen::InGame;
             }
             if screen == AppScreen::InGame {
-                if DEV_POWERUP_PREV_KEYS.iter().any(|k| is_key_pressed(*k)) {
+                let menu_shown = menu_is_visible(screen, world.status);
+                if dev_powerup_pressed(&DEV_POWERUP_PREV_KEYS, menu_shown) {
                     dev_state.cycle_powerup(false);
                 }
-                if DEV_POWERUP_NEXT_KEYS.iter().any(|k| is_key_pressed(*k)) {
+                if dev_powerup_pressed(&DEV_POWERUP_NEXT_KEYS, menu_shown) {
                     dev_state.cycle_powerup(true);
                 }
                 if is_key_pressed(DEV_APPLY_KEY) {
@@ -855,7 +834,7 @@ async fn main() {
                 }
             }
         }
-        sync_progress(&mut progress_guard, &dev_state, &mut world);
+        sync_progress(&mut progress_guard, &dev_state, &mut world, session.source);
 
         let rt_w = (screen_width() * miniquad::window::dpi_scale()).max(MIN_RENDER_W) as u32;
         let rt_h = (screen_height() * miniquad::window::dpi_scale()).max(MIN_RENDER_H) as u32;
@@ -930,66 +909,137 @@ async fn main() {
             grab_session_live = false;
         }
 
+        if screen != AppScreen::Editor {
+            // The high score only matters while the menu shows it; keying on it during play
+            // would rebuild the whole model on every new record.
+            let shown_high_score = if menu_is_visible(screen, world.status) {
+                world.high_score
+            } else {
+                0
+            };
+            let key = MenuModelKey {
+                language: lang,
+                max_unlocked: world.max_unlocked_level,
+                preferred_sector: last_started_sector,
+                theme_idx,
+                sfx_on: !sfx.muted,
+                music_on: sfx.music_enabled,
+                library_len: library.entries.len(),
+                library_next_id: library.next_id,
+                high_score: shown_high_score,
+            };
+            menu_model.get(key, || {
+                build_menu_model(&MenuModelSource {
+                    i18n,
+                    levels: &level_pack.levels,
+                    worlds: &worlds,
+                    max_unlocked: world.max_unlocked_level,
+                    preferred_sector: last_started_sector,
+                    satisfaction_names: &satisfaction_names,
+                    library: &library,
+                    quit_supported: cfg!(not(target_arch = "wasm32")),
+                    language: lang,
+                    renderer_name: i18n.t(&theme.name_key).to_owned(),
+                    sfx_on: !sfx.muted,
+                    music_on: sfx.music_enabled,
+                    high_score: shown_high_score,
+                })
+            });
+        }
+        if screen != AppScreen::InGame {
+            pause_menu_open = false;
+        }
+
         match screen {
             AppScreen::TitleMenu => {
-                let max_unlocked = world.max_unlocked_level;
-                if !worlds.is_empty() {
-                    for (n, key) in WORLD_SELECT_KEYS.iter().enumerate() {
-                        if is_key_pressed(*key) {
-                            if let Some(&(_, first_idx)) = worlds.get(n) {
-                                if is_world_unlocked(first_idx, max_unlocked) {
-                                    selected_world_pos = n;
-                                    selected_sector_idx = first_idx;
+                let pointer = pointer_frame(
+                    (mx, my),
+                    is_mouse_button_pressed(MouseButton::Left),
+                    is_mouse_button_released(MouseButton::Left),
+                    &touches(),
+                    miniquad::window::dpi_scale(),
+                );
+                let input = read_menu_input(
+                    pointer,
+                    |x, y| screen_to_arena(x, y, view_scale, view_ox, view_oy),
+                    dev_enter_consumed,
+                    dev_esc_consumed,
+                );
+                menu_pointer = input.pointer;
+                let action = menu.update(&input, menu_model.current());
+                let handled = apply_settings_action(
+                    action,
+                    &mut SettingsContext {
+                        lang: &mut lang,
+                        theme_idx: &mut theme_idx,
+                        theme_count: theme_reg.themes.len(),
+                        sfx: &mut sfx,
+                        save_tracker: &mut save_tracker,
+                        world: &world,
+                        now_sec,
+                    },
+                );
+                if !handled {
+                    match action {
+                        MenuAction::StartSector(idx)
+                            if is_sector_unlocked(idx, world.max_unlocked_level)
+                                && idx < level_pack.levels.len() =>
+                        {
+                            session.source = PlaySource::Campaign;
+                            start_run_from_title(
+                                &mut world,
+                                &mut dev_state,
+                                &level_pack.levels,
+                                idx,
+                                session.source,
+                            );
+                            last_started_sector = Some(idx);
+                            menu.open_home(arena_pointer);
+                            screen = AppScreen::InGame;
+                        }
+                        MenuAction::StartSatisfaction(idx)
+                            if start_satisfaction(
+                                &mut session,
+                                &mut world,
+                                &satisfaction_levels.levels,
+                                idx,
+                            ) =>
+                        {
+                            menu.open_home(arena_pointer);
+                            screen = AppScreen::InGame;
+                        }
+                        MenuAction::PlayLibrary(id) => {
+                            let entry = u32::try_from(id).ok().and_then(|id| library.get(id));
+                            if let Some(entry) = entry {
+                                match start_library_level(&mut session, &mut world, entry) {
+                                    Ok(()) => {
+                                        menu.open_home(arena_pointer);
+                                        screen = AppScreen::InGame;
+                                    }
+                                    Err(err) => popups.push(error_popup(i18n, &err)),
                                 }
                             }
                         }
+                        MenuAction::DeleteLibrary(id) => {
+                            let outcome = match u32::try_from(id) {
+                                Ok(id) => delete_library_level(&mut library, id, save_library),
+                                Err(_) => LibraryOutcome::Missing,
+                            };
+                            push_library_toast(&mut popups, i18n, theme, &outcome);
+                        }
+                        MenuAction::OpenEditor => {
+                            reload_library_if_unloaded(&mut library);
+                            menu.open_home(arena_pointer);
+                            enter_empty_editor(&mut screen, &mut session, &mut world);
+                        }
+                        #[cfg(not(target_arch = "wasm32"))]
+                        MenuAction::QuitApp => {
+                            set_native_cursor_grab(false);
+                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                            break;
+                        }
+                        _ => {}
                     }
-                    if is_key_pressed(KeyCode::Left) {
-                        selected_world_pos =
-                            step_unlocked_world(&worlds, selected_world_pos, false, max_unlocked);
-                        selected_sector_idx = worlds[selected_world_pos].1;
-                    }
-                    if is_key_pressed(KeyCode::Right) {
-                        selected_world_pos =
-                            step_unlocked_world(&worlds, selected_world_pos, true, max_unlocked);
-                        selected_sector_idx = worlds[selected_world_pos].1;
-                    }
-                }
-                let last_sector = level_pack.levels.len().saturating_sub(1);
-                for (key, nav) in [
-                    (KeyCode::Up, SectorNav::Next),
-                    (KeyCode::Down, SectorNav::Prev),
-                    (KeyCode::PageUp, SectorNav::PageNext),
-                    (KeyCode::PageDown, SectorNav::PagePrev),
-                    (KeyCode::Home, SectorNav::WorldHome),
-                    (KeyCode::End, SectorNav::WorldEnd),
-                ] {
-                    if is_key_pressed(key) {
-                        (selected_world_pos, selected_sector_idx) = navigate_sector(
-                            nav,
-                            &worlds,
-                            &level_pack.levels,
-                            selected_world_pos,
-                            selected_sector_idx,
-                            max_unlocked,
-                        );
-                    }
-                }
-                selected_sector_idx = clamp_sector(selected_sector_idx, max_unlocked, last_sector);
-
-                if (is_key_pressed(KeyCode::Enter)
-                    || is_key_pressed(KeyCode::Space)
-                    || is_mouse_button_pressed(MouseButton::Left))
-                    && is_sector_unlocked(selected_sector_idx, max_unlocked)
-                    && !dev_enter_consumed
-                {
-                    start_run_from_title(
-                        &mut world,
-                        &mut dev_state,
-                        &level_pack.levels,
-                        selected_sector_idx,
-                    );
-                    screen = AppScreen::InGame;
                 }
             }
             AppScreen::Editor => {
@@ -1053,6 +1103,17 @@ async fn main() {
                         color: rgba(theme.text_accent),
                     });
                 }
+                if is_key_pressed(KeyCode::S) {
+                    reload_library_if_unloaded(&mut library);
+                    let outcome = save_board_to_library(
+                        &mut library,
+                        library_is_loaded(),
+                        world.export_level_code(),
+                        i18n.t("menu.library.label.default_name"),
+                        save_library,
+                    );
+                    push_library_toast(&mut popups, i18n, theme, &outcome);
+                }
                 if is_key_pressed(KeyCode::I) {
                     match prompt_level_code(i18n.t("editor.paste_prompt")) {
                         Ok(Some(code)) => match world.import_level_code(&code) {
@@ -1087,7 +1148,103 @@ async fn main() {
                     };
                 }
                 if is_key_pressed(KeyCode::R) {
-                    restart_level(&mut world, &mut dev_state, &level_pack.levels);
+                    match restart_current(
+                        &session,
+                        &mut world,
+                        &mut dev_state,
+                        &level_pack.levels,
+                        &satisfaction_levels.levels,
+                        &library,
+                    ) {
+                        RestartOutcome::Restarted => {}
+                        RestartOutcome::ToTitle(page) => {
+                            open_menu_page(&mut menu, menu_model.current(), page, arena_pointer);
+                            screen = AppScreen::TitleMenu;
+                        }
+                        RestartOutcome::ToEditor => {
+                            screen = AppScreen::Editor;
+                            enter_editor(&mut session, &mut world);
+                        }
+                    }
+                }
+
+                // The pause menu drives the paused session. A frame it handled never fires or
+                // launches, so a Space that activates Resume does not also launch the ball.
+                let pause_menu_shown = world.status == SessionStatus::Paused;
+                if pause_menu_shown {
+                    let pointer = pointer_frame(
+                        (mx, my),
+                        is_mouse_button_pressed(MouseButton::Left),
+                        is_mouse_button_released(MouseButton::Left),
+                        &touches(),
+                        miniquad::window::dpi_scale(),
+                    );
+                    let input = read_menu_input(
+                        pointer,
+                        |x, y| screen_to_arena(x, y, view_scale, view_ox, view_oy),
+                        dev_enter_consumed,
+                        dev_esc_consumed,
+                    );
+                    if !pause_menu_open {
+                        // The pointer is wherever it was when the pause began: only a real move
+                        // from there changes the focused button.
+                        menu.open_pause(input.pointer);
+                        pause_menu_open = true;
+                    }
+                    menu_pointer = input.pointer;
+                    let action = menu.update(&input, menu_model.current());
+                    let handled = apply_settings_action(
+                        action,
+                        &mut SettingsContext {
+                            lang: &mut lang,
+                            theme_idx: &mut theme_idx,
+                            theme_count: theme_reg.themes.len(),
+                            sfx: &mut sfx,
+                            save_tracker: &mut save_tracker,
+                            world: &world,
+                            now_sec,
+                        },
+                    );
+                    if !handled {
+                        match apply_session_pause_action(
+                            action,
+                            &session,
+                            &mut world,
+                            &mut dev_state,
+                            &level_pack.levels,
+                            &satisfaction_levels.levels,
+                            &library,
+                        ) {
+                            PauseOutcome::ToTitle => {
+                                menu.open_home(arena_pointer);
+                                pause_menu_open = false;
+                                screen = AppScreen::TitleMenu;
+                            }
+                            PauseOutcome::ToTitlePage(page) => {
+                                open_menu_page(
+                                    &mut menu,
+                                    menu_model.current(),
+                                    page,
+                                    arena_pointer,
+                                );
+                                pause_menu_open = false;
+                                screen = AppScreen::TitleMenu;
+                            }
+                            PauseOutcome::ToEditor => {
+                                pause_menu_open = false;
+                                menu.open_home(arena_pointer);
+                                screen = AppScreen::Editor;
+                                enter_editor(&mut session, &mut world);
+                            }
+                            PauseOutcome::None | PauseOutcome::Resumed => {}
+                        }
+                    }
+                } else if pause_menu_open {
+                    // Resumed with P while a previewed renderer was still unsaved.
+                    if menu.renderer_dirty() {
+                        save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                    }
+                    pause_menu_open = false;
                 }
 
                 world.set_paddle_target(paddle_mx);
@@ -1114,24 +1271,64 @@ async fn main() {
                     );
                 }
 
-                let action_triggered =
-                    is_mouse_button_pressed(MouseButton::Left) || is_key_pressed(KeyCode::Space);
+                let action_triggered = !pause_menu_shown
+                    && (is_mouse_button_pressed(MouseButton::Left)
+                        || is_key_pressed(KeyCode::Space));
                 if action_triggered {
                     match world.status {
                         SessionStatus::Playing => world.launch_or_fire(&mut events),
-                        SessionStatus::Victory if !world.is_campaign_board() => {
-                            // A custom board has no next sector: go back to the editor.
-                            screen = AppScreen::Editor;
-                            world.reset_paddle_and_ball();
-                            world.status = SessionStatus::Playing;
-                        }
                         SessionStatus::Victory => {
-                            next_sector(&mut world, &mut dev_state, &level_pack.levels);
+                            let outcome = advance_after_victory(
+                                &session,
+                                &mut world,
+                                &mut dev_state,
+                                &level_pack.levels,
+                                &satisfaction_levels.levels,
+                            );
+                            match outcome {
+                                VictoryOutcome::NextLevel => {}
+                                VictoryOutcome::ToTitle(page) => {
+                                    open_menu_page(
+                                        &mut menu,
+                                        menu_model.current(),
+                                        page,
+                                        arena_pointer,
+                                    );
+                                    screen = AppScreen::TitleMenu;
+                                }
+                                VictoryOutcome::ToEditor => {
+                                    // A custom board has no next sector: back to the editor.
+                                    screen = AppScreen::Editor;
+                                    enter_editor(&mut session, &mut world);
+                                }
+                            }
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                         }
                         SessionStatus::GameOver => {
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                            restart_level(&mut world, &mut dev_state, &level_pack.levels);
+                            match restart_current(
+                                &session,
+                                &mut world,
+                                &mut dev_state,
+                                &level_pack.levels,
+                                &satisfaction_levels.levels,
+                                &library,
+                            ) {
+                                RestartOutcome::Restarted => {}
+                                RestartOutcome::ToTitle(page) => {
+                                    open_menu_page(
+                                        &mut menu,
+                                        menu_model.current(),
+                                        page,
+                                        arena_pointer,
+                                    );
+                                    screen = AppScreen::TitleMenu;
+                                }
+                                RestartOutcome::ToEditor => {
+                                    screen = AppScreen::Editor;
+                                    enter_editor(&mut session, &mut world);
+                                }
+                            }
                         }
                         SessionStatus::Paused => {}
                     }
@@ -1147,14 +1344,14 @@ async fn main() {
                         world.reset_paddle_and_ball();
                     }
                 }
-                sync_progress(&mut progress_guard, &dev_state, &mut world);
+                sync_progress(&mut progress_guard, &dev_state, &mut world, session.source);
                 if prev_status == SessionStatus::Playing && world.status != SessionStatus::Playing {
                     save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                 }
             }
         }
 
-        sync_progress(&mut progress_guard, &dev_state, &mut world);
+        sync_progress(&mut progress_guard, &dev_state, &mut world, session.source);
         // A new high score is persisted without waiting for pause / game over, throttled.
         save_tracker.persist_if_due(&world, theme_idx, lang == Language::Fr, now_sec);
 
@@ -1182,7 +1379,22 @@ async fn main() {
 
         // Tell the page which gestures will make the lock wanted next, so it can request the
         // lock synchronously inside the input handler (required by Firefox).
-        let resume_mask = resume_mask_for(screen, world.status);
+        let menu_visible = menu_is_visible(screen, world.status);
+        let menu_play = if menu_visible {
+            let model = menu_model.current();
+            MenuPlay {
+                click: menu_pointer.is_some_and(|p| menu.starts_play_at(model, p)),
+                key: menu.focused_starts_play(model),
+            }
+        } else {
+            MenuPlay::default()
+        };
+        let resume_mask = resume_mask_for(
+            screen,
+            world.status,
+            menu_play,
+            victory_continues(session.source, &world, satisfaction_levels.levels.len()),
+        );
         if last_resume_mask != Some(resume_mask) {
             set_resume_mask(resume_mask);
             last_resume_mask = Some(resume_mask);
@@ -1525,10 +1737,21 @@ async fn main() {
 
         // Draw capsules above additive explosions/glows so icons stay 100% crisp and readable
         draw_capsules(&world, i18n, &ui_font, time);
-        draw_popups(&popups, &ui_font);
+        let (level_number, level_name) = level_label(
+            session.source,
+            world.current_level_idx,
+            &level_pack.levels,
+            &satisfaction_levels.levels,
+            &library,
+            i18n.t("menu.home.button.editor"),
+        );
+        if !menu_visible {
+            draw_popups(&popups, &ui_font);
+        }
         draw_hud(&HudContext {
             world: &world,
-            levels: &level_pack,
+            level_number,
+            level_name,
             theme,
             i18n,
             lang,
@@ -1538,19 +1761,18 @@ async fn main() {
             rt_h,
         });
 
-        if screen == AppScreen::TitleMenu {
-            draw_title_menu(
-                &world,
-                &level_pack,
+        if menu_visible {
+            draw_menu(
+                &menu,
+                menu_model.current(),
                 theme,
                 i18n,
                 &ui_font,
-                &MenuSelection {
-                    worlds: &worlds,
-                    world_pos: selected_world_pos,
-                    sector_idx: selected_sector_idx,
-                },
+                arena_w,
+                arena_h,
             );
+            // Toasts stay readable over the menu panel.
+            draw_popups(&popups, &ui_font);
         }
 
         if dev_state.active {
@@ -1559,237 +1781,6 @@ async fn main() {
 
         next_frame().await
     }
-}
-
-/// Title menu selection state: the world list and the highlighted world / start sector.
-struct MenuSelection<'a> {
-    worlds: &'a [(usize, usize)],
-    world_pos: usize,
-    sector_idx: usize,
-}
-
-fn draw_title_menu(
-    world: &GameWorld,
-    levels: &LevelPack,
-    theme: &ThemeDef,
-    i18n: &I18nCatalog,
-    font: &Font,
-    selection: &MenuSelection,
-) {
-    let MenuSelection {
-        worlds,
-        world_pos: selected_world_pos,
-        sector_idx: selected_sector_idx,
-    } = *selection;
-    let w = world.config.arena.width;
-    let h = world.config.arena.height;
-    draw_rectangle(0.0, 0.0, w, h, rgba(MENU_DIM_COLOR));
-    let pri = rgba(theme.text_primary);
-    let acc = rgba(theme.text_accent);
-    let border = rgba(theme.border_color);
-
-    // Modern Glassmorphic Modal Panel
-    draw_rounded_rect(
-        MENU_PANEL_X,
-        MENU_PANEL_Y,
-        MENU_PANEL_W,
-        MENU_PANEL_H,
-        MENU_PANEL_RADIUS,
-        border,
-    );
-    draw_rounded_rect(
-        MENU_PANEL_X + MENU_PANEL_BORDER,
-        MENU_PANEL_Y + MENU_PANEL_BORDER,
-        MENU_PANEL_W - 2.0 * MENU_PANEL_BORDER,
-        MENU_PANEL_H - 2.0 * MENU_PANEL_BORDER,
-        MENU_PANEL_RADIUS - MENU_PANEL_BORDER,
-        rgba(MENU_PANEL_COLOR),
-    );
-    draw_rounded_rect(
-        MENU_PANEL_X + MENU_HEADER_INSET_X,
-        MENU_PANEL_Y + MENU_HEADER_INSET_Y,
-        MENU_PANEL_W - 2.0 * MENU_HEADER_INSET_X,
-        MENU_HEADER_H,
-        MENU_HEADER_RADIUS,
-        Color::new(1.0, 1.0, 1.0, 0.05),
-    );
-
-    txt(
-        font,
-        i18n.t("app.title"),
-        MENU_PANEL_X + MENU_TITLE_DX,
-        MENU_TITLE_Y,
-        MENU_TITLE_SIZE,
-        acc,
-    );
-    txt(
-        font,
-        i18n.t("app.subtitle"),
-        MENU_PANEL_X + MENU_SUBTITLE_DX,
-        MENU_SUBTITLE_Y,
-        MENU_SUBTITLE_SIZE,
-        pri,
-    );
-
-    draw_rounded_rect(
-        MENU_PANEL_X + MENU_BEST_PILL_DX,
-        MENU_BEST_PILL_Y,
-        MENU_BEST_PILL_W,
-        MENU_BEST_PILL_H,
-        MENU_BEST_PILL_RADIUS,
-        Color::new(acc.r, acc.g, acc.b, MENU_BEST_PILL_ALPHA),
-    );
-    let best_line = format!("{}: {:07}", i18n.t("menu.best_score"), world.high_score);
-    txt(
-        font,
-        &best_line,
-        MENU_PANEL_X + MENU_BEST_TEXT_DX,
-        MENU_BEST_TEXT_Y,
-        MENU_BEST_TEXT_SIZE,
-        acc,
-    );
-
-    let campaigns_line = substitute_count(
-        i18n.t("menu.campaigns"),
-        worlds.len().clamp(1, WORLD_SELECT_KEYS.len()),
-    );
-    txt(
-        font,
-        &campaigns_line,
-        MENU_PANEL_X + MENU_LABEL_DX,
-        MENU_CAMPAIGNS_Y,
-        MENU_LABEL_SIZE,
-        pri,
-    );
-    let row_layout = world_row_layout(worlds.len());
-    for (pos, &(world_id, first_idx)) in worlds.iter().take(WORLD_SELECT_KEYS.len()).enumerate() {
-        let unlocked = is_world_unlocked(first_idx, world.max_unlocked_level);
-        let y = MENU_WORLD_LIST_Y + pos as f32 * row_layout.step;
-        let is_sel = selected_world_pos == pos;
-        let pill_bg = if is_sel {
-            Color::new(acc.r, acc.g, acc.b, MENU_PILL_SELECTED_ALPHA)
-        } else {
-            rgba(MENU_PILL_IDLE_COLOR)
-        };
-        draw_rounded_rect(
-            MENU_PANEL_X + MENU_WORLD_PILL_DX,
-            y,
-            MENU_WORLD_PILL_W,
-            row_layout.pill_h,
-            MENU_WORLD_PILL_RADIUS.min(row_layout.pill_h * 0.5),
-            pill_bg,
-        );
-        let base_col = if is_sel { acc } else { pri };
-        let col = if unlocked {
-            base_col
-        } else {
-            Color::new(base_col.r, base_col.g, base_col.b, MENU_LOCKED_ALPHA)
-        };
-        let prefix = if is_sel {
-            MENU_SELECTED_PREFIX
-        } else {
-            MENU_UNSELECTED_PREFIX
-        };
-        let row_text = format!(
-            "{}{}",
-            prefix,
-            world_row_label(i18n, world_id, worlds, &levels.levels, pos)
-        );
-        let text_x = MENU_PANEL_X + MENU_WORLD_TEXT_DX;
-        let pill_right = MENU_PANEL_X + MENU_WORLD_PILL_DX + MENU_WORLD_PILL_W;
-        // A locked row reserves room for its label on the right and shrinks the name to fit.
-        let lock_label = i18n.t("menu.locked");
-        let lock_w = if unlocked {
-            0.0
-        } else {
-            measure_text(lock_label, Some(font), row_layout.text_size, 1.0).width + MENU_LOCK_GAP
-        };
-        let text_limit = pill_right - MENU_LOCK_LABEL_PAD - lock_w - text_x;
-        let row_size = fit_font_size(
-            |size| measure_text(&row_text, Some(font), size, 1.0).width,
-            row_layout.text_size,
-            MENU_WORLD_TEXT_SIZE_MIN.min(row_layout.text_size),
-            text_limit,
-        );
-        txt(
-            font,
-            &row_text,
-            text_x,
-            y + row_layout.text_dy,
-            row_size,
-            col,
-        );
-        if !unlocked {
-            let label_w = lock_w - MENU_LOCK_GAP;
-            txt(
-                font,
-                lock_label,
-                pill_right - MENU_LOCK_LABEL_PAD - label_w,
-                y + row_layout.text_dy,
-                row_layout.text_size,
-                col,
-            );
-        }
-    }
-
-    let sec_def = &levels.levels[selected_sector_idx % levels.levels.len()];
-    let sec_line = sector_line(i18n.t("menu.sector_select"), sec_def);
-    let sec_size = fit_font_size(
-        |size| measure_text(&sec_line, Some(font), size, 1.0).width,
-        MENU_SECTOR_SIZE,
-        MENU_SECTOR_SIZE_MIN,
-        MENU_SECTOR_MAX_W,
-    );
-    txt(
-        font,
-        &sec_line,
-        MENU_PANEL_X + MENU_LABEL_DX,
-        MENU_SECTOR_Y,
-        sec_size,
-        acc,
-    );
-
-    // Glowing CTA Pill Button
-    draw_rounded_rect(
-        MENU_CTA_X,
-        MENU_CTA_Y,
-        MENU_CTA_W,
-        MENU_CTA_H,
-        MENU_CTA_RADIUS,
-        acc,
-    );
-    draw_rounded_rect(
-        MENU_CTA_X + MENU_CTA_BORDER,
-        MENU_CTA_Y + MENU_CTA_BORDER,
-        MENU_CTA_W - 2.0 * MENU_CTA_BORDER,
-        MENU_CTA_H - 2.0 * MENU_CTA_BORDER,
-        MENU_CTA_RADIUS - MENU_CTA_BORDER,
-        rgba(MENU_CTA_COLOR),
-    );
-    txt(
-        font,
-        i18n.t("menu.play"),
-        MENU_CTA_X + MENU_CTA_TEXT_DX,
-        MENU_CTA_TEXT_Y,
-        MENU_CTA_TEXT_SIZE,
-        WHITE,
-    );
-
-    let footer = [
-        i18n.t("menu.editor_btn"),
-        i18n.t("menu.theme_btn"),
-        i18n.t("menu.lang_btn"),
-        i18n.t("menu.music_btn"),
-    ]
-    .join(MENU_FOOTER_SEPARATOR);
-    txt(
-        font,
-        &footer,
-        MENU_PANEL_X + MENU_FOOTER_DX,
-        MENU_FOOTER_Y,
-        MENU_FOOTER_SIZE,
-        pri,
-    );
 }
 
 fn draw_backdrop(
@@ -2371,7 +2362,8 @@ fn draw_popups(popups: &[FloatingPopup], font: &Font) {
 fn draw_hud(ctx: &HudContext) {
     let HudContext {
         world,
-        levels,
+        level_number,
+        level_name,
         theme,
         i18n,
         lang,
@@ -2383,11 +2375,6 @@ fn draw_hud(ctx: &HudContext) {
     let pri = rgba(theme.text_primary);
     let acc = rgba(theme.text_accent);
     let border = rgba(theme.border_color);
-    let lvl_name = levels
-        .levels
-        .get(world.current_level_idx)
-        .map(|l| l.name.as_str())
-        .unwrap_or("");
 
     // Sleek Compact Top Dashboard Bar
     draw_rounded_rect(
@@ -2421,8 +2408,8 @@ fn draw_hud(ctx: &HudContext) {
         i18n.t("hud.combo"),
         world.combo.max(1),
         i18n.t("hud.level"),
-        world.current_level_idx + 1,
-        lvl_name
+        level_number,
+        level_name
     );
     txt(
         font,
@@ -2497,10 +2484,18 @@ fn draw_hud(ctx: &HudContext) {
             HUD_FOOTER_MAX_W,
         );
         txt(font, help, HUD_BANNER_X, HUD_FOOTER_Y, help_size, pri);
+        txt(
+            font,
+            i18n.t("editor.library.save_hint"),
+            HUD_BANNER_X,
+            HUD_EDITOR_SAVE_HINT_Y,
+            HUD_FOOTER_SIZE,
+            pri,
+        );
         return;
     }
 
-    if world.level_elapsed >= world.config.gameplay.sudden_death_time_sec {
+    if sudden_death_banner_due(world) {
         txt(
             font,
             i18n.t("status.sudden_death"),
@@ -2562,15 +2557,8 @@ fn draw_hud(ctx: &HudContext) {
     }
 
     match world.status {
-        SessionStatus::Paused => {
-            draw_overlay_box(
-                font,
-                i18n.t("status.paused"),
-                i18n.t("status.paused_sub"),
-                pri,
-                acc,
-            );
-        }
+        // The pause menu draws the paused state.
+        SessionStatus::Paused => {}
         SessionStatus::Victory => {
             draw_overlay_box(
                 font,
@@ -2615,45 +2603,6 @@ fn build_sub_bar(i18n: &I18nCatalog, theme: &ThemeDef, lang: Language) -> String
     .flatten()
     .collect::<Vec<_>>()
     .join(HUD_SUB_BAR_SEPARATOR)
-}
-
-/// Starts a fresh run from the title menu: the only transition that ends a developer taint,
-/// because it is the only one that checks the sector against the saved unlock.
-fn start_run_from_title(
-    world: &mut GameWorld,
-    dev: &mut DevState,
-    levels: &[LevelDef],
-    sector_idx: usize,
-) {
-    world.lives = world.config.gameplay.initial_lives;
-    world.score = 0;
-    world.load_level(sector_idx, levels);
-    dev.level_loaded_normally();
-}
-
-/// Restarts the current sector (R key or game-over restart). It never clears a taint.
-fn restart_level(world: &mut GameWorld, dev: &mut DevState, levels: &[LevelDef]) {
-    debug_assert!(!dev.active || dev.tainted);
-    world.lives = world.config.gameplay.initial_lives;
-    world.score = 0;
-    world.load_level(world.current_level_idx, levels);
-}
-
-/// Moves on to the sector after a win. The score carries over and a taint is never cleared.
-fn next_sector(world: &mut GameWorld, dev: &mut DevState, levels: &[LevelDef]) {
-    debug_assert!(!dev.active || dev.tainted);
-    let next_lvl = (world.current_level_idx + 1) % levels.len();
-    world.load_level(next_lvl, levels);
-}
-
-/// Keeps the saved progress out of reach of developer mode: while the current level is tainted,
-/// the live high score and unlock marker are rolled back to the genuine ones.
-fn sync_progress(guard: &mut ProgressGuard, dev: &DevState, world: &mut GameWorld) {
-    guard.sync(
-        dev.tainted,
-        &mut world.high_score,
-        &mut world.max_unlocked_level,
-    );
 }
 
 /// Text lines of the developer panel under the badge: state first, then the optional key help.
@@ -2759,7 +2708,6 @@ fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kinetix_core::config::MAX_LEVEL_NAME_LEN;
 
     #[test]
     fn absolute_input_is_detected_by_oversized_deltas() {
@@ -2778,59 +2726,9 @@ mod tests {
     }
 
     #[test]
-    fn nine_world_rows_fit_and_extra_worlds_are_capped() {
-        let l = world_row_layout(WORLD_SELECT_KEYS.len());
-        let last_bottom =
-            MENU_WORLD_LIST_Y + (WORLD_SELECT_KEYS.len() - 1) as f32 * l.step + l.pill_h;
-        assert!(last_bottom <= MENU_WORLD_LIST_BOTTOM_Y + 0.01);
-        assert!(l.text_size <= l.pill_h as u16);
-        assert_eq!(world_row_layout(40), l);
-    }
-
-    #[test]
-    fn count_placeholder_is_substituted() {
-        assert_eq!(substitute_count("keys [1-{count}]", 5), "keys [1-5]");
-        assert_eq!(substitute_count("no placeholder", 5), "no placeholder");
-    }
-
-    #[test]
-    fn locale_campaign_strings_use_the_placeholder() {
-        for raw in [RAW_EN, RAW_FR] {
-            let catalog = I18nCatalog::from_json_str(raw).unwrap();
-            assert!(catalog.t("menu.campaigns").contains(COUNT_PLACEHOLDER));
-        }
-    }
-
-    #[test]
     fn score_popup_shows_multiplier_only_above_one() {
         assert_eq!(format_score_popup(150, 1), "+150");
         assert_eq!(format_score_popup(300, 2), "+300 (x2)");
-    }
-
-    #[test]
-    fn world_rows_keep_reference_look_for_three_worlds() {
-        let l = world_row_layout(3);
-        assert_eq!(l.pill_h, MENU_WORLD_PILL_H);
-        assert_eq!(l.step, MENU_WORLD_PILL_H + MENU_WORLD_ROW_GAP);
-        assert_eq!(l.text_size, MENU_WORLD_TEXT_SIZE);
-        assert_eq!(l.text_dy, MENU_WORLD_TEXT_DY);
-    }
-
-    #[test]
-    fn world_rows_fit_above_the_sector_line() {
-        for count in 1..=WORLD_SELECT_KEYS.len() {
-            let l = world_row_layout(count);
-            let last_bottom = MENU_WORLD_LIST_Y + (count - 1) as f32 * l.step + l.pill_h;
-            assert!(
-                last_bottom <= MENU_WORLD_LIST_BOTTOM_Y + 0.01,
-                "count {count}"
-            );
-            assert!(last_bottom < MENU_SECTOR_Y);
-            assert!(l.pill_h >= MENU_WORLD_PILL_MIN_H);
-            assert!(l.text_size >= MENU_WORLD_TEXT_SIZE_FLOOR);
-        }
-        assert!(world_row_layout(6).pill_h < MENU_WORLD_PILL_H);
-        assert_eq!(world_row_layout(0), world_row_layout(1));
     }
 
     #[test]
@@ -2935,155 +2833,178 @@ mod tests {
         );
     }
 
-    fn level(id: usize, world: usize) -> LevelDef {
-        LevelDef {
-            id,
-            world,
-            name: String::new(),
-            boss: false,
-            rows: Vec::new(),
-        }
-    }
-
     #[test]
-    fn worlds_are_derived_from_the_level_list() {
-        let levels = [
-            level(1, 1),
-            level(2, 1),
-            level(3, 2),
-            level(4, 2),
-            level(5, 5),
-        ];
-        assert_eq!(build_worlds(&levels), vec![(1, 0), (2, 2), (5, 4)]);
-        assert!(build_worlds(&[]).is_empty());
-    }
-
-    #[test]
-    fn sector_navigation_syncs_the_world_position() {
-        let levels = [level(1, 1), level(2, 1), level(3, 2), level(4, 2)];
-        let worlds = build_worlds(&levels);
-        assert_eq!(world_pos_for_level(&worlds, &levels, 1, 9), 0);
-        assert_eq!(world_pos_for_level(&worlds, &levels, 2, 9), 1);
-        assert_eq!(world_pos_for_level(&worlds, &levels, 99, 9), 9);
-    }
-
-    #[test]
-    fn fresh_profile_can_only_start_the_first_sector() {
-        let max_unlocked = 0;
-        assert!(is_sector_unlocked(0, max_unlocked));
-        assert!(!is_sector_unlocked(1, max_unlocked));
-        assert_eq!(clamp_sector(9, max_unlocked, 14), 0);
-    }
-
-    #[test]
-    fn sector_clamp_respects_both_bounds() {
-        assert_eq!(clamp_sector(3, 5, 14), 3);
-        assert_eq!(clamp_sector(6, 5, 14), 5);
-        assert_eq!(clamp_sector(20, 30, 14), 14);
-        assert_eq!(clamp_sector(0, 0, 0), 0);
-    }
-
-    #[test]
-    fn sector_navigation_handles_step_page_and_world_bounds() {
-        let levels: Vec<LevelDef> = (0..30).map(|i| level(i + 1, (i / 10) + 1)).collect();
-        let worlds = build_worlds(&levels);
-        let max_unlocked = 16; // World 1 (0..=9) full, World 2 (10..=16) partial, World 3 locked
-
+    fn title_resume_mask_follows_the_widget_that_would_start_play() {
+        let mask = |click, key| {
+            resume_mask_for(
+                AppScreen::TitleMenu,
+                SessionStatus::Paused,
+                MenuPlay { click, key },
+                true,
+            )
+        };
+        let none = mask(false, false);
+        assert_eq!(none, RESUME_CHEAT_MASK);
+        let click = mask(true, false);
+        assert_ne!(click & RESUME_CLICK, 0);
+        assert_eq!(click & (RESUME_SPACE | RESUME_ENTER), 0);
+        let key = mask(false, true);
+        assert_eq!(key & RESUME_CLICK, 0);
         assert_eq!(
-            navigate_sector(SectorNav::Next, &worlds, &levels, 0, 0, max_unlocked),
-            (0, 1)
+            key & (RESUME_SPACE | RESUME_ENTER),
+            RESUME_SPACE | RESUME_ENTER
         );
-        assert_eq!(
-            navigate_sector(SectorNav::Prev, &worlds, &levels, 0, 0, max_unlocked),
-            (0, 0)
+        assert_eq!(mask(true, true), click | key);
+        // Tab from the title only counts while the world is playing, whatever the widget.
+        assert_ne!(
+            resume_mask_for(
+                AppScreen::TitleMenu,
+                SessionStatus::Playing,
+                MenuPlay::default(),
+                true
+            ) & RESUME_TAB,
+            0
         );
-        assert_eq!(
-            navigate_sector(SectorNav::PageNext, &worlds, &levels, 0, 2, max_unlocked),
-            (1, 12)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::PageNext, &worlds, &levels, 1, 12, max_unlocked),
-            (1, 16)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::PagePrev, &worlds, &levels, 1, 15, max_unlocked),
-            (0, 5)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::WorldEnd, &worlds, &levels, 0, 3, max_unlocked),
-            (0, 9)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::WorldHome, &worlds, &levels, 0, 9, max_unlocked),
-            (0, 0)
-        );
-        // World 2 end is clamped to max_unlocked (16 instead of 19).
-        assert_eq!(
-            navigate_sector(SectorNav::WorldEnd, &worlds, &levels, 1, 10, max_unlocked),
-            (1, 16)
-        );
-        assert_eq!(
-            navigate_sector(SectorNav::WorldHome, &worlds, &levels, 1, 16, max_unlocked),
-            (1, 10)
-        );
-    }
-
-    #[test]
-    fn world_unlock_boundary_is_its_first_sector() {
-        assert!(is_world_unlocked(5, 5));
-        assert!(!is_world_unlocked(5, 4));
-        assert!(is_world_unlocked(0, 0));
-    }
-
-    #[test]
-    fn world_navigation_skips_locked_worlds() {
-        let worlds = [(1, 0), (2, 5), (3, 10)];
-        // Only world 1 unlocked: nothing else to move to.
-        assert_eq!(step_unlocked_world(&worlds, 0, true, 4), 0);
-        assert_eq!(step_unlocked_world(&worlds, 0, false, 4), 0);
-        // Worlds 1 and 2 unlocked: wraps between them and never reaches world 3.
-        assert_eq!(step_unlocked_world(&worlds, 0, true, 5), 1);
-        assert_eq!(step_unlocked_world(&worlds, 1, true, 9), 0);
-        assert_eq!(step_unlocked_world(&worlds, 0, false, 9), 1);
-        // Everything unlocked: plain wrap-around.
-        assert_eq!(step_unlocked_world(&worlds, 2, true, 14), 0);
-        assert_eq!(step_unlocked_world(&worlds, 0, false, 14), 2);
-        assert_eq!(step_unlocked_world(&[], 0, true, 0), 0);
     }
 
     #[test]
     fn resume_mask_matches_the_inputs_that_start_play() {
         assert_eq!(
-            resume_mask_for(AppScreen::InGame, SessionStatus::Playing),
+            resume_mask_for(
+                AppScreen::InGame,
+                SessionStatus::Playing,
+                MenuPlay::default(),
+                true
+            ),
             0
         );
-        let paused = resume_mask_for(AppScreen::InGame, SessionStatus::Paused);
+        let paused = resume_mask_for(
+            AppScreen::InGame,
+            SessionStatus::Paused,
+            MenuPlay::default(),
+            true,
+        );
         assert_eq!(paused, RESUME_P | RESUME_R | RESUME_CHEAT_MASK);
-        let over = resume_mask_for(AppScreen::InGame, SessionStatus::GameOver);
+        let over = resume_mask_for(
+            AppScreen::InGame,
+            SessionStatus::GameOver,
+            MenuPlay::default(),
+            true,
+        );
         assert_eq!(
             over,
-            resume_mask_for(AppScreen::InGame, SessionStatus::Victory)
+            resume_mask_for(
+                AppScreen::InGame,
+                SessionStatus::Victory,
+                MenuPlay::default(),
+                true
+            )
         );
         assert_eq!(over & RESUME_P, 0);
+        let click_play = MenuPlay {
+            click: true,
+            key: false,
+        };
+        let key_play = MenuPlay {
+            click: false,
+            key: true,
+        };
         assert_ne!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing) & RESUME_CLICK,
+            resume_mask_for(
+                AppScreen::TitleMenu,
+                SessionStatus::Playing,
+                click_play,
+                true
+            ) & RESUME_CLICK,
             0
         );
         assert_ne!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing) & RESUME_TAB,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing, key_play, true)
+                & RESUME_TAB,
             0
         );
         assert_eq!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused) & RESUME_TAB,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused, key_play, true)
+                & RESUME_TAB,
             0
         );
         assert_eq!(
-            resume_mask_for(AppScreen::Editor, SessionStatus::Playing),
+            resume_mask_for(
+                AppScreen::Editor,
+                SessionStatus::Playing,
+                MenuPlay::default(),
+                true
+            ),
             RESUME_F4 | RESUME_CHEAT_MASK
         );
     }
 
-    fn text_width(face: &ttf_parser::Face, text: &str, size: f32) -> f32 {
+    #[test]
+    fn paused_resume_mask_follows_the_pause_widget_and_has_no_escape_bit() {
+        let mask = |click, key| {
+            resume_mask_for(
+                AppScreen::InGame,
+                SessionStatus::Paused,
+                MenuPlay { click, key },
+                true,
+            )
+        };
+        let base = RESUME_P | RESUME_R | RESUME_CHEAT_MASK;
+        assert_eq!(mask(false, false), base);
+        assert_eq!(mask(true, false), base | RESUME_CLICK);
+        assert_eq!(mask(false, true), base | RESUME_SPACE | RESUME_ENTER);
+        assert_eq!(
+            mask(true, true),
+            base | RESUME_CLICK | RESUME_SPACE | RESUME_ENTER
+        );
+    }
+
+    #[test]
+    fn the_pause_menu_only_resumes_play_from_resume_and_restart() {
+        use kinetix_app::menu::{Menu, MenuInput, MenuModel};
+        let model = MenuModel::empty();
+        let mut menu = Menu::new();
+        menu.open_pause(None);
+        // Resume is focused first and starts play; Escape does nothing on the pause page.
+        assert!(menu.focused_starts_play(&model));
+        let escape = MenuInput {
+            escape: true,
+            ..MenuInput::default()
+        };
+        assert_eq!(menu.update(&escape, &model), MenuAction::None);
+        let enter = MenuInput {
+            enter: true,
+            ..MenuInput::default()
+        };
+        assert_eq!(menu.update(&enter, &model), MenuAction::Resume);
+        // Options does not start play, and Escape from it goes back to the pause page.
+        let down = MenuInput {
+            down: true,
+            ..MenuInput::default()
+        };
+        menu.update(&down, &model);
+        assert!(menu.focused_starts_play(&model));
+        menu.update(&down, &model);
+        assert!(!menu.focused_starts_play(&model));
+        menu.update(&enter, &model);
+        assert_ne!(menu.page(), kinetix_app::menu::PageId::Pause);
+        menu.update(&escape, &model);
+        assert_eq!(menu.page(), kinetix_app::menu::PageId::Pause);
+    }
+
+    #[test]
+    fn the_menu_is_visible_on_the_title_and_while_paused_in_game() {
+        assert!(menu_is_visible(
+            AppScreen::TitleMenu,
+            SessionStatus::Playing
+        ));
+        assert!(menu_is_visible(AppScreen::InGame, SessionStatus::Paused));
+        assert!(!menu_is_visible(AppScreen::InGame, SessionStatus::Playing));
+        assert!(!menu_is_visible(AppScreen::InGame, SessionStatus::Victory));
+        assert!(!menu_is_visible(AppScreen::Editor, SessionStatus::Paused));
+    }
+
+    pub(crate) fn text_width(face: &ttf_parser::Face, text: &str, size: f32) -> f32 {
         let scale = size / face.units_per_em() as f32;
         text.chars()
             .filter_map(|c| face.glyph_index(c))
@@ -3092,7 +3013,7 @@ mod tests {
             .sum()
     }
 
-    fn catalogs() -> [(&'static str, I18nCatalog); 2] {
+    pub(crate) fn catalogs() -> [(&'static str, I18nCatalog); 2] {
         [
             (
                 "en",
@@ -3103,85 +3024,6 @@ mod tests {
                 I18nCatalog::from_json_str(RAW_FR).expect("fr catalog"),
             ),
         ]
-    }
-
-    #[test]
-    fn level_pack_worlds_fit_the_world_select_keys() {
-        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        assert!(build_worlds(&pack.levels).len() <= WORLD_SELECT_KEYS.len());
-    }
-
-    #[test]
-    fn world_rows_show_a_localized_sector_range_computed_from_the_data() {
-        let levels = [
-            level(1, 1),
-            level(2, 1),
-            level(3, 2),
-            level(4, 2),
-            level(5, 2),
-        ];
-        let worlds = build_worlds(&levels);
-        assert_eq!(world_sector_range(&worlds, &levels, 0), Some((1, 2)));
-        assert_eq!(world_sector_range(&worlds, &levels, 1), Some((3, 5)));
-        assert_eq!(world_sector_range(&worlds, &levels, 2), None);
-        let [(_, en), (_, fr)] = catalogs();
-        assert_eq!(
-            world_row_label(&en, 2, &worlds, &levels, 1),
-            "WORLD 2: QUANTUM WARP (Sectors 3-5)"
-        );
-        assert_eq!(
-            world_row_label(&fr, 1, &worlds, &levels, 0),
-            "MONDE 1 : GRILLE D'IGNITION (Secteurs 1-2)"
-        );
-    }
-
-    #[test]
-    fn locale_world_names_carry_no_sector_range() {
-        for (code, catalog) in catalogs() {
-            assert!(catalog.t("menu.sector_range").contains(FIRST_PLACEHOLDER));
-            assert!(catalog.t("menu.sector_range").contains(LAST_PLACEHOLDER));
-            for world in 1..=WORLD_SELECT_KEYS.len() {
-                let key = format!("campaigns.c{world}");
-                let name = catalog.t(&key);
-                assert!(
-                    name == key || !name.contains('('),
-                    "{code}/{key} must not embed a sector range"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn sector_line_fits_at_the_minimum_font_size() {
-        let face = ttf_parser::Face::parse(RAW_FONT, 0).expect("valid font");
-        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        let worst_id = 999;
-        let synthetic = LevelDef {
-            id: worst_id,
-            world: 1,
-            name: "W".repeat(MAX_LEVEL_NAME_LEN),
-            boss: false,
-            rows: Vec::new(),
-        };
-        let longest_legacy = pack
-            .levels
-            .iter()
-            .max_by_key(|l| l.name.chars().count())
-            .expect("a level")
-            .clone();
-        // The worst case is the synthetic full-length name; it does not depend on the legacy names.
-        assert_eq!(synthetic.name.chars().count(), MAX_LEVEL_NAME_LEN);
-        for (code, catalog) in catalogs() {
-            for level in [&synthetic, &longest_legacy] {
-                let line = sector_line(catalog.t("menu.sector_select"), level);
-                let width = text_width(&face, &line, MENU_SECTOR_SIZE_MIN as f32);
-                assert!(
-                    width <= MENU_SECTOR_MAX_W,
-                    "{code}/{}: sector line is {width:.0}px, limit {MENU_SECTOR_MAX_W:.0}px",
-                    level.name
-                );
-            }
-        }
     }
 
     #[test]
@@ -3288,112 +3130,122 @@ mod tests {
     }
 
     #[test]
-    fn a_developer_win_never_unlocks_or_scores_into_the_saved_progress() {
-        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
-        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        assert!(pack.levels.len() > 2);
-        let mut world = GameWorld::new(config, &pack.levels);
-        world.high_score = 1;
-        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
-        let mut dev = DevState::default();
-        dev.toggle();
-
-        world.load_level(0, &pack.levels);
-        world.apply_powerup(kinetix_core::physics::PowerUpKind::ExtraLife);
-        world.bricks.clear();
-        world.boss = None;
-        let mut events = Vec::new();
-        world.update(0.016, &mut events);
-        assert_eq!(world.status, SessionStatus::Victory);
-        assert!(world.max_unlocked_level > 0, "the core unlocks on a win");
-        assert!(world.high_score > 1);
-
-        sync_progress(&mut guard, &dev, &mut world);
-        assert_eq!(world.max_unlocked_level, 0);
-        assert_eq!(world.high_score, 1);
-
-        // Switching the mode off keeps the level tainted until a normal load.
-        dev.toggle();
-        sync_progress(&mut guard, &dev, &mut world);
-        assert_eq!(world.max_unlocked_level, 0);
-        dev.level_loaded_normally();
-        world.load_level(0, &pack.levels);
-        world.bricks.clear();
-        world.boss = None;
-        world.update(0.016, &mut events);
-        sync_progress(&mut guard, &dev, &mut world);
-        assert_eq!(world.max_unlocked_level, 1, "a genuine win still unlocks");
-    }
-
-    fn dev_test_world() -> (GameWorld, LevelPack) {
-        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
-        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
-        let mut world = GameWorld::new(config, &pack.levels);
-        world.high_score = 1;
-        (world, pack)
-    }
-
-    fn win_current_level(world: &mut GameWorld) {
-        world.bricks.clear();
-        world.boss = None;
-        world.update(0.016, &mut Vec::new());
+    fn a_victory_that_returns_to_the_title_does_not_ask_for_the_pointer_lock() {
+        let mask = |status, continues| {
+            resume_mask_for(AppScreen::InGame, status, MenuPlay::default(), continues)
+        };
+        let to_next = mask(SessionStatus::Victory, true);
+        assert_eq!(
+            to_next & (RESUME_CLICK | RESUME_SPACE),
+            RESUME_CLICK | RESUME_SPACE
+        );
+        let to_title = mask(SessionStatus::Victory, false);
+        assert_eq!(to_title & (RESUME_CLICK | RESUME_SPACE), 0);
+        assert_eq!(to_title, RESUME_R | RESUME_CHEAT_MASK);
+        // A game over always restarts the board, whatever the source.
+        assert_eq!(
+            mask(SessionStatus::GameOver, false),
+            mask(SessionStatus::GameOver, true)
+        );
+        assert_ne!(mask(SessionStatus::GameOver, false) & RESUME_CLICK, 0);
     }
 
     #[test]
-    fn dev_score_then_next_sector_leaves_the_high_score_unchanged() {
-        let (mut world, pack) = dev_test_world();
-        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
-        let mut dev = DevState::default();
-        start_run_from_title(&mut world, &mut dev, &pack.levels, 0);
-        dev.toggle();
-        world.apply_powerup(kinetix_core::physics::PowerUpKind::ExtraLife);
-        dev.toggle();
-        win_current_level(&mut world);
-        sync_progress(&mut guard, &dev, &mut world);
-        next_sector(&mut world, &mut dev, &pack.levels);
-        assert!(world.score > 1, "the dev score carries over");
-        win_current_level(&mut world);
-        sync_progress(&mut guard, &dev, &mut world);
-        assert!(dev.tainted);
-        assert_eq!(world.high_score, 1);
-        assert_eq!(world.max_unlocked_level, 0);
+    fn the_resume_mask_after_a_win_follows_the_source() {
+        use kinetix_app::satisfaction::satisfaction_pack;
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let satisfaction = satisfaction_pack().levels;
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.load_pack_level(0, &pack.levels, PlaySource::Campaign.pack_rules());
+        assert!(victory_continues(
+            PlaySource::Campaign,
+            &world,
+            satisfaction.len()
+        ));
+        let last = satisfaction.len() - 1;
+        world.load_pack_level(last, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        assert!(!victory_continues(
+            PlaySource::Satisfaction,
+            &world,
+            satisfaction.len()
+        ));
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        assert!(victory_continues(
+            PlaySource::Satisfaction,
+            &world,
+            satisfaction.len()
+        ));
+        assert!(!victory_continues(
+            PlaySource::Library(1),
+            &world,
+            satisfaction.len()
+        ));
     }
 
     #[test]
-    fn dev_jump_to_a_locked_sector_stays_locked_after_restart_or_game_over() {
-        for game_over_restart in [false, true] {
-            let (mut world, pack) = dev_test_world();
-            let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
-            let mut dev = DevState::default();
-            start_run_from_title(&mut world, &mut dev, &pack.levels, 0);
-            dev.toggle();
-            world.load_level(5, &pack.levels);
-            dev.toggle();
-            if game_over_restart {
-                world.status = SessionStatus::GameOver;
-            }
-            restart_level(&mut world, &mut dev, &pack.levels);
-            win_current_level(&mut world);
-            assert_eq!(world.max_unlocked_level, 6, "the core alone would unlock");
-            sync_progress(&mut guard, &dev, &mut world);
-            assert_eq!(world.max_unlocked_level, 0);
+    fn f4_into_the_editor_always_leaves_the_campaign_source() {
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.load_pack_level(0, &pack.levels, PlaySource::Campaign.pack_rules());
+        let mut session = Session::campaign();
+        let mut screen = AppScreen::InGame;
+
+        toggle_editor(&mut screen, &mut session, &mut world);
+        assert!(screen == AppScreen::Editor);
+        assert_eq!(session.source, PlaySource::EditorTest);
+        assert!(session.editor_snapshot.is_none());
+
+        toggle_editor(&mut screen, &mut session, &mut world);
+        assert!(screen == AppScreen::InGame);
+        assert_eq!(session.source, PlaySource::EditorTest);
+        assert!(session.editor_snapshot.is_some(), "the test board is kept");
+        assert_eq!(world.status, SessionStatus::Playing);
+    }
+
+    #[test]
+    fn sudden_death_banner_follows_the_pack_rules_and_the_timer() {
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let satisfaction = kinetix_app::satisfaction::satisfaction_pack().levels;
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.load_pack_level(0, &pack.levels, PlaySource::Campaign.pack_rules());
+        assert!(
+            !sudden_death_banner_due(&world),
+            "the timer has not run out"
+        );
+        world.level_elapsed = world.config.gameplay.sudden_death_time_sec;
+        assert!(sudden_death_banner_due(&world));
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        world.level_elapsed = world.config.gameplay.sudden_death_time_sec * 2.0;
+        assert!(
+            !sudden_death_banner_due(&world),
+            "no banner without sudden death"
+        );
+    }
+
+    #[test]
+    fn up_and_down_cycle_the_dev_powerup_only_when_no_menu_is_shown() {
+        for key in [KeyCode::Up, KeyCode::Down] {
+            assert!(dev_key_cycles_powerup(key, false));
+            assert!(!dev_key_cycles_powerup(key, true));
+        }
+        for key in [KeyCode::LeftBracket, KeyCode::RightBracket] {
+            assert!(dev_key_cycles_powerup(key, true));
         }
     }
 
     #[test]
-    fn only_a_title_start_clears_the_taint_and_then_wins_count() {
-        let (mut world, pack) = dev_test_world();
-        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
-        let mut dev = DevState::default();
-        dev.toggle();
-        dev.toggle();
-        restart_level(&mut world, &mut dev, &pack.levels);
-        next_sector(&mut world, &mut dev, &pack.levels);
-        assert!(dev.tainted);
-        start_run_from_title(&mut world, &mut dev, &pack.levels, 0);
-        assert!(!dev.tainted);
-        win_current_level(&mut world);
-        sync_progress(&mut guard, &dev, &mut world);
-        assert_eq!(world.max_unlocked_level, 1);
+    fn the_title_glyph_size_is_not_preloaded_for_the_full_charset() {
+        for dpi in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let sizes = full_charset_sizes(dpi);
+            assert!(!sizes.is_empty());
+            assert!(
+                !sizes.contains(&physical_font_size(SIZE_HOME_TITLE, dpi)),
+                "title size at dpi {dpi}"
+            );
+        }
+        assert!(!MENU_FONT_SIZES.contains(&SIZE_HOME_TITLE));
     }
 }
