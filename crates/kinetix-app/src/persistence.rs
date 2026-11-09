@@ -108,13 +108,7 @@ pub fn save_settings(settings: Settings) {
     let Some(path) = native::progress_path() else {
         return;
     };
-    let mut progress = match native::read_progress(&path) {
-        native::ReadOutcome::Valid(progress) => progress,
-        _ => native::Progress::default(),
-    };
-    progress.sfx_on = settings.sfx_on;
-    progress.music_on = settings.music_on;
-    if let Err(_err) = native::save_session(&path, &progress) {
+    if let Err(_err) = native::save_settings_session(&path, settings) {
         #[cfg(debug_assertions)]
         eprintln!("settings save failed: {_err}");
     }
@@ -168,18 +162,14 @@ pub fn save_progress(high_score: u64, unlocked: usize, theme: usize, lang_fr: bo
     let Some(path) = native::progress_path() else {
         return;
     };
-    let settings = native::current_settings(&path);
-    let progress = native::Progress {
-        version: native::PROGRESS_VERSION,
+    let state = native::ProgressState {
         high_score,
         unlocked,
         theme,
         lang_fr,
-        sfx_on: settings.sfx_on,
-        music_on: settings.music_on,
     };
     // Persistence must never crash the game; failures are reported in debug builds only.
-    if let Err(_err) = native::save_session(&path, &progress) {
+    if let Err(_err) = native::save_progress_session(&path, state) {
         #[cfg(debug_assertions)]
         eprintln!("progress save failed: {_err}");
     }
@@ -271,8 +261,25 @@ pub mod native {
     pub enum ReadOutcome {
         Missing,
         Valid(Progress),
-        /// I/O failure, corrupt JSON or incompatible version: the file must not be overwritten.
+        /// Corrupt JSON or incompatible version: the file must not be overwritten before it is
+        /// moved aside to `.bak`.
         Unreadable,
+        /// The file exists but could not be read (I/O failure): its content is unknown, so
+        /// nothing may be written over it and no field may be filled from defaults.
+        IoFailed,
+    }
+
+    /// The progress fields a game save supplies; the audio settings come from the file.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ProgressState {
+        pub high_score: u64,
+        pub unlocked: usize,
+        pub theme: usize,
+        pub lang_fr: bool,
+    }
+
+    fn read_failed() -> std::io::Error {
+        std::io::Error::other("progress file could not be read")
     }
 
     /// Per-session write state: the original file is preserved at most once.
@@ -370,7 +377,7 @@ pub mod native {
             }
         }
         let Some(text) = text else {
-            return ReadOutcome::Unreadable;
+            return ReadOutcome::IoFailed;
         };
         match serde_json::from_str::<Progress>(&text) {
             Ok(progress) if progress.version == PROGRESS_VERSION => ReadOutcome::Valid(progress),
@@ -421,15 +428,22 @@ pub mod native {
         write_text_atomic(path, &json)
     }
 
-    /// Before the first write of a session, moves an unreadable file aside to `.bak`.
+    /// Before the first write of a session, moves an unreadable file aside to `.bak`. A file
+    /// that could not even be read (I/O failure) is left alone and the session stays unprepared,
+    /// so the next save looks at it again.
     fn prepare_first_write(path: &Path, state: &mut SaveState) {
         if state.prepared {
             return;
         }
-        state.prepared = true;
-        if read_progress(path) != ReadOutcome::Unreadable {
-            return;
+        match read_progress(path) {
+            ReadOutcome::IoFailed => return,
+            ReadOutcome::Unreadable => {}
+            ReadOutcome::Missing | ReadOutcome::Valid(_) => {
+                state.prepared = true;
+                return;
+            }
         }
+        state.prepared = true;
         let backup = path.with_file_name(PROGRESS_BACKUP_FILE_NAME);
         let _ = std::fs::remove_file(&backup);
         if rename_with_retry(path, &backup).is_err() {
@@ -437,7 +451,8 @@ pub mod native {
         }
     }
 
-    /// Saves with session safeguards: backup of an unreadable file, then monotonic merge.
+    /// Saves with session safeguards: backup of an unreadable file, then monotonic merge. A file
+    /// that cannot be read at all is never overwritten: the save fails and a later one retries.
     pub fn save_with(
         path: &Path,
         progress: &Progress,
@@ -448,11 +463,74 @@ pub mod native {
             return Ok(());
         }
         let mut merged = progress.clone();
-        if let ReadOutcome::Valid(current) = read_progress(path) {
-            merged.high_score = merged.high_score.max(current.high_score);
-            merged.unlocked = merged.unlocked.max(current.unlocked);
+        match read_progress(path) {
+            ReadOutcome::Valid(current) => {
+                merged.high_score = merged.high_score.max(current.high_score);
+                merged.unlocked = merged.unlocked.max(current.unlocked);
+            }
+            ReadOutcome::IoFailed => return Err(read_failed()),
+            ReadOutcome::Missing | ReadOutcome::Unreadable => {}
         }
         write_progress(path, &merged)
+    }
+
+    /// Saves the game progress keeping the audio settings of the file. The settings of a corrupt
+    /// file fall back to the defaults (the file is moved aside first); when the file cannot be
+    /// read at all nothing is written.
+    pub fn save_progress_with(
+        path: &Path,
+        game: ProgressState,
+        state: &mut SaveState,
+    ) -> std::io::Result<()> {
+        let settings = match read_progress(path) {
+            ReadOutcome::Valid(current) => super::Settings {
+                sfx_on: current.sfx_on,
+                music_on: current.music_on,
+            },
+            ReadOutcome::Missing | ReadOutcome::Unreadable => super::Settings::default(),
+            ReadOutcome::IoFailed => return Err(read_failed()),
+        };
+        let progress = Progress {
+            version: PROGRESS_VERSION,
+            high_score: game.high_score,
+            unlocked: game.unlocked,
+            theme: game.theme,
+            lang_fr: game.lang_fr,
+            sfx_on: settings.sfx_on,
+            music_on: settings.music_on,
+        };
+        save_with(path, &progress, state)
+    }
+
+    /// Saves the audio settings keeping the game progress of the file. A missing or corrupt file
+    /// starts from default progress; when the file cannot be read at all nothing is written.
+    pub fn save_settings_with(
+        path: &Path,
+        settings: super::Settings,
+        state: &mut SaveState,
+    ) -> std::io::Result<()> {
+        let mut progress = match read_progress(path) {
+            ReadOutcome::Valid(current) => current,
+            ReadOutcome::Missing | ReadOutcome::Unreadable => Progress::default(),
+            ReadOutcome::IoFailed => return Err(read_failed()),
+        };
+        progress.sfx_on = settings.sfx_on;
+        progress.music_on = settings.music_on;
+        save_with(path, &progress, state)
+    }
+
+    pub fn save_progress_session(path: &Path, game: ProgressState) -> std::io::Result<()> {
+        let mut state = SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        save_progress_with(path, game, &mut state)
+    }
+
+    pub fn save_settings_session(path: &Path, settings: super::Settings) -> std::io::Result<()> {
+        let mut state = SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        save_settings_with(path, settings, &mut state)
     }
 
     pub fn save_session(path: &Path, progress: &Progress) -> std::io::Result<()> {
@@ -705,6 +783,135 @@ pub mod native {
             let defaults = crate::persistence::Settings::default();
             assert_eq!(current_settings(&path), defaults);
             assert_eq!(current_settings(&tmp.0.join("absent.json")), defaults);
+        }
+
+        /// A directory where the file should be: it exists but cannot be read as a file.
+        fn unreadable_dir_path(tmp: &TempDir) -> PathBuf {
+            let path = tmp.0.join(PROGRESS_FILE_NAME);
+            std::fs::create_dir_all(path.join("keep")).unwrap();
+            path
+        }
+
+        fn game_state() -> ProgressState {
+            ProgressState {
+                high_score: 10,
+                unlocked: 1,
+                theme: 4,
+                lang_fr: true,
+            }
+        }
+
+        #[test]
+        fn an_io_failure_is_told_apart_from_corrupt_content() {
+            let tmp = TempDir::new("io-kind");
+            assert_eq!(
+                read_progress(&unreadable_dir_path(&tmp)),
+                ReadOutcome::IoFailed
+            );
+            let corrupt = tmp.0.join("corrupt.json");
+            std::fs::write(&corrupt, "{ not json").unwrap();
+            assert_eq!(read_progress(&corrupt), ReadOutcome::Unreadable);
+        }
+
+        #[test]
+        fn a_save_never_writes_over_a_file_that_cannot_be_read() {
+            let tmp = TempDir::new("io-save");
+            let path = unreadable_dir_path(&tmp);
+            let mut state = SaveState::default();
+            assert!(save_with(&path, &sample(), &mut state).is_err());
+            assert!(save_progress_with(&path, game_state(), &mut state).is_err());
+            assert!(
+                save_settings_with(&path, crate::persistence::Settings::default(), &mut state)
+                    .is_err()
+            );
+            assert!(path.is_dir(), "the unreadable entry is untouched");
+            assert!(!tmp.0.join(PROGRESS_BACKUP_FILE_NAME).exists());
+            assert!(!state.prepared, "the next save looks at the file again");
+            assert!(!state.disabled);
+        }
+
+        #[test]
+        fn a_save_after_a_read_failure_retries_and_keeps_the_other_fields() {
+            let tmp = TempDir::new("io-retry");
+            let path = tmp.0.join(PROGRESS_FILE_NAME);
+            let mut state = SaveState::default();
+            // The failure happens while the file is momentarily unreadable.
+            std::fs::create_dir_all(path.join("keep")).unwrap();
+            assert!(save_progress_with(&path, game_state(), &mut state).is_err());
+            std::fs::remove_dir_all(&path).unwrap();
+            let kept = Progress {
+                sfx_on: false,
+                music_on: false,
+                ..sample()
+            };
+            write_progress(&path, &kept).unwrap();
+
+            save_progress_with(&path, game_state(), &mut state).unwrap();
+            let ReadOutcome::Valid(saved) = read_progress(&path) else {
+                panic!("expected a valid file");
+            };
+            assert!(!saved.sfx_on && !saved.music_on, "settings were not reset");
+            assert_eq!((saved.theme, saved.lang_fr), (4, true));
+            assert_eq!(saved.high_score, 123_456, "monotonic merge still applies");
+        }
+
+        #[test]
+        fn saving_progress_keeps_the_stored_audio_settings() {
+            let tmp = TempDir::new("keep-audio");
+            let path = tmp.0.join(PROGRESS_FILE_NAME);
+            let stored = Progress {
+                sfx_on: false,
+                music_on: true,
+                ..sample()
+            };
+            write_progress(&path, &stored).unwrap();
+            let mut state = SaveState::default();
+            save_progress_with(&path, game_state(), &mut state).unwrap();
+            let ReadOutcome::Valid(saved) = read_progress(&path) else {
+                panic!("expected a valid file");
+            };
+            assert!(!saved.sfx_on && saved.music_on);
+        }
+
+        #[test]
+        fn saving_settings_keeps_the_stored_progress() {
+            let tmp = TempDir::new("keep-progress");
+            let path = tmp.0.join(PROGRESS_FILE_NAME);
+            write_progress(&path, &sample()).unwrap();
+            let mut state = SaveState::default();
+            let settings = crate::persistence::Settings {
+                sfx_on: true,
+                music_on: false,
+            };
+            save_settings_with(&path, settings, &mut state).unwrap();
+            let ReadOutcome::Valid(saved) = read_progress(&path) else {
+                panic!("expected a valid file");
+            };
+            assert!(saved.sfx_on && !saved.music_on);
+            assert_eq!((saved.high_score, saved.unlocked), (123_456, 7));
+            assert_eq!((saved.theme, saved.lang_fr), (2, true));
+        }
+
+        #[test]
+        fn a_corrupt_file_is_still_moved_aside_before_the_first_settings_or_progress_write() {
+            for settings_first in [true, false] {
+                let tmp = TempDir::new("corrupt-first");
+                let path = tmp.0.join(PROGRESS_FILE_NAME);
+                std::fs::write(&path, "{ not json").unwrap();
+                let mut state = SaveState::default();
+                if settings_first {
+                    let settings = crate::persistence::Settings {
+                        sfx_on: false,
+                        music_on: true,
+                    };
+                    save_settings_with(&path, settings, &mut state).unwrap();
+                } else {
+                    save_progress_with(&path, game_state(), &mut state).unwrap();
+                }
+                let bak = tmp.0.join(PROGRESS_BACKUP_FILE_NAME);
+                assert_eq!(std::fs::read_to_string(&bak).unwrap(), "{ not json");
+                assert!(matches!(read_progress(&path), ReadOutcome::Valid(_)));
+            }
         }
 
         #[test]

@@ -28,8 +28,9 @@ pub use model::{LibraryEntry, LibraryId, MenuAction, MenuInput, MenuModel, Secto
 pub use render::draw_menu;
 pub use state::Menu;
 pub use widgets::{
-    fit_to_sizes, page_layout, Activation, Align, Label, PageId, PageLayout, Role, TextItem, Tone,
-    UiRect, Widget, CONTROLS_KEYS, MENU_FONT_SIZES,
+    fit_to_sizes, page_layout, Activation, Align, Label, PageId, PageLayout, PageStep, Role,
+    TextItem, Tone, UiRect, Widget, CONFIRM_DELETE_KEY, CONTROLS_KEYS, MENU_FONT_SIZES,
+    SIZE_HOME_TITLE,
 };
 
 #[cfg(test)]
@@ -49,6 +50,9 @@ mod tests {
         "menu.home.button.options",
         "menu.home.button.quit",
         "menu.common.button.back",
+        "menu.common.button.prev_page",
+        "menu.common.button.next_page",
+        "menu.best_score",
         "menu.chapters.title",
         "menu.chapters.label.progress",
         "menu.chapters.label.locked",
@@ -75,6 +79,7 @@ mod tests {
         "menu.library.button.new",
         "menu.library.button.play",
         "menu.library.button.delete",
+        "menu.library.button.confirm_delete",
         "menu.library.label.empty",
         "menu.library.label.count",
         "menu.library.label.default_name",
@@ -241,6 +246,7 @@ mod tests {
                 catalog.t("menu.library.label.default_name").contains("{n}"),
                 "{lang}"
             );
+            assert!(catalog.t("menu.best_score").contains("{score}"), "{lang}");
         }
     }
 

@@ -43,6 +43,9 @@ pub enum SaveError {
     Blocked,
     /// The storage refused the write (I/O failure, quota, private mode).
     Failed,
+    /// The library could not be read at startup (I/O failure): saving the empty in-memory
+    /// library would erase the stored one, so writes are refused until a load succeeds.
+    NotLoaded,
 }
 
 /// One saved level: a stable id, a display name and its KTX1 share code.
@@ -207,8 +210,10 @@ mod native {
     pub enum ReadOutcome {
         Missing,
         Valid(Library),
-        /// I/O failure or corrupt JSON: the file must not be overwritten before a backup.
+        /// Corrupt JSON: the file must not be overwritten before a backup.
         Unreadable,
+        /// The file exists but could not be read (I/O failure): its content is unknown.
+        IoFailed,
     }
 
     /// Per-session write state of the library file, independent of the progress file's.
@@ -216,11 +221,15 @@ mod native {
     pub struct SaveState {
         pub prepared: bool,
         pub disabled: bool,
+        /// True after a load that failed with an I/O error: writes are refused until a load
+        /// succeeds.
+        pub unloaded: bool,
     }
 
     static SESSION: Mutex<SaveState> = Mutex::new(SaveState {
         prepared: false,
         disabled: false,
+        unloaded: false,
     });
 
     pub fn library_path() -> Option<PathBuf> {
@@ -240,7 +249,7 @@ mod native {
             }
         }
         let Some(text) = text else {
-            return ReadOutcome::Unreadable;
+            return ReadOutcome::IoFailed;
         };
         match serde_json::from_str::<Library>(&text) {
             Ok(_) => ReadOutcome::Valid(Library::from_json(&text)),
@@ -248,15 +257,21 @@ mod native {
         }
     }
 
-    /// Before the first write of a session, moves an unreadable file aside to `.bak`.
+    /// Before the first write of a session, moves a corrupt file aside to `.bak`. A file that
+    /// could not be read at all is left alone and the session stays unprepared.
     fn prepare_first_write(path: &Path, state: &mut SaveState) {
         if state.prepared {
             return;
         }
-        state.prepared = true;
-        if read_library(path) != ReadOutcome::Unreadable {
-            return;
+        match read_library(path) {
+            ReadOutcome::IoFailed => return,
+            ReadOutcome::Unreadable => {}
+            ReadOutcome::Missing | ReadOutcome::Valid(_) => {
+                state.prepared = true;
+                return;
+            }
         }
+        state.prepared = true;
         let backup = path.with_file_name(LIBRARY_BACKUP_FILE_NAME);
         let _ = std::fs::remove_file(&backup);
         if rename_with_retry(path, &backup).is_err() {
@@ -269,6 +284,9 @@ mod native {
         library: &Library,
         state: &mut SaveState,
     ) -> Result<(), SaveError> {
+        if state.unloaded {
+            return Err(SaveError::NotLoaded);
+        }
         prepare_first_write(path, state);
         if state.disabled {
             return Err(SaveError::Blocked);
@@ -276,11 +294,39 @@ mod native {
         write_text_atomic(path, &library.to_json()).map_err(|_| SaveError::Failed)
     }
 
-    pub fn load_from(path: &Path) -> Library {
+    /// Reads the library and records in `state` whether it can be written afterwards: a missing
+    /// or corrupt file is a library that can be saved (the corrupt one is backed up first), an
+    /// I/O failure is not.
+    pub fn load_with(path: &Path, state: &mut SaveState) -> Library {
         match read_library(path) {
-            ReadOutcome::Valid(library) => library,
-            _ => Library::default(),
+            ReadOutcome::Valid(library) => {
+                state.unloaded = false;
+                library
+            }
+            ReadOutcome::Missing | ReadOutcome::Unreadable => {
+                state.unloaded = false;
+                Library::default()
+            }
+            ReadOutcome::IoFailed => {
+                state.unloaded = true;
+                Library::default()
+            }
         }
+    }
+
+    pub fn load_from(path: &Path) -> Library {
+        let mut state = SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        load_with(path, &mut state)
+    }
+
+    /// True when the last load of the session failed with an I/O error.
+    pub fn is_unloaded() -> bool {
+        SESSION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unloaded
     }
 
     pub fn save_session(path: &Path, library: &Library) -> Result<(), SaveError> {
@@ -304,12 +350,26 @@ pub fn load_library() -> Library {
         .unwrap_or_default()
 }
 
-/// Writes the library to `library.json`, preserving an unreadable file as `.bak` first.
+/// Writes the library to `library.json`, preserving an unreadable file as `.bak` first. Refused
+/// while the last load failed with an I/O error (the in-memory library is not the stored one).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_library(library: &Library) -> Result<(), SaveError> {
     let path = native::library_path().ok_or(SaveError::Unavailable)?;
     native::save_session(&path, library)
 }
+
+/// Loads the library again when the startup load failed with an I/O error, so a later save can
+/// work. Does nothing when the library was loaded.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reload_library_if_unloaded(library: &mut Library) {
+    if native::is_unloaded() {
+        *library = load_library();
+    }
+}
+
+/// The web storage cannot fail a read apart from a missing key: there is nothing to reload.
+#[cfg(target_arch = "wasm32")]
+pub fn reload_library_if_unloaded(_library: &mut Library) {}
 
 #[cfg(test)]
 mod tests {
@@ -430,7 +490,8 @@ mod tests {
     mod storage {
         use super::*;
         use crate::library::native::{
-            load_from, read_library, save_with, ReadOutcome, SaveState, BACKUP_NAME, FILE_NAME,
+            load_from, load_with, read_library, save_with, ReadOutcome, SaveState, BACKUP_NAME,
+            FILE_NAME,
         };
         use std::path::PathBuf;
 
@@ -496,6 +557,84 @@ mod tests {
             let result = save_with(&path, &Library::default(), &mut state);
             assert_eq!(result, Err(SaveError::Blocked));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "garbage");
+        }
+
+        /// A directory where the file should be: it exists but cannot be read as a file.
+        fn unreadable_dir_path(tmp: &TempDir) -> PathBuf {
+            let path = tmp.0.join(FILE_NAME);
+            std::fs::create_dir_all(path.join("keep")).unwrap();
+            path
+        }
+
+        #[test]
+        fn an_io_failure_is_told_apart_from_corrupt_content() {
+            let tmp = TempDir::new("io-kind");
+            assert_eq!(
+                read_library(&unreadable_dir_path(&tmp)),
+                ReadOutcome::IoFailed
+            );
+            let corrupt = tmp.0.join("corrupt.json");
+            std::fs::write(&corrupt, "{ not json").unwrap();
+            assert_eq!(read_library(&corrupt), ReadOutcome::Unreadable);
+        }
+
+        #[test]
+        fn a_boot_read_error_refuses_saves_until_a_load_succeeds() {
+            let tmp = TempDir::new("io-unloaded");
+            let path = unreadable_dir_path(&tmp);
+            let mut state = SaveState::default();
+            assert_eq!(load_with(&path, &mut state), Library::default());
+            assert!(state.unloaded);
+
+            let mut lib = Library::default();
+            lib.add("New".into(), code(1)).unwrap();
+            assert_eq!(
+                save_with(&path, &lib, &mut state),
+                Err(SaveError::NotLoaded)
+            );
+            assert!(path.is_dir(), "nothing was written over the entry");
+            assert!(!tmp.0.join(BACKUP_NAME).exists());
+
+            // The file becomes readable: a later load succeeds and saving works again.
+            std::fs::remove_dir_all(&path).unwrap();
+            let mut stored = Library::default();
+            stored.add("Kept".into(), code(2)).unwrap();
+            std::fs::write(&path, stored.to_json()).unwrap();
+            let loaded = load_with(&path, &mut state);
+            assert!(!state.unloaded);
+            assert_eq!(loaded, stored);
+            assert!(save_with(&path, &loaded, &mut state).is_ok());
+        }
+
+        #[test]
+        fn a_missing_or_corrupt_file_is_a_loaded_library() {
+            let tmp = TempDir::new("io-loaded");
+            let mut state = SaveState::default();
+            load_with(&tmp.0.join("absent.json"), &mut state);
+            assert!(!state.unloaded);
+            let corrupt = tmp.0.join(FILE_NAME);
+            std::fs::write(&corrupt, "{ not json").unwrap();
+            load_with(&corrupt, &mut state);
+            assert!(!state.unloaded);
+            let mut lib = Library::default();
+            lib.add("Fresh".into(), code(1)).unwrap();
+            assert!(save_with(&corrupt, &lib, &mut state).is_ok());
+            assert_eq!(
+                std::fs::read_to_string(tmp.0.join(BACKUP_NAME)).unwrap(),
+                "{ not json"
+            );
+        }
+
+        #[test]
+        fn a_write_over_an_unreadable_entry_does_not_back_it_up() {
+            let tmp = TempDir::new("io-nobak");
+            let path = unreadable_dir_path(&tmp);
+            let mut state = SaveState::default();
+            // Loaded state forced: the I/O failure only appears at save time.
+            let result = save_with(&path, &Library::default(), &mut state);
+            assert!(result.is_err());
+            assert!(!tmp.0.join(BACKUP_NAME).exists());
+            assert!(!state.prepared);
         }
 
         #[test]

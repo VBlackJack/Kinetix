@@ -24,8 +24,11 @@ use super::model::{MenuAction, MenuModel};
 
 // ---- Fonts -------------------------------------------------------------------------------
 
-/// Every font size the menu draws with; the application preloads these glyph sizes.
-pub const MENU_FONT_SIZES: &[u16] = &[21, 22, 24, 28, 30, 32, 48, 96];
+/// Every font size the menu draws with except the Home title; the application preloads these
+/// glyph sizes for the full character set.
+pub const MENU_FONT_SIZES: &[u16] = &[21, 22, 24, 28, 30, 32, 48];
+/// Size of the Home title: only the title characters are preloaded at this size, and it is the
+/// single source for both the menu layout and the glyph atlas prewarm.
 pub const SIZE_HOME_TITLE: u16 = 96;
 pub const SIZE_PAGE_TITLE: u16 = 48;
 pub const SIZE_SUBTITLE: u16 = 32;
@@ -62,6 +65,9 @@ const CONTROLS_FIRST_Y: f32 = 290.0;
 const CONTROLS_STEP_Y: f32 = 56.0;
 const PAGE_INDICATOR_GAP: f32 = 40.0;
 const PAGE_INDICATOR_DY: f32 = 40.0;
+const HIGH_SCORE_Y: f32 = 900.0;
+/// Digits of the high score shown on the Home page.
+const HIGH_SCORE_DIGITS: usize = 7;
 
 // ---- Widget geometry -----------------------------------------------------------------------
 
@@ -82,6 +88,8 @@ const DELETE_GAP: f32 = 12.0;
 const BACK_W: f32 = 320.0;
 const BACK_H: f32 = 60.0;
 const BACK_Y: f32 = PANEL_Y + PANEL_H - 110.0;
+const PAGE_BUTTON_W: f32 = 160.0;
+const PAGE_BUTTON_GAP: f32 = 24.0;
 
 // ---- Paging --------------------------------------------------------------------------------
 
@@ -89,6 +97,9 @@ pub const CHAPTERS_PER_PAGE: usize = 8;
 pub const SECTORS_PER_PAGE: usize = 10;
 pub const SATISFACTION_PER_PAGE: usize = 8;
 pub const LIBRARY_PER_PAGE: usize = 8;
+
+/// Label of an armed library Delete button.
+pub const CONFIRM_DELETE_KEY: &str = "menu.library.button.confirm_delete";
 
 /// Locale keys of the read-only controls reference, in display order.
 pub const CONTROLS_KEYS: &[&str] = &[
@@ -183,6 +194,24 @@ pub enum Role {
     Delete(usize),
     Extra,
     Back,
+    /// Pointer-only button that shows the previous list page.
+    PagePrev,
+    /// Pointer-only button that shows the next list page.
+    PageNext,
+}
+
+impl Role {
+    /// True for the pointer-only paging buttons, which keyboard focus skips.
+    pub fn is_page_button(self) -> bool {
+        matches!(self, Self::PagePrev | Self::PageNext)
+    }
+}
+
+/// Direction of a paging button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageStep {
+    Prev,
+    Next,
 }
 
 /// What activating a widget does.
@@ -191,6 +220,8 @@ pub enum Activation {
     Navigate(PageId),
     Back,
     Emit(MenuAction),
+    /// Shows the previous or next list page.
+    Page(PageStep),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,6 +289,22 @@ impl PageLayout {
         self.widgets.iter().position(|w| w.role == Role::Item(item))
     }
 
+    /// Index of the delete button of the library row `item`.
+    pub fn widget_for_delete(&self, item: usize) -> Option<usize> {
+        self.widgets
+            .iter()
+            .position(|w| w.role == Role::Delete(item))
+    }
+
+    /// Number of widgets keyboard focus cycles through (the paging buttons come last and are
+    /// pointer-only).
+    pub fn focusable_count(&self) -> usize {
+        self.widgets
+            .iter()
+            .take_while(|w| !w.role.is_page_button())
+            .count()
+    }
+
     /// Absolute index of the first and last list item shown on this page.
     pub fn item_range(&self) -> Range<usize> {
         visible_range(self.item_count, self.page_size, self.list_page)
@@ -283,10 +330,14 @@ pub fn visible_range(item_count: usize, page_size: usize, list_page: usize) -> R
 }
 
 /// Largest menu font size not above `preferred` whose width fits `limit`; the smallest menu
-/// size when none fits. Never returns a size outside `MENU_FONT_SIZES`.
+/// size when none fits. Never returns a size outside `MENU_FONT_SIZES` plus `SIZE_HOME_TITLE`.
 pub fn fit_to_sizes(measure: impl Fn(u16) -> f32, preferred: u16, limit: f32) -> u16 {
     let mut fallback = MENU_FONT_SIZES[0];
-    for &size in MENU_FONT_SIZES.iter().rev() {
+    let candidates = MENU_FONT_SIZES
+        .iter()
+        .copied()
+        .chain(std::iter::once(SIZE_HOME_TITLE));
+    for size in candidates.rev() {
         if size > preferred {
             continue;
         }
@@ -355,7 +406,7 @@ fn page_indicator(list_page: usize, pages: usize) -> TextItem {
                 ("pages", pages.to_string()),
             ],
         },
-        x: centered_x(BACK_W) + BACK_W + PAGE_INDICATOR_GAP,
+        x: centered_x(BACK_W) + BACK_W + PAGE_BUTTON_GAP + PAGE_BUTTON_W + PAGE_INDICATOR_GAP,
         y: BACK_Y + PAGE_INDICATOR_DY,
         size: SIZE_SMALL,
         align: Align::Left,
@@ -418,6 +469,20 @@ fn build_home(layout: &mut PageLayout, model: &MenuModel) {
         x: PANEL_CENTER_X,
         y: HOME_SUBTITLE_Y,
         size: SIZE_SUBTITLE,
+        align: Align::Center,
+        tone: Tone::Primary,
+    });
+    layout.texts.push(TextItem {
+        label: Label::Template {
+            key: "menu.best_score",
+            args: vec![(
+                "score",
+                format!("{:0width$}", model.high_score, width = HIGH_SCORE_DIGITS),
+            )],
+        },
+        x: PANEL_CENTER_X,
+        y: HIGH_SCORE_Y,
+        size: SIZE_VALUE,
         align: Align::Center,
         tone: Tone::Primary,
     });
@@ -744,9 +809,42 @@ fn build_library(layout: &mut PageLayout, model: &MenuModel, list_page: usize) {
     finish_list_page(layout);
 }
 
+fn page_button(step: PageStep, enabled: bool) -> Widget {
+    let (x, key, role) = match step {
+        PageStep::Prev => (
+            centered_x(BACK_W) - PAGE_BUTTON_GAP - PAGE_BUTTON_W,
+            "menu.common.button.prev_page",
+            Role::PagePrev,
+        ),
+        PageStep::Next => (
+            centered_x(BACK_W) + BACK_W + PAGE_BUTTON_GAP,
+            "menu.common.button.next_page",
+            Role::PageNext,
+        ),
+    };
+    let mut w = widget(
+        UiRect::new(x, BACK_Y, PAGE_BUTTON_W, BACK_H),
+        Label::Key(key),
+        SIZE_BUTTON,
+        role,
+        Activation::Page(step),
+    );
+    w.enabled = enabled;
+    w
+}
+
+/// Adds the Back button and, on a multi-page list, the paging buttons (last, pointer-only) and
+/// the page indicator.
 fn finish_list_page(layout: &mut PageLayout) {
     layout.widgets.push(back_widget());
     if layout.page_count > 1 {
+        layout
+            .widgets
+            .push(page_button(PageStep::Prev, layout.list_page > 0));
+        layout.widgets.push(page_button(
+            PageStep::Next,
+            layout.list_page + 1 < layout.page_count,
+        ));
         let indicator = page_indicator(layout.list_page, layout.page_count);
         layout.texts.push(indicator);
     }
@@ -902,9 +1000,13 @@ mod tests {
         let layout = page_layout(PageId::Sectors(0), &model, 2);
         assert_eq!(layout.page_count, 3);
         assert_eq!(layout.list_page, 2);
-        // 5 rows on the last page plus Back.
-        assert_eq!(layout.widgets.len(), 6);
+        // 5 rows on the last page, Back, then the previous / next paging buttons.
+        assert_eq!(layout.widgets.len(), 8);
         assert_eq!(layout.widgets[0].role, Role::Item(20));
+        assert_eq!(layout.widgets[5].role, Role::Back);
+        assert_eq!(layout.widgets[6].role, Role::PagePrev);
+        assert_eq!(layout.widgets[7].role, Role::PageNext);
+        assert_eq!(layout.focusable_count(), 6);
         let clamped = page_layout(PageId::Sectors(0), &model, 99);
         assert_eq!(clamped.list_page, 2);
     }
@@ -954,11 +1056,10 @@ mod tests {
             for list_page in 0..2 {
                 let layout = page_layout(page, &model, list_page);
                 for t in &layout.texts {
-                    assert!(
-                        MENU_FONT_SIZES.contains(&t.size),
-                        "{page:?} text {}",
-                        t.size
-                    );
+                    // Only the Home title uses the title size, preloaded for its own characters.
+                    let allowed = MENU_FONT_SIZES.contains(&t.size)
+                        || (page == PageId::Home && t.size == SIZE_HOME_TITLE);
+                    assert!(allowed, "{page:?} text {}", t.size);
                 }
                 for w in &layout.widgets {
                     assert!(
@@ -969,8 +1070,8 @@ mod tests {
                 }
             }
         }
+        assert!(!MENU_FONT_SIZES.contains(&SIZE_HOME_TITLE));
         for size in [
-            SIZE_HOME_TITLE,
             SIZE_PAGE_TITLE,
             SIZE_SUBTITLE,
             SIZE_BUTTON,
@@ -988,13 +1089,101 @@ mod tests {
         for limit in [1.0, 215.0, 250.0, 301.0, 1000.0] {
             for preferred in [21, 22, 25, 30, 48, 96] {
                 let size = fit_to_sizes(measure, preferred, limit);
-                assert!(MENU_FONT_SIZES.contains(&size));
+                assert!(MENU_FONT_SIZES.contains(&size) || size == SIZE_HOME_TITLE);
                 assert!(size <= preferred.max(MENU_FONT_SIZES[0]));
             }
         }
         assert_eq!(fit_to_sizes(measure, 30, 1000.0), 30);
+        // The title size is reachable only when it is asked for.
+        assert_eq!(
+            fit_to_sizes(measure, SIZE_HOME_TITLE, 10_000.0),
+            SIZE_HOME_TITLE
+        );
+        assert_eq!(fit_to_sizes(measure, 60, 10_000.0), 48);
         assert_eq!(fit_to_sizes(measure, 30, 250.0), 24);
         assert_eq!(fit_to_sizes(measure, 30, 1.0), 21);
+    }
+
+    #[test]
+    fn paged_lists_get_pointer_only_paging_buttons() {
+        let mut model = model_with_world(25);
+        model.satisfaction_levels = (0..12).map(|i| format!("Q{i}")).collect();
+        model.library = (0..12)
+            .map(|id| LibraryEntry {
+                id,
+                name: format!("L{id}"),
+            })
+            .collect();
+        let template = model.worlds[0].clone();
+        model.worlds.extend((0..9).map(|_| template.clone()));
+        for page in [
+            PageId::Chapters,
+            PageId::Sectors(0),
+            PageId::Satisfaction,
+            PageId::Library,
+        ] {
+            let layout = page_layout(page, &model, 0);
+            assert!(layout.page_count > 1, "{page:?}");
+            let n = layout.widgets.len();
+            assert_eq!(layout.widgets[n - 2].role, Role::PagePrev, "{page:?}");
+            assert_eq!(layout.widgets[n - 1].role, Role::PageNext, "{page:?}");
+            assert_eq!(layout.focusable_count(), n - 2, "{page:?}");
+            // On the first page there is nothing before; on the last there is nothing after.
+            assert!(!layout.widgets[n - 2].enabled);
+            assert!(layout.widgets[n - 1].enabled);
+            let last = page_layout(page, &model, layout.page_count - 1);
+            let m = last.widgets.len();
+            assert!(last.widgets[m - 2].enabled);
+            assert!(!last.widgets[m - 1].enabled);
+            // Each button is hit at its own centre and nowhere else.
+            for index in [m - 2, m - 1] {
+                let r = last.widgets[index].rect;
+                assert_eq!(last.hit(r.x + r.w * 0.5, r.y + r.h * 0.5), Some(index));
+            }
+        }
+    }
+
+    #[test]
+    fn short_lists_and_other_pages_have_no_paging_buttons() {
+        let mut model = model_with_world(3);
+        model.satisfaction_levels = vec!["A".to_owned()];
+        for page in [
+            PageId::Home,
+            PageId::Options,
+            PageId::Controls,
+            PageId::Pause,
+            PageId::Chapters,
+            PageId::Sectors(0),
+            PageId::Satisfaction,
+            PageId::Library,
+        ] {
+            let layout = page_layout(page, &model, 0);
+            assert!(
+                layout.widgets.iter().all(|w| !w.role.is_page_button()),
+                "{page:?}"
+            );
+            assert_eq!(layout.focusable_count(), layout.widgets.len());
+        }
+    }
+
+    #[test]
+    fn the_home_page_shows_the_high_score_with_leading_zeros() {
+        let mut model = MenuModel::empty();
+        model.high_score = 4200;
+        let layout = page_layout(PageId::Home, &model, 0);
+        let line = layout
+            .texts
+            .iter()
+            .find(|t| t.label.key() == Some("menu.best_score"))
+            .expect("high score line");
+        assert_eq!(
+            line.label,
+            Label::Template {
+                key: "menu.best_score",
+                args: vec![("score", "0004200".to_owned())],
+            }
+        );
+        assert!(MENU_FONT_SIZES.contains(&line.size));
     }
 
     #[test]

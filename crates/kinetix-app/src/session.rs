@@ -28,10 +28,13 @@ use kinetix_core::level_code::{parse_level_code, LevelCodeError};
 use kinetix_core::physics::{GameWorld, SessionStatus};
 
 /// State of the current play session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Session {
     /// Where the board being played comes from.
     pub(crate) source: PlaySource,
+    /// Share code of the board a test play started from the editor with: restarting an editor
+    /// test imports it again instead of loading a campaign sector.
+    pub(crate) editor_snapshot: Option<String>,
 }
 
 impl Session {
@@ -39,8 +42,25 @@ impl Session {
     pub(crate) fn campaign() -> Self {
         Self {
             source: PlaySource::Campaign,
+            editor_snapshot: None,
         }
     }
+}
+
+/// Enters the level editor: the board edited from here on belongs to an editor test, whatever
+/// was being played before, so it can never reach the campaign progress. Fresh paddle and ball.
+pub(crate) fn enter_editor(session: &mut Session, world: &mut GameWorld) {
+    session.source = PlaySource::EditorTest;
+    world.reset_paddle_and_ball();
+    world.status = SessionStatus::Playing;
+}
+
+/// Starts a test play of the editor board: the board is remembered so a restart replays it.
+pub(crate) fn start_editor_test(session: &mut Session, world: &mut GameWorld) {
+    session.source = PlaySource::EditorTest;
+    session.editor_snapshot = Some(world.export_level_code());
+    world.reset_paddle_and_ball();
+    world.status = SessionStatus::Playing;
 }
 
 /// Starts a fresh run from the title menu: the only transition that ends a developer taint,
@@ -117,8 +137,18 @@ pub(crate) fn start_library_level(
     Ok(())
 }
 
+/// What restarting the current board did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartOutcome {
+    /// The board was reloaded and play goes on.
+    Restarted,
+    /// There is nothing to restart: back to the title screen, opened on this page.
+    ToTitle(PageId),
+}
+
 /// Restarts the current board of the session: the same satisfaction level, the same library
-/// code, or the current sector. Score and lives reset; a taint is never cleared.
+/// code, the editor test snapshot, or the current sector. Score and lives reset; a taint is never
+/// cleared. A library entry deleted in the meantime sends the player back to the library page.
 pub(crate) fn restart_current(
     session: &Session,
     world: &mut GameWorld,
@@ -126,22 +156,35 @@ pub(crate) fn restart_current(
     campaign: &[LevelDef],
     satisfaction: &[LevelDef],
     library: &Library,
-) {
-    if let PlaySource::Library(id) = session.source {
-        if let Some(entry) = library.get(id) {
-            if world.import_level_code(&entry.code).is_ok() {
-                world.lives = world.config.gameplay.initial_lives;
-                world.score = 0;
+) -> RestartOutcome {
+    match session.source {
+        PlaySource::Library(id) => {
+            let Some(entry) = library.get(id) else {
+                return RestartOutcome::ToTitle(PageId::Library);
+            };
+            reload_custom_board(world, &entry.code);
+        }
+        PlaySource::EditorTest => {
+            if let Some(code) = &session.editor_snapshot {
+                reload_custom_board(world, code);
             }
         }
-        return;
+        PlaySource::Campaign | PlaySource::Satisfaction => restart_level(
+            world,
+            dev,
+            levels_for(session.source, campaign, satisfaction),
+            session.source,
+        ),
     }
-    restart_level(
-        world,
-        dev,
-        levels_for(session.source, campaign, satisfaction),
-        session.source,
-    );
+    RestartOutcome::Restarted
+}
+
+/// Imports `code` again with fresh lives and score; a code that no longer imports changes nothing.
+fn reload_custom_board(world: &mut GameWorld, code: &str) {
+    if world.import_level_code(code).is_ok() {
+        world.lives = world.config.gameplay.initial_lives;
+        world.score = 0;
+    }
 }
 
 /// Where the game goes after a victory is acknowledged.
@@ -185,21 +228,38 @@ pub(crate) fn advance_after_victory(
     }
 }
 
-/// Number and name shown by the HUD for the board being played.
+/// True when a victory on the current board goes on to another board (no title or editor
+/// screen in between): the campaign sector list, or the satisfaction pack before its last level.
+pub(crate) fn victory_continues(
+    source: PlaySource,
+    world: &GameWorld,
+    satisfaction_len: usize,
+) -> bool {
+    match source {
+        PlaySource::Campaign => world.is_campaign_board(),
+        PlaySource::Satisfaction => world.current_level_idx + 1 < satisfaction_len,
+        PlaySource::Library(_) | PlaySource::EditorTest => false,
+    }
+}
+
+/// Number and name shown by the HUD for the board being played. A test play from the editor shows
+/// `editor_label`, never the name of a campaign sector.
 pub(crate) fn level_label<'a>(
     source: PlaySource,
     current_idx: usize,
     campaign: &'a [LevelDef],
     satisfaction: &'a [LevelDef],
     library: &'a Library,
+    editor_label: &'a str,
 ) -> (usize, &'a str) {
     match source {
+        PlaySource::EditorTest => (1, editor_label),
         PlaySource::Library(id) => library
             .entries
             .iter()
             .position(|entry| entry.id == id)
             .map_or((1, ""), |pos| (pos + 1, library.entries[pos].name.as_str())),
-        PlaySource::Satisfaction | PlaySource::Campaign | PlaySource::EditorTest => {
+        PlaySource::Satisfaction | PlaySource::Campaign => {
             let levels = levels_for(source, campaign, satisfaction);
             (
                 current_idx + 1,
@@ -296,25 +356,17 @@ pub(crate) enum PauseOutcome {
     Resumed,
     /// The player left for the title screen; the world is left exactly as it is.
     ToTitle,
+    /// The board cannot be restarted any more: the title screen opens on this page.
+    ToTitlePage(PageId),
 }
 
-/// Applies a pause menu action to the session. Resume and Restart put the world back to
+/// Applies the pause menu actions that do not reload a board. Resume puts the world back to
 /// playing; Quit to menu leaves the world, the progress and the developer taint untouched, like
-/// the Tab key does.
-pub(crate) fn apply_pause_action(
-    action: MenuAction,
-    world: &mut GameWorld,
-    dev: &mut DevState,
-    levels: &[LevelDef],
-    source: PlaySource,
-) -> PauseOutcome {
+/// the Tab key does. Restart belongs to `apply_session_pause_action`.
+fn apply_pause_action(action: MenuAction, world: &mut GameWorld) -> PauseOutcome {
     match action {
         MenuAction::Resume => {
             world.status = SessionStatus::Playing;
-            PauseOutcome::Resumed
-        }
-        MenuAction::Restart => {
-            restart_level(world, dev, levels, source);
             PauseOutcome::Resumed
         }
         MenuAction::QuitToTitle => PauseOutcome::ToTitle,
@@ -323,7 +375,7 @@ pub(crate) fn apply_pause_action(
 }
 
 /// Applies a pause menu action to the session of any source: Restart reloads the board of the
-/// source (never a campaign sector for satisfaction or library), the rest is
+/// source (never a campaign sector for satisfaction, library or editor), the rest is
 /// `apply_pause_action`.
 pub(crate) fn apply_session_pause_action(
     action: MenuAction,
@@ -335,11 +387,15 @@ pub(crate) fn apply_session_pause_action(
     library: &Library,
 ) -> PauseOutcome {
     if action == MenuAction::Restart {
-        restart_current(session, world, dev, campaign, satisfaction, library);
-        world.status = SessionStatus::Playing;
-        return PauseOutcome::Resumed;
+        return match restart_current(session, world, dev, campaign, satisfaction, library) {
+            RestartOutcome::Restarted => {
+                world.status = SessionStatus::Playing;
+                PauseOutcome::Resumed
+            }
+            RestartOutcome::ToTitle(page) => PauseOutcome::ToTitlePage(page),
+        };
     }
-    apply_pause_action(action, world, dev, campaign, session.source)
+    apply_pause_action(action, world)
 }
 
 /// Moves on to the sector after a win. The score carries over and a taint is never cleared.
@@ -354,8 +410,10 @@ pub(crate) fn next_sector(
     world.load_pack_level(next_lvl, levels, source.pack_rules());
 }
 
-/// Keeps the saved progress out of reach of developer mode: while the current level is tainted,
-/// the live high score and unlock marker are rolled back to the genuine ones.
+/// Keeps the saved progress out of reach of developer mode and of boards that are not the
+/// campaign: while the level is tainted, the source is not the campaign, or the board in play is
+/// not a campaign sector (a custom board under a campaign source), the live high score and
+/// unlock marker are rolled back to the genuine ones.
 pub(crate) fn sync_progress(
     guard: &mut ProgressGuard,
     dev: &DevState,
@@ -363,7 +421,7 @@ pub(crate) fn sync_progress(
     source: PlaySource,
 ) {
     guard.sync(
-        progress_frozen(source, dev.tainted),
+        progress_frozen(source, dev.tainted) || !world.is_campaign_board(),
         &mut world.high_score,
         &mut world.max_unlocked_level,
     );
@@ -540,19 +598,21 @@ mod tests {
 
     #[test]
     fn a_non_campaign_source_never_writes_progress_even_without_a_taint() {
-        let (mut world, pack) = dev_test_world();
+        let (mut world, _) = dev_test_world();
+        let satisfaction = satisfaction_levels();
         let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
         let dev = DevState::default();
-        start_run_from_title(
+        let mut session = Session::campaign();
+        assert!(start_satisfaction(
+            &mut session,
             &mut world,
-            &mut DevState::default(),
-            &pack.levels,
-            0,
-            PlaySource::Satisfaction,
-        );
+            &satisfaction,
+            0
+        ));
         assert!(!world.is_campaign_board());
+        world.high_score = 9_999;
         win_current_level(&mut world);
-        sync_progress(&mut guard, &dev, &mut world, PlaySource::Satisfaction);
+        sync_progress(&mut guard, &dev, &mut world, session.source);
         assert_eq!(world.max_unlocked_level, 0);
         assert_eq!(world.high_score, 1);
     }
@@ -567,15 +627,9 @@ mod tests {
     #[test]
     fn resume_puts_a_paused_world_back_to_playing() {
         let mut dev = DevState::default();
-        let (mut world, pack) = paused_world(&mut dev);
+        let (mut world, _) = paused_world(&mut dev);
         world.score = 700;
-        let outcome = apply_pause_action(
-            MenuAction::Resume,
-            &mut world,
-            &mut dev,
-            &pack.levels,
-            PlaySource::Campaign,
-        );
+        let outcome = apply_pause_action(MenuAction::Resume, &mut world);
         assert_eq!(outcome, PauseOutcome::Resumed);
         assert_eq!(world.status, SessionStatus::Playing);
         assert_eq!(world.score, 700, "resume keeps the score");
@@ -586,12 +640,14 @@ mod tests {
         let mut dev = DevState::default();
         let (mut world, pack) = paused_world(&mut dev);
         world.score = 700;
-        let outcome = apply_pause_action(
+        let outcome = apply_session_pause_action(
             MenuAction::Restart,
+            &Session::campaign(),
             &mut world,
             &mut dev,
             &pack.levels,
-            PlaySource::Campaign,
+            &satisfaction_levels(),
+            &Library::default(),
         );
         assert_eq!(outcome, PauseOutcome::Resumed);
         assert_eq!(world.status, SessionStatus::Playing);
@@ -606,12 +662,14 @@ mod tests {
         dev.toggle();
         dev.toggle();
         assert!(dev.tainted);
-        apply_pause_action(
+        apply_session_pause_action(
             MenuAction::Restart,
+            &Session::campaign(),
             &mut world,
             &mut dev,
             &pack.levels,
-            PlaySource::Campaign,
+            &satisfaction_levels(),
+            &Library::default(),
         );
         assert!(dev.tainted);
     }
@@ -619,17 +677,11 @@ mod tests {
     #[test]
     fn quit_to_menu_leaves_the_world_and_the_taint_alone() {
         let mut dev = DevState::default();
-        let (mut world, pack) = paused_world(&mut dev);
+        let (mut world, _) = paused_world(&mut dev);
         dev.toggle();
         dev.toggle();
         world.score = 700;
-        let outcome = apply_pause_action(
-            MenuAction::QuitToTitle,
-            &mut world,
-            &mut dev,
-            &pack.levels,
-            PlaySource::Campaign,
-        );
+        let outcome = apply_pause_action(MenuAction::QuitToTitle, &mut world);
         assert_eq!(outcome, PauseOutcome::ToTitle);
         assert_eq!(world.status, SessionStatus::Paused);
         assert_eq!(world.score, 700);
@@ -640,7 +692,7 @@ mod tests {
     #[test]
     fn settings_and_unrelated_actions_are_left_to_the_caller() {
         let mut dev = DevState::default();
-        let (mut world, pack) = paused_world(&mut dev);
+        let (mut world, _) = paused_world(&mut dev);
         for action in [
             MenuAction::None,
             MenuAction::ToggleSfx,
@@ -649,13 +701,7 @@ mod tests {
             MenuAction::StartSector(0),
             MenuAction::QuitApp,
         ] {
-            let outcome = apply_pause_action(
-                action,
-                &mut world,
-                &mut dev,
-                &pack.levels,
-                PlaySource::Campaign,
-            );
+            let outcome = apply_pause_action(action, &mut world);
             assert_eq!(outcome, PauseOutcome::None);
             assert_eq!(world.status, SessionStatus::Paused);
         }
@@ -947,6 +993,7 @@ mod tests {
         let mut dev = DevState::default();
         let editor = Session {
             source: PlaySource::EditorTest,
+            editor_snapshot: None,
         };
         let outcome = advance_after_victory(
             &editor,
@@ -999,6 +1046,7 @@ mod tests {
             &campaign.levels,
             &satisfaction,
             &library,
+            EDITOR_LABEL,
         );
         assert_eq!((number, name), (3, satisfaction[2].name.as_str()));
         let (number, name) = level_label(
@@ -1007,6 +1055,7 @@ mod tests {
             &campaign.levels,
             &satisfaction,
             &library,
+            EDITOR_LABEL,
         );
         assert_eq!((number, name), (1, campaign.levels[0].name.as_str()));
         let (number, name) = level_label(
@@ -1015,6 +1064,7 @@ mod tests {
             &campaign.levels,
             &satisfaction,
             &library,
+            EDITOR_LABEL,
         );
         assert_eq!((number, name), (2, "SECOND"));
         let (number, name) = level_label(
@@ -1023,10 +1073,25 @@ mod tests {
             &campaign.levels,
             &satisfaction,
             &library,
+            EDITOR_LABEL,
         );
         assert_eq!((number, name), (1, ""));
+        let (number, name) = level_label(
+            PlaySource::EditorTest,
+            7,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+            EDITOR_LABEL,
+        );
+        assert_eq!(
+            (number, name),
+            (1, EDITOR_LABEL),
+            "an editor test never shows a campaign sector name"
+        );
     }
 
+    const EDITOR_LABEL: &str = "EDITOR";
     const NAME_TEMPLATE: &str = "LEVEL {n}";
 
     #[test]
@@ -1152,5 +1217,198 @@ mod tests {
             "control and direction characters are dropped"
         );
         assert_eq!(default_library_name("N\u{e9}o {n}", 5), "N\u{e9}o 5");
+    }
+
+    #[test]
+    fn a_custom_board_edited_from_a_campaign_run_never_saves_progress() {
+        let (mut world, pack) = dev_test_world();
+        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
+        let mut dev = DevState::default();
+        let mut session = Session::campaign();
+        start_run_from_title(&mut world, &mut dev, &pack.levels, 0, session.source);
+        let code = world.export_level_code();
+
+        // F4 into the editor, import a board, F4 back into test play.
+        enter_editor(&mut session, &mut world);
+        assert_eq!(session.source, PlaySource::EditorTest);
+        world.import_level_code(&code).expect("valid code");
+        start_editor_test(&mut session, &mut world);
+        world.high_score = 5_000;
+        win_current_level(&mut world);
+        sync_progress(&mut guard, &dev, &mut world, session.source);
+        assert_eq!(world.high_score, 1, "the editor test saved no high score");
+        assert_eq!(world.max_unlocked_level, 0, "and unlocked nothing");
+    }
+
+    #[test]
+    fn a_custom_board_under_a_campaign_source_is_frozen_on_its_own() {
+        let (mut world, pack) = dev_test_world();
+        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
+        let dev = DevState::default();
+        start_run_from_title(
+            &mut world,
+            &mut DevState::default(),
+            &pack.levels,
+            0,
+            PlaySource::Campaign,
+        );
+        let code = world.export_level_code();
+        world.import_level_code(&code).expect("valid code");
+        assert!(!world.is_campaign_board());
+        world.high_score = 5_000;
+        win_current_level(&mut world);
+        sync_progress(&mut guard, &dev, &mut world, PlaySource::Campaign);
+        assert_eq!(world.high_score, 1);
+        assert_eq!(world.max_unlocked_level, 0);
+
+        // A campaign sector started afterwards counts again.
+        start_run_from_title(
+            &mut world,
+            &mut DevState::default(),
+            &pack.levels,
+            0,
+            PlaySource::Campaign,
+        );
+        win_current_level(&mut world);
+        sync_progress(&mut guard, &dev, &mut world, PlaySource::Campaign);
+        assert_eq!(world.max_unlocked_level, 1);
+    }
+
+    #[test]
+    fn restarting_an_editor_test_replays_its_snapshot_not_a_campaign_sector() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let library = Library::default();
+        let mut dev = DevState::default();
+        let mut session = Session::campaign();
+        world.load_pack_level(2, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        let snapshot_bricks = world.bricks.len();
+        start_editor_test(&mut session, &mut world);
+        assert!(session.editor_snapshot.is_some());
+        world.bricks.truncate(1);
+        world.score = 400;
+        world.status = SessionStatus::GameOver;
+
+        let outcome = restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(outcome, RestartOutcome::Restarted);
+        assert_eq!(world.bricks.len(), snapshot_bricks);
+        assert_eq!(world.score, 0);
+        assert!(!world.is_campaign_board());
+        assert_eq!(world.status, SessionStatus::Playing);
+    }
+
+    #[test]
+    fn the_pause_restart_of_an_editor_test_replays_the_snapshot() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut dev = DevState::default();
+        let mut session = Session::campaign();
+        world.load_pack_level(1, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        let snapshot_bricks = world.bricks.len();
+        start_editor_test(&mut session, &mut world);
+        world.bricks.truncate(1);
+        world.status = SessionStatus::Paused;
+        let outcome = apply_session_pause_action(
+            MenuAction::Restart,
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &Library::default(),
+        );
+        assert_eq!(outcome, PauseOutcome::Resumed);
+        assert_eq!(world.bricks.len(), snapshot_bricks);
+        assert!(!world.is_campaign_board());
+    }
+
+    #[test]
+    fn restarting_a_deleted_library_level_returns_to_the_library_page() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut dev = DevState::default();
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        let (mut library, id) = library_with_current_board(&world);
+        let entry = library.get(id).expect("entry").clone();
+        let mut session = Session::campaign();
+        start_library_level(&mut session, &mut world, &entry).expect("valid code");
+        assert!(library.delete(id));
+        world.score = 300;
+
+        let outcome = restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(outcome, RestartOutcome::ToTitle(PageId::Library));
+        assert_eq!(world.score, 300, "nothing was reloaded");
+
+        world.status = SessionStatus::Paused;
+        let outcome = apply_session_pause_action(
+            MenuAction::Restart,
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(outcome, PauseOutcome::ToTitlePage(PageId::Library));
+        assert_eq!(world.status, SessionStatus::Paused);
+    }
+
+    #[test]
+    fn victory_continues_matches_what_advancing_does() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut dev = DevState::default();
+        let sources = [
+            PlaySource::Campaign,
+            PlaySource::Satisfaction,
+            PlaySource::Library(1),
+            PlaySource::EditorTest,
+        ];
+        for source in sources {
+            for idx in [0, satisfaction.len() - 1] {
+                match source {
+                    PlaySource::Campaign => {
+                        world.load_pack_level(idx, &campaign.levels, source.pack_rules())
+                    }
+                    PlaySource::Satisfaction => {
+                        world.load_pack_level(idx, &satisfaction, source.pack_rules())
+                    }
+                    _ => world
+                        .import_level_code(&world.export_level_code())
+                        .expect("valid code"),
+                }
+                let expected = victory_continues(source, &world, satisfaction.len());
+                let session = Session {
+                    source,
+                    editor_snapshot: None,
+                };
+                let outcome = advance_after_victory(
+                    &session,
+                    &mut world,
+                    &mut dev,
+                    &campaign.levels,
+                    &satisfaction,
+                );
+                assert_eq!(
+                    expected,
+                    outcome == VictoryOutcome::NextLevel,
+                    "{source:?} at {idx}"
+                );
+            }
+        }
     }
 }

@@ -31,8 +31,18 @@ const DIM_COLOR: [u8; 4] = [5, 4, 15, 215];
 const PANEL_COLOR: [u8; 4] = [12, 14, 30, 245];
 const IDLE_PILL_COLOR: [u8; 4] = [24, 28, 52, 200];
 const HEADER_BAND_ALPHA: f32 = 0.05;
-const FOCUS_FILL_ALPHA: f32 = 0.25;
-const FOCUS_BORDER: f32 = 3.0;
+/// Text colours tried on the accent-filled focused widget: the panel background and white.
+const FOCUS_TEXT_DARK: [u8; 4] = [12, 14, 30, 255];
+const FOCUS_TEXT_LIGHT: [u8; 4] = [255, 255, 255, 255];
+/// Linearisation of an sRGB channel (WCAG relative luminance).
+const SRGB_THRESHOLD: f32 = 0.039_28;
+const SRGB_LINEAR_DIVISOR: f32 = 12.92;
+const SRGB_OFFSET: f32 = 0.055;
+const SRGB_SCALE: f32 = 1.055;
+const SRGB_GAMMA: f32 = 2.4;
+const LUMINANCE_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
+/// Offset added to both luminances in the WCAG contrast ratio.
+const CONTRAST_OFFSET: f32 = 0.05;
 const PILL_RADIUS: f32 = 14.0;
 const DISABLED_ALPHA: f32 = 0.4;
 const SHADOW_OFFSET: f32 = 2.0;
@@ -46,6 +56,37 @@ const TEXT_SPACING: f32 = 1.0;
 
 fn rgba(c: [u8; 4]) -> Color {
     Color::from_rgba(c[0], c[1], c[2], c[3])
+}
+
+fn linear_channel(value: u8) -> f32 {
+    let c = f32::from(value) / f32::from(u8::MAX);
+    if c <= SRGB_THRESHOLD {
+        c / SRGB_LINEAR_DIVISOR
+    } else {
+        ((c + SRGB_OFFSET) / SRGB_SCALE).powf(SRGB_GAMMA)
+    }
+}
+
+fn luminance(c: [u8; 4]) -> f32 {
+    LUMINANCE_WEIGHTS[0] * linear_channel(c[0])
+        + LUMINANCE_WEIGHTS[1] * linear_channel(c[1])
+        + LUMINANCE_WEIGHTS[2] * linear_channel(c[2])
+}
+
+/// WCAG contrast ratio between two colours (always at least 1).
+pub(crate) fn contrast_ratio(a: [u8; 4], b: [u8; 4]) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + CONTRAST_OFFSET) / (la.min(lb) + CONTRAST_OFFSET)
+}
+
+/// Text colour drawn on a widget filled with `fill`: whichever of the panel background and white
+/// contrasts more.
+pub(crate) fn focus_text_color(fill: [u8; 4]) -> [u8; 4] {
+    if contrast_ratio(fill, FOCUS_TEXT_DARK) >= contrast_ratio(fill, FOCUS_TEXT_LIGHT) {
+        FOCUS_TEXT_DARK
+    } else {
+        FOCUS_TEXT_LIGHT
+    }
 }
 
 fn with_alpha(c: Color, alpha: f32) -> Color {
@@ -106,38 +147,36 @@ fn draw_fitted(font: &Font, text: &str, spec: FitSpec) -> f32 {
     width
 }
 
+/// Theme colours a widget is drawn with.
+#[derive(Clone, Copy)]
+struct WidgetColors {
+    primary: Color,
+    accent: Color,
+    /// Text on the accent-filled focused widget.
+    focus_text: Color,
+}
+
 fn draw_widget(
     widget: &Widget,
     focused: bool,
     i18n: &I18nCatalog,
     font: &Font,
-    primary: Color,
-    accent: Color,
+    colors: WidgetColors,
 ) {
     let UiRect { x, y, w, h } = widget.rect;
     let alpha = if widget.enabled { 1.0 } else { DISABLED_ALPHA };
+    let WidgetColors {
+        primary,
+        accent,
+        focus_text,
+    } = colors;
     if focused {
         fill_rounded(x, y, w, h, PILL_RADIUS, with_alpha(accent, alpha));
-        fill_rounded(
-            x + FOCUS_BORDER,
-            y + FOCUS_BORDER,
-            w - 2.0 * FOCUS_BORDER,
-            h - 2.0 * FOCUS_BORDER,
-            PILL_RADIUS - FOCUS_BORDER,
-            rgba(IDLE_PILL_COLOR),
-        );
-        fill_rounded(
-            x + FOCUS_BORDER,
-            y + FOCUS_BORDER,
-            w - 2.0 * FOCUS_BORDER,
-            h - 2.0 * FOCUS_BORDER,
-            PILL_RADIUS - FOCUS_BORDER,
-            with_alpha(accent, FOCUS_FILL_ALPHA * alpha),
-        );
     } else {
         fill_rounded(x, y, w, h, PILL_RADIUS, rgba(IDLE_PILL_COLOR));
     }
-    let color = with_alpha(if focused { accent } else { primary }, alpha);
+    let color = with_alpha(if focused { focus_text } else { primary }, alpha);
+    let value_color = if focused { focus_text } else { accent };
     let baseline = y + h * 0.5 + widget.size as f32 * BASELINE_FACTOR;
     let label = widget.label.resolve(i18n);
     let inner_w = w - 2.0 * PILL_PAD_X;
@@ -153,7 +192,7 @@ fn draw_widget(
                     preferred: widget.size,
                     limit: inner_w * 0.5,
                     align: Align::Right,
-                    color: with_alpha(accent, alpha),
+                    color: with_alpha(value_color, alpha),
                 },
             ) + PILL_VALUE_GAP
         }
@@ -232,7 +271,53 @@ pub fn draw_menu(
         };
         draw_fitted(font, &text, spec);
     }
+    let colors = WidgetColors {
+        primary,
+        accent,
+        focus_text: rgba(focus_text_color(theme.text_accent)),
+    };
     for (index, widget) in layout.widgets.iter().enumerate() {
-        draw_widget(widget, index == menu.focus(), i18n, font, primary, accent);
+        draw_widget(widget, index == menu.focus(), i18n, font, colors);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kinetix_core::config::ThemeRegistry;
+
+    const RAW_THEMES: &str = include_str!("../../../../assets/config/themes.json");
+    /// Minimum contrast ratio of the focused text against the accent fill (WCAG AA for the
+    /// large text the menu uses is 3; this keeps a margin above it).
+    const MIN_FOCUS_CONTRAST: f32 = 4.0;
+
+    #[test]
+    fn contrast_ratio_is_symmetric_and_bounded() {
+        let black = [0, 0, 0, 255];
+        let white = [255, 255, 255, 255];
+        assert!((contrast_ratio(black, white) - 21.0).abs() < 0.01);
+        assert_eq!(contrast_ratio(black, white), contrast_ratio(white, black));
+        assert!((contrast_ratio(white, white) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn focus_text_picks_the_more_readable_of_the_two_colours() {
+        assert_eq!(focus_text_color([255, 255, 80, 255]), FOCUS_TEXT_DARK);
+        assert_eq!(focus_text_color([20, 30, 140, 255]), FOCUS_TEXT_LIGHT);
+    }
+
+    #[test]
+    fn focused_text_is_readable_on_every_theme_accent() {
+        let registry: ThemeRegistry = serde_json::from_str(RAW_THEMES).unwrap();
+        assert!(!registry.themes.is_empty());
+        for theme in &registry.themes {
+            let text = focus_text_color(theme.text_accent);
+            let ratio = contrast_ratio(theme.text_accent, text);
+            assert!(
+                ratio >= MIN_FOCUS_CONTRAST,
+                "{} focus contrast {ratio}",
+                theme.name_key
+            );
+        }
     }
 }

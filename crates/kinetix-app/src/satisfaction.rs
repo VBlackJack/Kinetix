@@ -17,9 +17,6 @@
 //! The satisfaction pack: a fixed set of levels played outside the campaign.
 
 use kinetix_core::config::LevelPack;
-use kinetix_core::physics::PackRules;
-
-use crate::play_source::PlaySource;
 
 const SATISFACTION_JSON: &str = include_str!("../../../assets/config/satisfaction.json");
 
@@ -35,14 +32,10 @@ pub fn level_names(pack: &LevelPack) -> Vec<&str> {
     pack.levels.iter().map(|l| l.name.as_str()).collect()
 }
 
-/// Engine rules for the satisfaction pack: the single source of truth is `PlaySource`.
-pub fn satisfaction_rules() -> PackRules {
-    PlaySource::Satisfaction.pack_rules()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::play_source::PlaySource;
     use kinetix_core::config::LevelDef;
     use kinetix_core::level_code::{parse_level_code, EDITOR_COLS, LEVEL_CODE_PREFIX};
     use std::collections::HashSet;
@@ -104,7 +97,7 @@ mod tests {
 
     #[test]
     fn rules_are_non_campaign_without_sudden_death() {
-        let rules = satisfaction_rules();
+        let rules = PlaySource::Satisfaction.pack_rules();
         assert!(!rules.campaign);
         assert!(!rules.sudden_death);
     }

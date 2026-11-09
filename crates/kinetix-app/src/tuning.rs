@@ -155,9 +155,6 @@ pub const POWERUP_POPUP_DY: f32 = -28.0;
 pub const POPUP_MIN_X: f32 = 80.0;
 pub const POPUP_MAX_X: f32 = 1560.0;
 
-// ---- Title menu ----
-pub const MENU_TITLE_SIZE: u16 = 96;
-
 // ---- HUD ----
 pub const HUD_BAR_X: f32 = 48.0;
 pub const HUD_BAR_Y: f32 = 8.0;
@@ -192,8 +189,10 @@ pub const HUD_SUB_BAR_SEPARATOR: &str = "    ";
 pub const HUD_BANNER_X: f32 = 72.0;
 pub const HUD_BANNER_Y: f32 = 138.0;
 pub const HUD_BANNER_SIZE: u16 = 28;
+/// Vertical gap between the editor banner and the hint about saving the board to the library.
+pub const HUD_EDITOR_SAVE_HINT_DY: f32 = 32.0;
 /// Editor hint about saving the board to the library, drawn under the banner.
-pub const HUD_EDITOR_SAVE_HINT_Y: f32 = HUD_BANNER_Y + 32.0;
+pub const HUD_EDITOR_SAVE_HINT_Y: f32 = HUD_BANNER_Y + HUD_EDITOR_SAVE_HINT_DY;
 pub const HUD_SUDDEN_DEATH_Y: f32 = 136.0;
 pub const HUD_SUDDEN_DEATH_SIZE: u16 = 26;
 pub const HUD_FOOTER_Y: f32 = 1058.0;
@@ -234,7 +233,7 @@ pub const BOSS_LABEL_SIZE: u16 = 28;
 
 // ---- Font atlas pre-warm ----
 /// Every UI font size used by `txt` and `measure_text` (badge shrink sizes are added separately,
-/// and the title size is only warmed for the title string).
+/// and the menu title size, `SIZE_HOME_TITLE`, is only warmed for the title string).
 pub const UI_FONT_SIZES: [u16; 13] = [16, 17, 21, 22, 23, 24, 26, 28, 29, 30, 32, 34, 48];
 
 // ---- Pointer lock resume gestures (must match RESUME_* in web/index.html) ----

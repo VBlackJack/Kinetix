@@ -653,6 +653,11 @@ impl GameWorld {
         self.campaign_board
     }
 
+    /// True unless the board was loaded from a pack that turns sudden death off.
+    pub fn sudden_death_enabled(&self) -> bool {
+        self.sudden_death_enabled
+    }
+
     /// Removes every brick (editor clear); the board stops counting as a campaign sector.
     pub fn clear_bricks(&mut self) {
         self.bricks.clear();

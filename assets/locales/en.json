@@ -4,16 +4,8 @@
     "subtitle": "Modern High-Velocity Brick Breaker"
   },
   "menu": {
-    "play": "CLICK OR PRESS [ENTER / SPACE] TO LAUNCH CAMPAIGN",
-    "campaigns": "SELECT CAMPAIGN WORLD ([LEFT / RIGHT] or [1-{count}])",
-    "sector_select": "START SECTOR [UP/DOWN] [PGUP/DN] [HOME/END]:",
     "sector_range": "(Sectors {first}-{last})",
-    "editor_btn": "[F4] LEVEL ARCHITECT (EDITOR)",
-    "theme_btn": "[F1] VISUAL RENDERER",
-    "lang_btn": "[F2] LANGUAGE",
-    "music_btn": "[B] DYNAMIC SYNTHTRACK",
-    "locked": "LOCKED",
-    "best_score": "HIGH SCORE",
+    "best_score": "HIGH SCORE: {score}",
     "home": {
       "button": {
         "campaign": "CAMPAIGN",
@@ -25,7 +17,9 @@
     },
     "common": {
       "button": {
-        "back": "BACK"
+        "back": "BACK",
+        "prev_page": "PREV",
+        "next_page": "NEXT"
       }
     },
     "chapters": {
@@ -81,7 +75,8 @@
       "button": {
         "new": "NEW LEVEL",
         "play": "PLAY",
-        "delete": "DELETE"
+        "delete": "DELETE",
+        "confirm_delete": "CONFIRM?"
       },
       "label": {
         "empty": "NO SAVED LEVELS YET",

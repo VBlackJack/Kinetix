@@ -26,8 +26,8 @@ use audio::{
     set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
-use kinetix_app::library::{load_library, save_library};
-use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES};
+use kinetix_app::library::{load_library, reload_library_if_unloaded, save_library};
+use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES, SIZE_HOME_TITLE};
 use kinetix_app::persistence::{load_progress, load_settings, save_settings, Settings};
 use kinetix_app::play_source::PlaySource;
 use kinetix_app::satisfaction::{level_names, satisfaction_pack};
@@ -41,10 +41,10 @@ use kinetix_core::physics::{
 };
 use macroquad::prelude::*;
 use session::{
-    advance_after_victory, apply_session_pause_action, delete_library_level, level_label,
-    restart_current, save_board_to_library, start_library_level, start_run_from_title,
-    start_satisfaction, sync_progress, LibraryOutcome, PauseOutcome, SaveTracker, Session,
-    VictoryOutcome,
+    advance_after_victory, apply_session_pause_action, delete_library_level, enter_editor,
+    level_label, restart_current, save_board_to_library, start_editor_test, start_library_level,
+    start_run_from_title, start_satisfaction, sync_progress, victory_continues, LibraryOutcome,
+    PauseOutcome, RestartOutcome, SaveTracker, Session, VictoryOutcome,
 };
 use std::collections::BTreeSet;
 use title::{
@@ -192,6 +192,13 @@ fn push_library_toast(
     });
 }
 
+/// Where the mouse is, in arena coordinates.
+fn current_arena_pointer(arena_w: f32, arena_h: f32) -> Option<(f32, f32)> {
+    let (mx, my) = mouse_position();
+    let (scale, ox, oy) = letterbox(screen_width(), screen_height(), arena_w, arena_h);
+    Some(screen_to_arena(mx, my, scale, ox, oy))
+}
+
 fn rand_in(range: (f32, f32)) -> f32 {
     rand::gen_range(range.0, range.1)
 }
@@ -330,20 +337,44 @@ fn menu_is_visible(screen: AppScreen, status: SessionStatus) -> bool {
         || (screen == AppScreen::InGame && status == SessionStatus::Paused)
 }
 
-/// Opens the level editor on a fresh paddle and ball (the F4 entry).
-fn enter_editor(screen: &mut AppScreen, world: &mut GameWorld) {
-    *screen = AppScreen::Editor;
-    world.reset_paddle_and_ball();
-    world.status = SessionStatus::Playing;
-}
-
 /// Opens the editor on an empty board with fresh lives and score (the library "New" entry).
-fn enter_empty_editor(screen: &mut AppScreen, world: &mut GameWorld) {
+fn enter_empty_editor(screen: &mut AppScreen, session: &mut Session, world: &mut GameWorld) {
     world.clear_bricks();
     world.boss = None;
     world.lives = world.config.gameplay.initial_lives;
     world.score = 0;
-    enter_editor(screen, world);
+    *screen = AppScreen::Editor;
+    enter_editor(session, world);
+}
+
+/// The F4 key: from the editor it starts a test play of the board, from anywhere else it opens
+/// the editor. Either way the board belongs to an editor test, never to the campaign.
+fn toggle_editor(screen: &mut AppScreen, session: &mut Session, world: &mut GameWorld) {
+    if *screen == AppScreen::Editor {
+        *screen = AppScreen::InGame;
+        start_editor_test(session, world);
+    } else {
+        *screen = AppScreen::Editor;
+        enter_editor(session, world);
+    }
+}
+
+/// True when the sudden death banner is due: the board has sudden death and its timer ran out.
+fn sudden_death_banner_due(world: &GameWorld) -> bool {
+    world.sudden_death_enabled()
+        && world.level_elapsed >= world.config.gameplay.sudden_death_time_sec
+}
+
+/// False for the Up / Down keys while a menu is shown: they move the menu focus there, they do not
+/// select a developer power-up.
+fn dev_key_cycles_powerup(key: KeyCode, menu_shown: bool) -> bool {
+    !(menu_shown && matches!(key, KeyCode::Up | KeyCode::Down))
+}
+
+/// True when any of `keys` was pressed this frame and may cycle the developer power-up.
+fn dev_powerup_pressed(keys: &[KeyCode], menu_shown: bool) -> bool {
+    keys.iter()
+        .any(|&key| dev_key_cycles_powerup(key, menu_shown) && is_key_pressed(key))
 }
 
 /// Which menu gestures start play (from the title or the pause menu): a click on the widget
@@ -356,7 +387,14 @@ struct MenuPlay {
 
 /// Input gestures that will make the pointer lock wanted from the given state (see
 /// `lock_wanted` in the main loop); the page uses it to request the lock inside the gesture.
-fn resume_mask_for(screen: AppScreen, status: SessionStatus, menu_play: MenuPlay) -> u32 {
+/// `victory_continues` is true when a win goes on to another board: only then does a click or a
+/// Space press after the win start play again.
+fn resume_mask_for(
+    screen: AppScreen,
+    status: SessionStatus,
+    menu_play: MenuPlay,
+    victory_continues: bool,
+) -> u32 {
     match screen {
         AppScreen::TitleMenu => {
             let mut base = RESUME_CHEAT_MASK;
@@ -389,6 +427,7 @@ fn resume_mask_for(screen: AppScreen, status: SessionStatus, menu_play: MenuPlay
                 }
                 base
             }
+            SessionStatus::Victory if !victory_continues => RESUME_R | RESUME_CHEAT_MASK,
             SessionStatus::Victory | SessionStatus::GameOver => {
                 RESUME_CLICK | RESUME_SPACE | RESUME_R | RESUME_CHEAT_MASK
             }
@@ -423,15 +462,7 @@ fn prewarm_font(
 
     // Glyphs are cached per physical pixel size (font size times the DPI scale, rounded up).
     let dpi = miniquad::window::dpi_scale();
-    let physical = |size: u16| (size as f32 * dpi).ceil() as u16;
-    let sizes: BTreeSet<u16> = UI_FONT_SIZES
-        .iter()
-        .copied()
-        .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
-        .chain(MENU_FONT_SIZES.iter().copied())
-        .map(physical)
-        .collect();
-    for size in sizes {
+    for size in full_charset_sizes(dpi) {
         font.populate_font_cache(&chars, size);
     }
 
@@ -442,7 +473,24 @@ fn prewarm_font(
         .collect::<BTreeSet<char>>()
         .into_iter()
         .collect();
-    font.populate_font_cache(&title_chars, physical(MENU_TITLE_SIZE));
+    font.populate_font_cache(&title_chars, physical_font_size(SIZE_HOME_TITLE, dpi));
+}
+
+/// Glyph cache size of a font size at the given DPI scale (rounded up).
+fn physical_font_size(size: u16, dpi: f32) -> u16 {
+    (size as f32 * dpi).ceil() as u16
+}
+
+/// Physical glyph sizes preloaded for the full character set. The menu title size is not part of
+/// it: the title is only a few characters, warmed separately.
+fn full_charset_sizes(dpi: f32) -> BTreeSet<u16> {
+    UI_FONT_SIZES
+        .iter()
+        .copied()
+        .chain(BADGE_FONT_SIZE_MIN..=BADGE_FONT_SIZE_MAX)
+        .chain(MENU_FONT_SIZES.iter().copied())
+        .map(|size| physical_font_size(size, dpi))
+        .collect()
 }
 
 struct HudContext<'a> {
@@ -630,6 +678,8 @@ async fn main() {
             Language::Fr => &catalog_fr,
         };
         let theme = &theme_reg.themes[theme_idx % theme_reg.themes.len()];
+        let arena_pointer =
+            current_arena_pointer(world.config.arena.width, world.config.arena.height);
 
         sfx.update_music(
             world.boss.is_some(),
@@ -654,16 +704,7 @@ async fn main() {
             screen = AppScreen::InGame;
         }
         if is_key_pressed(KeyCode::F4) {
-            screen = match screen {
-                AppScreen::Editor => AppScreen::InGame,
-                _ => AppScreen::Editor,
-            };
-            // A board edited after a non-campaign run is an editor test, not that run.
-            if screen == AppScreen::Editor && session.source != PlaySource::Campaign {
-                session.source = PlaySource::EditorTest;
-            }
-            world.reset_paddle_and_ball();
-            world.status = SessionStatus::Playing;
+            toggle_editor(&mut screen, &mut session, &mut world);
         }
         if is_key_pressed(KeyCode::Tab) {
             if menu.renderer_dirty() {
@@ -674,7 +715,7 @@ async fn main() {
                 _ => AppScreen::TitleMenu,
             };
             if screen == AppScreen::TitleMenu {
-                menu.open_home();
+                menu.open_home(arena_pointer);
             }
         }
         if is_key_pressed(KeyCode::M) {
@@ -753,10 +794,11 @@ async fn main() {
                 screen = AppScreen::InGame;
             }
             if screen == AppScreen::InGame {
-                if DEV_POWERUP_PREV_KEYS.iter().any(|k| is_key_pressed(*k)) {
+                let menu_shown = menu_is_visible(screen, world.status);
+                if dev_powerup_pressed(&DEV_POWERUP_PREV_KEYS, menu_shown) {
                     dev_state.cycle_powerup(false);
                 }
-                if DEV_POWERUP_NEXT_KEYS.iter().any(|k| is_key_pressed(*k)) {
+                if dev_powerup_pressed(&DEV_POWERUP_NEXT_KEYS, menu_shown) {
                     dev_state.cycle_powerup(true);
                 }
                 if is_key_pressed(DEV_APPLY_KEY) {
@@ -863,6 +905,13 @@ async fn main() {
         }
 
         if screen != AppScreen::Editor {
+            // The high score only matters while the menu shows it; keying on it during play
+            // would rebuild the whole model on every new record.
+            let shown_high_score = if menu_is_visible(screen, world.status) {
+                world.high_score
+            } else {
+                0
+            };
             let key = MenuModelKey {
                 language: lang,
                 max_unlocked: world.max_unlocked_level,
@@ -872,6 +921,7 @@ async fn main() {
                 music_on: sfx.music_enabled,
                 library_len: library.entries.len(),
                 library_next_id: library.next_id,
+                high_score: shown_high_score,
             };
             menu_model.get(key, || {
                 build_menu_model(&MenuModelSource {
@@ -887,6 +937,7 @@ async fn main() {
                     renderer_name: i18n.t(&theme.name_key).to_owned(),
                     sfx_on: !sfx.muted,
                     music_on: sfx.music_enabled,
+                    high_score: shown_high_score,
                 })
             });
         }
@@ -929,14 +980,6 @@ async fn main() {
                             if is_sector_unlocked(idx, world.max_unlocked_level)
                                 && idx < level_pack.levels.len() =>
                         {
-                            if menu.renderer_dirty() {
-                                save_tracker.persist(
-                                    &world,
-                                    theme_idx,
-                                    lang == Language::Fr,
-                                    now_sec,
-                                );
-                            }
                             session.source = PlaySource::Campaign;
                             start_run_from_title(
                                 &mut world,
@@ -946,7 +989,7 @@ async fn main() {
                                 session.source,
                             );
                             last_started_sector = Some(idx);
-                            menu.open_home();
+                            menu.open_home(arena_pointer);
                             screen = AppScreen::InGame;
                         }
                         MenuAction::StartSatisfaction(idx)
@@ -957,15 +1000,7 @@ async fn main() {
                                 idx,
                             ) =>
                         {
-                            if menu.renderer_dirty() {
-                                save_tracker.persist(
-                                    &world,
-                                    theme_idx,
-                                    lang == Language::Fr,
-                                    now_sec,
-                                );
-                            }
-                            menu.open_home();
+                            menu.open_home(arena_pointer);
                             screen = AppScreen::InGame;
                         }
                         MenuAction::PlayLibrary(id) => {
@@ -973,7 +1008,7 @@ async fn main() {
                             if let Some(entry) = entry {
                                 match start_library_level(&mut session, &mut world, entry) {
                                     Ok(()) => {
-                                        menu.open_home();
+                                        menu.open_home(arena_pointer);
                                         screen = AppScreen::InGame;
                                     }
                                     Err(err) => popups.push(error_popup(i18n, &err)),
@@ -988,17 +1023,9 @@ async fn main() {
                             push_library_toast(&mut popups, i18n, theme, &outcome);
                         }
                         MenuAction::OpenEditor => {
-                            if menu.renderer_dirty() {
-                                save_tracker.persist(
-                                    &world,
-                                    theme_idx,
-                                    lang == Language::Fr,
-                                    now_sec,
-                                );
-                            }
-                            menu.open_home();
-                            session.source = PlaySource::EditorTest;
-                            enter_empty_editor(&mut screen, &mut world);
+                            reload_library_if_unloaded(&mut library);
+                            menu.open_home(arena_pointer);
+                            enter_empty_editor(&mut screen, &mut session, &mut world);
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         MenuAction::QuitApp => {
@@ -1072,6 +1099,7 @@ async fn main() {
                     });
                 }
                 if is_key_pressed(KeyCode::S) {
+                    reload_library_if_unloaded(&mut library);
                     let outcome = save_board_to_library(
                         &mut library,
                         world.export_level_code(),
@@ -1114,24 +1142,23 @@ async fn main() {
                     };
                 }
                 if is_key_pressed(KeyCode::R) {
-                    restart_current(
+                    if let RestartOutcome::ToTitle(page) = restart_current(
                         &session,
                         &mut world,
                         &mut dev_state,
                         &level_pack.levels,
                         &satisfaction_levels.levels,
                         &library,
-                    );
+                    ) {
+                        open_menu_page(&mut menu, menu_model.current(), page, arena_pointer);
+                        screen = AppScreen::TitleMenu;
+                    }
                 }
 
                 // The pause menu drives the paused session. A frame it handled never fires or
                 // launches, so a Space that activates Resume does not also launch the ball.
                 let pause_menu_shown = world.status == SessionStatus::Paused;
                 if pause_menu_shown {
-                    if !pause_menu_open {
-                        menu.open_pause();
-                        pause_menu_open = true;
-                    }
                     let pointer = pointer_frame(
                         (mx, my),
                         is_mouse_button_pressed(MouseButton::Left),
@@ -1145,6 +1172,12 @@ async fn main() {
                         dev_enter_consumed,
                         dev_esc_consumed,
                     );
+                    if !pause_menu_open {
+                        // The pointer is wherever it was when the pause began: only a real move
+                        // from there changes the focused button.
+                        menu.open_pause(input.pointer);
+                        pause_menu_open = true;
+                    }
                     menu_pointer = input.pointer;
                     let action = menu.update(&input, menu_model.current());
                     let handled = apply_settings_action(
@@ -1159,8 +1192,8 @@ async fn main() {
                             now_sec,
                         },
                     );
-                    if !handled
-                        && apply_session_pause_action(
+                    if !handled {
+                        match apply_session_pause_action(
                             action,
                             &session,
                             &mut world,
@@ -1168,14 +1201,24 @@ async fn main() {
                             &level_pack.levels,
                             &satisfaction_levels.levels,
                             &library,
-                        ) == PauseOutcome::ToTitle
-                    {
-                        if menu.renderer_dirty() {
-                            save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
+                        ) {
+                            PauseOutcome::ToTitle => {
+                                menu.open_home(arena_pointer);
+                                pause_menu_open = false;
+                                screen = AppScreen::TitleMenu;
+                            }
+                            PauseOutcome::ToTitlePage(page) => {
+                                open_menu_page(
+                                    &mut menu,
+                                    menu_model.current(),
+                                    page,
+                                    arena_pointer,
+                                );
+                                pause_menu_open = false;
+                                screen = AppScreen::TitleMenu;
+                            }
+                            PauseOutcome::None | PauseOutcome::Resumed => {}
                         }
-                        menu.open_home();
-                        pause_menu_open = false;
-                        screen = AppScreen::TitleMenu;
                     }
                 } else if pause_menu_open {
                     // Resumed with P while a previewed renderer was still unsaved.
@@ -1226,28 +1269,40 @@ async fn main() {
                             match outcome {
                                 VictoryOutcome::NextLevel => {}
                                 VictoryOutcome::ToTitle(page) => {
-                                    open_menu_page(&mut menu, menu_model.current(), page);
+                                    open_menu_page(
+                                        &mut menu,
+                                        menu_model.current(),
+                                        page,
+                                        arena_pointer,
+                                    );
                                     screen = AppScreen::TitleMenu;
                                 }
                                 VictoryOutcome::ToEditor => {
                                     // A custom board has no next sector: back to the editor.
                                     screen = AppScreen::Editor;
-                                    world.reset_paddle_and_ball();
-                                    world.status = SessionStatus::Playing;
+                                    enter_editor(&mut session, &mut world);
                                 }
                             }
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                         }
                         SessionStatus::GameOver => {
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                            restart_current(
+                            if let RestartOutcome::ToTitle(page) = restart_current(
                                 &session,
                                 &mut world,
                                 &mut dev_state,
                                 &level_pack.levels,
                                 &satisfaction_levels.levels,
                                 &library,
-                            );
+                            ) {
+                                open_menu_page(
+                                    &mut menu,
+                                    menu_model.current(),
+                                    page,
+                                    arena_pointer,
+                                );
+                                screen = AppScreen::TitleMenu;
+                            }
                         }
                         SessionStatus::Paused => {}
                     }
@@ -1308,7 +1363,12 @@ async fn main() {
         } else {
             MenuPlay::default()
         };
-        let resume_mask = resume_mask_for(screen, world.status, menu_play);
+        let resume_mask = resume_mask_for(
+            screen,
+            world.status,
+            menu_play,
+            victory_continues(session.source, &world, satisfaction_levels.levels.len()),
+        );
         if last_resume_mask != Some(resume_mask) {
             set_resume_mask(resume_mask);
             last_resume_mask = Some(resume_mask);
@@ -1657,6 +1717,7 @@ async fn main() {
             &level_pack.levels,
             &satisfaction_levels.levels,
             &library,
+            i18n.t("menu.home.button.editor"),
         );
         if !menu_visible {
             draw_popups(&popups, &ui_font);
@@ -2408,7 +2469,7 @@ fn draw_hud(ctx: &HudContext) {
         return;
     }
 
-    if world.level_elapsed >= world.config.gameplay.sudden_death_time_sec {
+    if sudden_death_banner_due(world) {
         txt(
             font,
             i18n.t("status.sudden_death"),
@@ -2753,6 +2814,7 @@ mod tests {
                 AppScreen::TitleMenu,
                 SessionStatus::Paused,
                 MenuPlay { click, key },
+                true,
             )
         };
         let none = mask(false, false);
@@ -2772,7 +2834,8 @@ mod tests {
             resume_mask_for(
                 AppScreen::TitleMenu,
                 SessionStatus::Playing,
-                MenuPlay::default()
+                MenuPlay::default(),
+                true
             ) & RESUME_TAB,
             0
         );
@@ -2784,7 +2847,8 @@ mod tests {
             resume_mask_for(
                 AppScreen::InGame,
                 SessionStatus::Playing,
-                MenuPlay::default()
+                MenuPlay::default(),
+                true
             ),
             0
         );
@@ -2792,19 +2856,22 @@ mod tests {
             AppScreen::InGame,
             SessionStatus::Paused,
             MenuPlay::default(),
+            true,
         );
         assert_eq!(paused, RESUME_P | RESUME_R | RESUME_CHEAT_MASK);
         let over = resume_mask_for(
             AppScreen::InGame,
             SessionStatus::GameOver,
             MenuPlay::default(),
+            true,
         );
         assert_eq!(
             over,
             resume_mask_for(
                 AppScreen::InGame,
                 SessionStatus::Victory,
-                MenuPlay::default()
+                MenuPlay::default(),
+                true
             )
         );
         assert_eq!(over & RESUME_P, 0);
@@ -2817,23 +2884,30 @@ mod tests {
             key: true,
         };
         assert_ne!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing, click_play)
-                & RESUME_CLICK,
+            resume_mask_for(
+                AppScreen::TitleMenu,
+                SessionStatus::Playing,
+                click_play,
+                true
+            ) & RESUME_CLICK,
             0
         );
         assert_ne!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing, key_play) & RESUME_TAB,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Playing, key_play, true)
+                & RESUME_TAB,
             0
         );
         assert_eq!(
-            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused, key_play) & RESUME_TAB,
+            resume_mask_for(AppScreen::TitleMenu, SessionStatus::Paused, key_play, true)
+                & RESUME_TAB,
             0
         );
         assert_eq!(
             resume_mask_for(
                 AppScreen::Editor,
                 SessionStatus::Playing,
-                MenuPlay::default()
+                MenuPlay::default(),
+                true
             ),
             RESUME_F4 | RESUME_CHEAT_MASK
         );
@@ -2846,6 +2920,7 @@ mod tests {
                 AppScreen::InGame,
                 SessionStatus::Paused,
                 MenuPlay { click, key },
+                true,
             )
         };
         let base = RESUME_P | RESUME_R | RESUME_CHEAT_MASK;
@@ -2863,7 +2938,7 @@ mod tests {
         use kinetix_app::menu::{Menu, MenuInput, MenuModel};
         let model = MenuModel::empty();
         let mut menu = Menu::new();
-        menu.open_pause();
+        menu.open_pause(None);
         // Resume is focused first and starts play; Escape does nothing on the pause page.
         assert!(menu.focused_starts_play(&model));
         let escape = MenuInput {
@@ -3026,5 +3101,125 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_victory_that_returns_to_the_title_does_not_ask_for_the_pointer_lock() {
+        let mask = |status, continues| {
+            resume_mask_for(AppScreen::InGame, status, MenuPlay::default(), continues)
+        };
+        let to_next = mask(SessionStatus::Victory, true);
+        assert_eq!(
+            to_next & (RESUME_CLICK | RESUME_SPACE),
+            RESUME_CLICK | RESUME_SPACE
+        );
+        let to_title = mask(SessionStatus::Victory, false);
+        assert_eq!(to_title & (RESUME_CLICK | RESUME_SPACE), 0);
+        assert_eq!(to_title, RESUME_R | RESUME_CHEAT_MASK);
+        // A game over always restarts the board, whatever the source.
+        assert_eq!(
+            mask(SessionStatus::GameOver, false),
+            mask(SessionStatus::GameOver, true)
+        );
+        assert_ne!(mask(SessionStatus::GameOver, false) & RESUME_CLICK, 0);
+    }
+
+    #[test]
+    fn the_resume_mask_after_a_win_follows_the_source() {
+        use kinetix_app::satisfaction::satisfaction_pack;
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let satisfaction = satisfaction_pack().levels;
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.load_pack_level(0, &pack.levels, PlaySource::Campaign.pack_rules());
+        assert!(victory_continues(
+            PlaySource::Campaign,
+            &world,
+            satisfaction.len()
+        ));
+        let last = satisfaction.len() - 1;
+        world.load_pack_level(last, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        assert!(!victory_continues(
+            PlaySource::Satisfaction,
+            &world,
+            satisfaction.len()
+        ));
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        assert!(victory_continues(
+            PlaySource::Satisfaction,
+            &world,
+            satisfaction.len()
+        ));
+        assert!(!victory_continues(
+            PlaySource::Library(1),
+            &world,
+            satisfaction.len()
+        ));
+    }
+
+    #[test]
+    fn f4_into_the_editor_always_leaves_the_campaign_source() {
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.load_pack_level(0, &pack.levels, PlaySource::Campaign.pack_rules());
+        let mut session = Session::campaign();
+        let mut screen = AppScreen::InGame;
+
+        toggle_editor(&mut screen, &mut session, &mut world);
+        assert!(screen == AppScreen::Editor);
+        assert_eq!(session.source, PlaySource::EditorTest);
+        assert!(session.editor_snapshot.is_none());
+
+        toggle_editor(&mut screen, &mut session, &mut world);
+        assert!(screen == AppScreen::InGame);
+        assert_eq!(session.source, PlaySource::EditorTest);
+        assert!(session.editor_snapshot.is_some(), "the test board is kept");
+        assert_eq!(world.status, SessionStatus::Playing);
+    }
+
+    #[test]
+    fn sudden_death_banner_follows_the_pack_rules_and_the_timer() {
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        let satisfaction = kinetix_app::satisfaction::satisfaction_pack().levels;
+        let mut world = GameWorld::new(config, &pack.levels);
+        world.load_pack_level(0, &pack.levels, PlaySource::Campaign.pack_rules());
+        assert!(
+            !sudden_death_banner_due(&world),
+            "the timer has not run out"
+        );
+        world.level_elapsed = world.config.gameplay.sudden_death_time_sec;
+        assert!(sudden_death_banner_due(&world));
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        world.level_elapsed = world.config.gameplay.sudden_death_time_sec * 2.0;
+        assert!(
+            !sudden_death_banner_due(&world),
+            "no banner without sudden death"
+        );
+    }
+
+    #[test]
+    fn up_and_down_cycle_the_dev_powerup_only_when_no_menu_is_shown() {
+        for key in [KeyCode::Up, KeyCode::Down] {
+            assert!(dev_key_cycles_powerup(key, false));
+            assert!(!dev_key_cycles_powerup(key, true));
+        }
+        for key in [KeyCode::LeftBracket, KeyCode::RightBracket] {
+            assert!(dev_key_cycles_powerup(key, true));
+        }
+    }
+
+    #[test]
+    fn the_title_glyph_size_is_not_preloaded_for_the_full_charset() {
+        for dpi in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            let sizes = full_charset_sizes(dpi);
+            assert!(!sizes.is_empty());
+            assert!(
+                !sizes.contains(&physical_font_size(SIZE_HOME_TITLE, dpi)),
+                "title size at dpi {dpi}"
+            );
+        }
+        assert!(!MENU_FONT_SIZES.contains(&SIZE_HOME_TITLE));
     }
 }

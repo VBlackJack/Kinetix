@@ -4,16 +4,8 @@
     "subtitle": "Casse-Briques Moderne Haute Vélocité"
   },
   "menu": {
-    "play": "CLIQUEZ OU APPUYEZ SUR [ENTRÉE / ESPACE] POUR LANCER LA CAMPAGNE",
-    "campaigns": "CHOIX DU MONDE ([GAUCHE / DROITE] ou [1-{count}])",
-    "sector_select": "SECTEUR [HAUT/BAS] [PG.PREC/SUIV] [DÉBUT/FIN] :",
     "sector_range": "(Secteurs {first}-{last})",
-    "editor_btn": "[F4] ARCHITECTE DE NIVEAU (ÉDITEUR)",
-    "theme_btn": "[F1] MOTEUR DE RENDU",
-    "lang_btn": "[F2] LANGUE",
-    "music_btn": "[B] MUSIQUE DYNAMIQUE",
-    "locked": "VERROUILLÉ",
-    "best_score": "RECORD ABSOLU",
+    "best_score": "RECORD ABSOLU : {score}",
     "home": {
       "button": {
         "campaign": "CAMPAGNE",
@@ -25,7 +17,9 @@
     },
     "common": {
       "button": {
-        "back": "RETOUR"
+        "back": "RETOUR",
+        "prev_page": "PRÉC.",
+        "next_page": "SUIV."
       }
     },
     "chapters": {
@@ -81,7 +75,8 @@
       "button": {
         "new": "NOUVEAU NIVEAU",
         "play": "JOUER",
-        "delete": "SUPPRIMER"
+        "delete": "SUPPRIMER",
+        "confirm_delete": "CONFIRMER ?"
       },
       "label": {
         "empty": "AUCUN NIVEAU SAUVEGARDÉ",

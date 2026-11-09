@@ -67,6 +67,8 @@ pub struct MenuModel {
     pub renderer_name: String,
     pub sfx_on: bool,
     pub music_on: bool,
+    /// Best score of the saved campaign progress, shown on the Home page.
+    pub high_score: u64,
 }
 
 impl MenuModel {
@@ -82,6 +84,7 @@ impl MenuModel {
             renderer_name: String::new(),
             sfx_on: true,
             music_on: true,
+            high_score: 0,
         }
     }
 }

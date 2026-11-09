@@ -864,3 +864,17 @@ fn sudden_death_on_still_strikes() {
     assert!(sudden_death_strikes(PackRules::CAMPAIGN));
     assert!(sudden_death_strikes(PackRules::non_campaign(true)));
 }
+
+#[test]
+fn the_sudden_death_getter_follows_the_pack_rules_and_editor_edits() {
+    let lv = levels();
+    let mut w = world();
+    assert!(w.sudden_death_enabled());
+    w.load_pack_level(0, &lv, PackRules::non_campaign(false));
+    assert!(!w.sudden_death_enabled());
+    w.load_pack_level(0, &lv, PackRules::CAMPAIGN);
+    assert!(w.sudden_death_enabled());
+    w.load_pack_level(0, &lv, PackRules::non_campaign(false));
+    w.clear_bricks();
+    assert!(w.sudden_death_enabled(), "an edited board has sudden death");
+}

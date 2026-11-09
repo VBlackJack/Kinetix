@@ -19,8 +19,8 @@
 use crate::tuning::*;
 use kinetix_app::library::{Library, MAX_LIBRARY_LEVELS};
 use kinetix_app::menu::{
-    Activation, LibraryEntry as MenuLibraryEntry, LibraryId, Menu, MenuInput, MenuModel, PageId,
-    SectorRow, WorldRow,
+    LibraryEntry as MenuLibraryEntry, LibraryId, Menu, MenuInput, MenuModel, PageId, SectorRow,
+    WorldRow,
 };
 use kinetix_core::config::LevelDef;
 use kinetix_core::i18n::{I18nCatalog, Language};
@@ -112,6 +112,8 @@ pub(crate) struct MenuModelSource<'a> {
     pub(crate) renderer_name: String,
     pub(crate) sfx_on: bool,
     pub(crate) music_on: bool,
+    /// Best score of the saved campaign progress.
+    pub(crate) high_score: u64,
 }
 
 /// Row text of a sector: its id and name, without the title screen prefix.
@@ -191,34 +193,19 @@ pub(crate) fn build_menu_model(source: &MenuModelSource) -> MenuModel {
         renderer_name: source.renderer_name.clone(),
         sfx_on: source.sfx_on,
         music_on: source.music_on,
+        high_score: source.high_score,
     }
 }
 
-/// Shows the Home page, then opens `target` the way a player would: by clicking the Home button
-/// that leads to it. The menu stays on Home when no enabled button leads there.
-pub(crate) fn open_menu_page(menu: &mut Menu, model: &MenuModel, target: PageId) {
-    menu.open_home();
-    let layout = menu.layout(model);
-    let Some(button) = layout
-        .widgets
-        .iter()
-        .find(|w| w.enabled && w.activation == Activation::Navigate(target))
-    else {
-        return;
-    };
-    let point = Some((
-        button.rect.x + button.rect.w * 0.5,
-        button.rect.y + button.rect.h * 0.5,
-    ));
-    for (pressed, released) in [(true, false), (false, true)] {
-        let click = MenuInput {
-            pointer: point,
-            pointer_pressed: pressed,
-            pointer_released: released,
-            ..MenuInput::default()
-        };
-        menu.update(&click, model);
-    }
+/// Shows `target` with Back leading to Home (see `Menu::open_page`); `pointer` is where the
+/// pointer already is, so it does not steal focus until it moves.
+pub(crate) fn open_menu_page(
+    menu: &mut Menu,
+    model: &MenuModel,
+    target: PageId,
+    pointer: Option<(f32, f32)>,
+) {
+    menu.open_page(target, model, pointer);
 }
 
 /// What the cached menu model depends on: the model is rebuilt only when this changes.
@@ -232,6 +219,7 @@ pub(crate) struct MenuModelKey {
     pub(crate) music_on: bool,
     pub(crate) library_len: usize,
     pub(crate) library_next_id: u32,
+    pub(crate) high_score: u64,
 }
 
 /// The last built menu model and the key it was built for.
@@ -318,14 +306,22 @@ pub(crate) fn pointer_frame(
     }
 }
 
+/// Page keys implied by a mouse wheel movement of the frame: wheel up shows the previous list
+/// page, wheel down the next one. Returns `(page_up, page_down)`.
+pub(crate) fn wheel_paging(wheel_y: f32) -> (bool, bool) {
+    (wheel_y > 0.0, wheel_y < 0.0)
+}
+
 /// Builds the menu input of the frame: keyboard edges plus the pointer, in arena coordinates.
-/// Enter and Escape are dropped when developer sector entry consumed them this frame.
+/// The mouse wheel counts as Page Up / Page Down. Enter and Escape are dropped when developer
+/// sector entry consumed them this frame.
 pub(crate) fn read_menu_input(
     pointer: PointerFrame,
     to_arena: impl Fn(f32, f32) -> (f32, f32),
     dev_enter_consumed: bool,
     dev_esc_consumed: bool,
 ) -> MenuInput {
+    let (wheel_up, wheel_down) = wheel_paging(mouse_wheel().1);
     let input = MenuInput {
         pointer: pointer.position.map(|(x, y)| to_arena(x, y)),
         pointer_pressed: pointer.pressed,
@@ -334,8 +330,8 @@ pub(crate) fn read_menu_input(
         down: is_key_pressed(KeyCode::Down),
         left: is_key_pressed(KeyCode::Left),
         right: is_key_pressed(KeyCode::Right),
-        page_up: is_key_pressed(KeyCode::PageUp),
-        page_down: is_key_pressed(KeyCode::PageDown),
+        page_up: is_key_pressed(KeyCode::PageUp) || wheel_up,
+        page_down: is_key_pressed(KeyCode::PageDown) || wheel_down,
         home: is_key_pressed(KeyCode::Home),
         end: is_key_pressed(KeyCode::End),
         enter: is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::Space),
@@ -389,19 +385,27 @@ mod tests {
     fn open_menu_page_reaches_the_satisfaction_and_library_pages() {
         let model = menu_model_with_content();
         let mut menu = Menu::new();
-        open_menu_page(&mut menu, &model, PageId::Satisfaction);
+        open_menu_page(&mut menu, &model, PageId::Satisfaction, None);
         assert_eq!(menu.page(), PageId::Satisfaction);
-        open_menu_page(&mut menu, &model, PageId::Library);
+        open_menu_page(&mut menu, &model, PageId::Library, None);
         assert_eq!(menu.page(), PageId::Library);
         assert!(menu.can_go_back(), "Back leads to Home");
     }
 
     #[test]
-    fn open_menu_page_stays_on_home_when_no_button_leads_there() {
+    fn open_menu_page_opens_the_pause_page_as_its_own_root() {
         let model = menu_model_with_content();
         let mut menu = Menu::new();
-        open_menu_page(&mut menu, &model, PageId::Pause);
-        assert_eq!(menu.page(), PageId::Home);
+        open_menu_page(&mut menu, &model, PageId::Pause, None);
+        assert_eq!(menu.page(), PageId::Pause);
+        assert!(!menu.can_go_back());
+    }
+
+    #[test]
+    fn wheel_movement_maps_to_the_page_keys() {
+        assert_eq!(wheel_paging(0.0), (false, false));
+        assert_eq!(wheel_paging(1.0), (true, false));
+        assert_eq!(wheel_paging(-2.5), (false, true));
     }
 
     #[test]
@@ -503,6 +507,7 @@ mod tests {
             renderer_name: "R".to_owned(),
             sfx_on: false,
             music_on: true,
+            high_score: 4200,
         })
     }
 
@@ -525,6 +530,7 @@ mod tests {
         assert_eq!(model.language, Language::Fr);
         assert_eq!(model.renderer_name, "R");
         assert_eq!(model.library_max, MAX_LIBRARY_LEVELS);
+        assert_eq!(model.high_score, 4200);
     }
 
     #[test]
@@ -579,6 +585,7 @@ mod tests {
             music_on: true,
             library_len: 0,
             library_next_id: 1,
+            high_score: 0,
         };
         let mut cache = MenuModelCache::new();
         assert!(cache.current().worlds.is_empty());
