@@ -82,7 +82,6 @@ mod tests {
         let exported = world.export_level_code();
         assert!(exported.starts_with("KTX1:"));
         assert!(world.import_level_code(&exported).is_ok());
-        assert_eq!(levels.levels.len(), 15);
     }
 
     fn flatten_keys(
@@ -103,6 +102,221 @@ mod tests {
             }
             _ => {
                 out.insert(prefix.to_string());
+            }
+        }
+    }
+
+    /// Content of the legacy levels: (name, boss flag, rows), in campaign order.
+    type LegacyLevel = (&'static str, bool, &'static [&'static str]);
+
+    #[test]
+    fn legacy_levels_keep_their_content() {
+        let expected: [LegacyLevel; 15] = [
+            (
+                "FIRST SPARK",
+                false,
+                &[
+                    "111222333222111",
+                    "1002E23332E2001",
+                    "444444555444444",
+                    "00333E666E33300",
+                    "222200111002222",
+                    "5500550E0550055",
+                ],
+            ),
+            (
+                "REACTOR CORE",
+                false,
+                &[
+                    "##11122222111##",
+                    "#333E44E44E333#",
+                    "220055EEE550022",
+                    "220055EEE550022",
+                    "#444E33E33E444#",
+                    "##11166666111##",
+                ],
+            ),
+            (
+                "OVERDRIVE MATRIX",
+                false,
+                &[
+                    "6E601E102E203E3",
+                    "666011102220333",
+                    "0000###0###0000",
+                    "444E555E444E555",
+                    "1234561E1654321",
+                    "111111111111111",
+                ],
+            ),
+            (
+                "PRISM FORTRESS",
+                false,
+                &[
+                    "###555EEE555###",
+                    "#220044E440022#",
+                    "3300660E0660033",
+                    "3300660E0660033",
+                    "#220044E440022#",
+                    "###111222111###",
+                ],
+            ),
+            (
+                "IGNITION WARDEN [BOSS]",
+                true,
+                &[
+                    "000000000000000",
+                    "000000000000000",
+                    "000000000000000",
+                    "##222E000E222##",
+                    "111100###001111",
+                ],
+            ),
+            (
+                "PORTAL NEXUS",
+                false,
+                &[
+                    "T00555EEE55500T",
+                    "111222000222111",
+                    "00#444GGG444#00",
+                    "333000EEE000333",
+                    "T0022211122200T",
+                    "111000###000111",
+                ],
+            ),
+            (
+                "PHANTOM CARRIER",
+                false,
+                &[
+                    "GGGGGGEEEGGGGGG",
+                    "00MMM00000MMM00",
+                    "222E333T333E222",
+                    "00MMM00000MMM00",
+                    "GGGG444T444GGGG",
+                    "111222333222111",
+                ],
+            ),
+            (
+                "CONVEYOR BELT",
+                false,
+                &[
+                    "MMMMM0EEE0MMMMM",
+                    "000000###000000",
+                    "T0555E666E5550T",
+                    "000000###000000",
+                    "MMMMM0EEE0MMMMM",
+                    "222333444333222",
+                ],
+            ),
+            (
+                "EVENT HORIZON",
+                false,
+                &[
+                    "#T#666EEE666#T#",
+                    "GGG0055E5500GGG",
+                    "00MMM0TTT0MMM00",
+                    "444E3330333E444",
+                    "GGG0022E2200GGG",
+                    "1111111E1111111",
+                ],
+            ),
+            (
+                "CHRONO ARCHON [BOSS]",
+                true,
+                &[
+                    "000000000000000",
+                    "000000000000000",
+                    "000000000000000",
+                    "T00GGGEEEGGG00T",
+                    "##MMM0###0MMM##",
+                ],
+            ),
+            (
+                "ANVIL FOUNDRY",
+                false,
+                &[
+                    "###666EEE666###",
+                    "MMM555#T#555MMM",
+                    "666E4440444E666",
+                    "GGG333#T#333GGG",
+                    "MMM222EEE222MMM",
+                    "111555666555111",
+                ],
+            ),
+            (
+                "TESLA COIL",
+                false,
+                &[
+                    "T0E0T0E0E0T0E0T",
+                    "666666###666666",
+                    "00MMMMMEMMMMM00",
+                    "GGGGGG###GGGGGG",
+                    "555E444T444E555",
+                    "222333444333222",
+                ],
+            ),
+            (
+                "SPECTRAL VAULT",
+                false,
+                &[
+                    "#####T###T#####",
+                    "#GGGGGGGGGGGGG#",
+                    "#G666E555E666G#",
+                    "#G555EEEE5555G#",
+                    "#GGGGGGGGGGGGG#",
+                    "##MMM22222MMM##",
+                ],
+            ),
+            (
+                "SINGULARITY RING",
+                false,
+                &[
+                    "66E660TTT066E66",
+                    "600060MMM060006",
+                    "E0T0E0GGG0E0T0E",
+                    "600060MMM060006",
+                    "66E660###066E66",
+                    "555555EEE555555",
+                ],
+            ),
+            (
+                "OMEGA EMPEROR [FINAL BOSS]",
+                true,
+                &[
+                    "000000000000000",
+                    "000000000000000",
+                    "000000000000000",
+                    "T0MMM6EEE6MMM0T",
+                    "##GGG5###5GGG##",
+                ],
+            ),
+        ];
+        let levels: LevelPack =
+            serde_json::from_str(include_str!("../../../assets/config/levels.json"))
+                .expect("valid levels.json");
+        assert!(levels.levels.len() >= expected.len());
+        for (idx, (name, boss, rows)) in expected.iter().enumerate() {
+            let level = &levels.levels[idx];
+            assert_eq!(level.id, idx + 1, "id of legacy level {idx}");
+            assert_eq!(level.name, *name, "name of legacy level {idx}");
+            assert_eq!(level.boss, *boss, "boss flag of legacy level {idx}");
+            assert_eq!(level.rows, *rows, "rows of legacy level {idx}");
+        }
+    }
+
+    #[test]
+    fn every_world_in_the_level_pack_has_a_campaign_label() {
+        let levels: LevelPack =
+            serde_json::from_str(include_str!("../../../assets/config/levels.json"))
+                .expect("valid levels.json");
+        let locales = [
+            ("en", include_str!("../../../assets/locales/en.json")),
+            ("fr", include_str!("../../../assets/locales/fr.json")),
+        ];
+        for (name, raw) in locales {
+            let catalog = I18nCatalog::from_json_str(raw).expect("valid locale");
+            for level in &levels.levels {
+                let key = format!("campaigns.c{}", level.world);
+                assert_ne!(catalog.t(&key), key, "{name}.json lacks {key}");
             }
         }
     }

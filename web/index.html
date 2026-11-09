@@ -173,13 +173,13 @@
         };
         importObject.env.kinetix_load_packed = function () {
           try {
-            const u = (parseInt(localStorage.getItem("kinetix_unlocked") || "0", 10) || 0) & 0xFF;
+            const u = (parseInt(localStorage.getItem("kinetix_unlocked") || "0", 10) || 0) & 0xFFFF;
             const t = (parseInt(localStorage.getItem("kinetix_theme") || "0", 10) || 0) & 0xFF;
             const storedLang = localStorage.getItem("kinetix_lang");
             const l = storedLang === null
               ? (/^fr/i.test(navigator.language || "") ? 1 : 0)
-              : ((parseInt(storedLang, 10) || 0) & 0xFF);
-            return u | (t << 8) | (l << 16);
+              : ((parseInt(storedLang, 10) || 0) & 0x1);
+            return u | (t << 16) | (l << 24);
           } catch (_) {
             return 0;
           }

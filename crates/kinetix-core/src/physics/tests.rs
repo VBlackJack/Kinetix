@@ -38,15 +38,7 @@ fn standard(hp: u8, max_hp: u8, color_idx: usize) -> BrickKind {
 }
 
 fn brick(x: f32, y: f32, kind: BrickKind) -> Brick {
-    Brick {
-        x,
-        y,
-        w: 100.0,
-        h: BRICK_HEIGHT,
-        vx: 0.0,
-        kind,
-        hit_flash: 0.0,
-    }
+    Brick::new(x, y, 100.0, BRICK_HEIGHT, 0.0, kind, 0.0)
 }
 
 /// World with no bricks, no boss and one free ball at (x, y) moving along (vx, vy).
@@ -659,4 +651,164 @@ fn non_destroying_hits_report_no_multiplier() {
             ..
         })
     ));
+}
+
+#[test]
+fn bumper_brick_boosts_ball_speed_temporarily_and_takes_two_hits() {
+    let mut w = empty_world(950.0, 400.0 - 9.0 + 2.0, 0.0, 1.0);
+    w.bricks.push(brick(
+        900.0,
+        400.0,
+        BrickKind::Bumper {
+            hp: BUMPER_BRICK_HP,
+        },
+    ));
+    let base = w.balls[0].speed;
+    let boost = w.config.ball.bumper_speed_boost;
+    step(&mut w, 1);
+    assert_eq!(w.bricks.len(), 1);
+    assert!(matches!(w.bricks[0].kind, BrickKind::Bumper { hp: 1 }));
+    assert!(
+        (w.balls[0].speed - base).abs() < EPS,
+        "the bumper must not change the base speed, got {}",
+        w.balls[0].speed
+    );
+    assert!(
+        w.balls[0].boost > boost * 0.9 && w.balls[0].boost <= boost,
+        "expected bumper boost, got {}",
+        w.balls[0].boost
+    );
+    let mut events = Vec::new();
+    assert!(w.damage_brick(0, false, &mut events));
+    assert!(w.bricks.is_empty());
+}
+
+#[test]
+fn bumper_boost_decays_back_to_the_base_speed() {
+    let mut w = empty_world(960.0, 700.0, 0.0, -1.0);
+    // Keep the level alive and the ball parked so only the decay is observed.
+    w.bricks.push(brick(900.0, 300.0, standard(1, 1, 0)));
+    w.balls[0].stuck_offset = Some(0.0);
+    let base = w.balls[0].speed;
+    w.balls[0].boost = w.config.ball.bumper_speed_boost;
+    let max = w.config.ball.max_speed;
+    assert!(w.balls[0].effective_speed(max) > base);
+    let decay_sec = w.config.ball.bumper_boost_decay_sec;
+    let mut events = Vec::new();
+    // Half the decay time leaves about half of the boost.
+    let half_frames = (decay_sec * 0.5 / BOSS_PIN_DT).round() as usize;
+    for _ in 0..half_frames {
+        w.update(BOSS_PIN_DT, &mut events);
+    }
+    let remaining = w.balls[0].boost / w.config.ball.bumper_speed_boost;
+    assert!((remaining - 0.5).abs() < 0.05, "remaining {remaining}");
+    // Past the full decay time the ball is back to its base speed.
+    let rest_frames = (decay_sec * 0.5 / BOSS_PIN_DT).round() as usize + 2;
+    for _ in 0..rest_frames {
+        w.update(BOSS_PIN_DT, &mut events);
+    }
+    assert_eq!(w.balls[0].boost, 0.0);
+    assert!((w.balls[0].effective_speed(max) - base).abs() < EPS);
+}
+
+#[test]
+fn bumper_boost_never_exceeds_the_speed_cap_and_slow_scales_base_only() {
+    let mut w = empty_world(950.0, 400.0 - 9.0 + 2.0, 0.0, 1.0);
+    let max = w.config.ball.max_speed;
+    w.balls[0].speed = max - 10.0;
+    w.bricks.push(brick(
+        900.0,
+        400.0,
+        BrickKind::Bumper {
+            hp: BUMPER_BRICK_HP,
+        },
+    ));
+    step(&mut w, 1);
+    assert!((w.balls[0].boost - 10.0).abs() < EPS);
+    assert!((w.balls[0].effective_speed(max) - max).abs() < EPS);
+
+    let boost = w.balls[0].boost;
+    let base = w.balls[0].speed;
+    w.apply_powerup(PowerUpKind::Slow);
+    assert!((w.balls[0].boost - boost).abs() < EPS);
+    assert!((w.balls[0].speed - base * w.config.gameplay.slow_factor).abs() < EPS);
+}
+
+#[test]
+fn regenerating_brick_heals_after_delay_unless_finished_in_time() {
+    let mut w = empty_world(950.0, 700.0, 0.0, -1.0);
+    w.bricks.push(brick(
+        900.0,
+        300.0,
+        BrickKind::Regenerating { hp: REGEN_BRICK_HP },
+    ));
+    let mut events = Vec::new();
+    assert!(!w.damage_brick(0, false, &mut events));
+    assert!(matches!(
+        w.bricks[0].kind,
+        BrickKind::Regenerating { hp: 1 }
+    ));
+    assert!((w.bricks[0].regen_timer - w.config.gameplay.regen_delay_sec).abs() < EPS);
+
+    // Advance past the delay while the ball is stuck on the paddle.
+    w.balls[0].stuck_offset = Some(0.0);
+    w.update(4.2, &mut events);
+    assert!(matches!(
+        w.bricks[0].kind,
+        BrickKind::Regenerating { hp: REGEN_BRICK_HP }
+    ));
+    assert_eq!(w.bricks[0].regen_timer, 0.0);
+
+    // Two hits before the timer expires destroys it.
+    assert!(!w.damage_brick(0, false, &mut events));
+    assert!(w.damage_brick(0, false, &mut events));
+    assert!(w.bricks.is_empty());
+}
+
+#[test]
+fn regenerating_brick_heals_on_time_at_240_hz() {
+    let frame_dt = 1.0 / 240.0;
+    let mut w = empty_world(950.0, 700.0, 0.0, -1.0);
+    w.bricks.push(brick(
+        900.0,
+        300.0,
+        BrickKind::Regenerating { hp: REGEN_BRICK_HP },
+    ));
+    let mut events = Vec::new();
+    assert!(!w.damage_brick(0, false, &mut events));
+    w.balls[0].stuck_offset = Some(0.0);
+    let total_frames = (w.config.gameplay.regen_delay_sec / frame_dt).round() as usize;
+    let early_margin = 3;
+    for _ in 0..total_frames - early_margin {
+        w.update(frame_dt, &mut events);
+    }
+    assert!(
+        matches!(w.bricks[0].kind, BrickKind::Regenerating { hp: 1 }),
+        "healed early"
+    );
+    for _ in 0..early_margin * 2 {
+        w.update(frame_dt, &mut events);
+    }
+    assert!(matches!(
+        w.bricks[0].kind,
+        BrickKind::Regenerating { hp: REGEN_BRICK_HP }
+    ));
+}
+
+#[test]
+fn legacy_config_without_bumper_or_regen_fields_still_parses() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../assets/config/game_config.json"))
+            .expect("valid config");
+    let ball = value["ball"].as_object_mut().expect("ball");
+    ball.remove("bumper_speed_boost");
+    ball.remove("bumper_boost_decay_sec");
+    value["gameplay"]
+        .as_object_mut()
+        .expect("gameplay")
+        .remove("regen_delay_sec");
+    let cfg: crate::config::GameConfig = serde_json::from_value(value).expect("older config");
+    assert!(cfg.ball.bumper_speed_boost > 0.0);
+    assert!(cfg.ball.bumper_boost_decay_sec > 0.0);
+    assert!(cfg.gameplay.regen_delay_sec > 0.0);
 }
