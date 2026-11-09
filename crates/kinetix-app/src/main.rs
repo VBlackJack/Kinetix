@@ -26,9 +26,10 @@ use audio::{
     set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
-use kinetix_app::library::load_library;
+use kinetix_app::library::{load_library, save_library};
 use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES};
 use kinetix_app::persistence::{load_progress, load_settings, save_settings, Settings};
+use kinetix_app::play_source::PlaySource;
 use kinetix_app::satisfaction::{level_names, satisfaction_pack};
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
@@ -40,13 +41,15 @@ use kinetix_core::physics::{
 };
 use macroquad::prelude::*;
 use session::{
-    apply_pause_action, next_sector, restart_level, start_run_from_title, sync_progress,
-    PauseOutcome, SaveTracker, Session,
+    advance_after_victory, apply_session_pause_action, delete_library_level, level_label,
+    restart_current, save_board_to_library, start_library_level, start_run_from_title,
+    start_satisfaction, sync_progress, LibraryOutcome, PauseOutcome, SaveTracker, Session,
+    VictoryOutcome,
 };
 use std::collections::BTreeSet;
 use title::{
-    build_menu_model, build_worlds, is_sector_unlocked, pointer_frame, read_menu_input,
-    MenuModelCache, MenuModelKey, MenuModelSource,
+    build_menu_model, build_worlds, is_sector_unlocked, open_menu_page, pointer_frame,
+    read_menu_input, MenuModelCache, MenuModelKey, MenuModelSource,
 };
 use tuning::*;
 use vfx::{
@@ -163,6 +166,30 @@ fn error_popup(i18n: &I18nCatalog, err: &LevelCodeError) -> FloatingPopup {
         life: POPUP_LIFE_SEC,
         color: rgba(MALUS_COLOR),
     }
+}
+
+/// Shows the toast that follows a library change (nothing for a change that did not happen).
+fn push_library_toast(
+    popups: &mut Vec<FloatingPopup>,
+    i18n: &I18nCatalog,
+    theme: &ThemeDef,
+    outcome: &LibraryOutcome,
+) {
+    let Some(key) = outcome.toast_key() else {
+        return;
+    };
+    let color = if outcome.is_failure() {
+        MALUS_COLOR
+    } else {
+        theme.text_accent
+    };
+    popups.push(FloatingPopup {
+        x: POPUP_X,
+        y: POPUP_Y,
+        text: i18n.t(key).to_string(),
+        life: POPUP_LIFE_SEC,
+        color: rgba(color),
+    });
 }
 
 fn rand_in(range: (f32, f32)) -> f32 {
@@ -310,6 +337,15 @@ fn enter_editor(screen: &mut AppScreen, world: &mut GameWorld) {
     world.status = SessionStatus::Playing;
 }
 
+/// Opens the editor on an empty board with fresh lives and score (the library "New" entry).
+fn enter_empty_editor(screen: &mut AppScreen, world: &mut GameWorld) {
+    world.clear_bricks();
+    world.boss = None;
+    world.lives = world.config.gameplay.initial_lives;
+    world.score = 0;
+    enter_editor(screen, world);
+}
+
 /// Which menu gestures start play (from the title or the pause menu): a click on the widget
 /// under the pointer, and Enter / Space on the focused widget.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -411,7 +447,9 @@ fn prewarm_font(
 
 struct HudContext<'a> {
     world: &'a GameWorld,
-    levels: &'a LevelPack,
+    /// One-based number and name of the board being played.
+    level_number: usize,
+    level_name: &'a str,
     theme: &'a ThemeDef,
     i18n: &'a I18nCatalog,
     lang: Language,
@@ -472,7 +510,7 @@ async fn main() {
         .into_iter()
         .map(str::to_owned)
         .collect();
-    let library = load_library();
+    let mut library = load_library();
     let extra_names: Vec<&str> = satisfaction_names
         .iter()
         .map(String::as_str)
@@ -522,7 +560,7 @@ async fn main() {
 
     #[cfg(not(target_arch = "wasm32"))]
     prevent_quit();
-    let session = Session::campaign();
+    let mut session = Session::campaign();
     let mut save_tracker = SaveTracker::new(saved_hs);
     let mut dev_state = DevState::default();
     let mut progress_guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
@@ -612,6 +650,7 @@ async fn main() {
         if LEVEL_CHEAT_ENABLED && is_key_pressed(KeyCode::F3) {
             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
             world.load_level(next_lvl, &level_pack.levels);
+            session.source = PlaySource::Campaign;
             screen = AppScreen::InGame;
         }
         if is_key_pressed(KeyCode::F4) {
@@ -619,6 +658,10 @@ async fn main() {
                 AppScreen::Editor => AppScreen::InGame,
                 _ => AppScreen::Editor,
             };
+            // A board edited after a non-campaign run is an editor test, not that run.
+            if screen == AppScreen::Editor && session.source != PlaySource::Campaign {
+                session.source = PlaySource::EditorTest;
+            }
             world.reset_paddle_and_ball();
             world.status = SessionStatus::Playing;
         }
@@ -706,6 +749,7 @@ async fn main() {
                     world.lives = world.config.gameplay.initial_lives;
                 }
                 world.load_level(idx, &level_pack.levels);
+                session.source = PlaySource::Campaign;
                 screen = AppScreen::InGame;
             }
             if screen == AppScreen::InGame {
@@ -893,6 +937,7 @@ async fn main() {
                                     now_sec,
                                 );
                             }
+                            session.source = PlaySource::Campaign;
                             start_run_from_title(
                                 &mut world,
                                 &mut dev_state,
@@ -904,6 +949,44 @@ async fn main() {
                             menu.open_home();
                             screen = AppScreen::InGame;
                         }
+                        MenuAction::StartSatisfaction(idx)
+                            if start_satisfaction(
+                                &mut session,
+                                &mut world,
+                                &satisfaction_levels.levels,
+                                idx,
+                            ) =>
+                        {
+                            if menu.renderer_dirty() {
+                                save_tracker.persist(
+                                    &world,
+                                    theme_idx,
+                                    lang == Language::Fr,
+                                    now_sec,
+                                );
+                            }
+                            menu.open_home();
+                            screen = AppScreen::InGame;
+                        }
+                        MenuAction::PlayLibrary(id) => {
+                            let entry = u32::try_from(id).ok().and_then(|id| library.get(id));
+                            if let Some(entry) = entry {
+                                match start_library_level(&mut session, &mut world, entry) {
+                                    Ok(()) => {
+                                        menu.open_home();
+                                        screen = AppScreen::InGame;
+                                    }
+                                    Err(err) => popups.push(error_popup(i18n, &err)),
+                                }
+                            }
+                        }
+                        MenuAction::DeleteLibrary(id) => {
+                            let outcome = match u32::try_from(id) {
+                                Ok(id) => delete_library_level(&mut library, id, save_library),
+                                Err(_) => LibraryOutcome::Missing,
+                            };
+                            push_library_toast(&mut popups, i18n, theme, &outcome);
+                        }
                         MenuAction::OpenEditor => {
                             if menu.renderer_dirty() {
                                 save_tracker.persist(
@@ -914,7 +997,8 @@ async fn main() {
                                 );
                             }
                             menu.open_home();
-                            enter_editor(&mut screen, &mut world);
+                            session.source = PlaySource::EditorTest;
+                            enter_empty_editor(&mut screen, &mut world);
                         }
                         #[cfg(not(target_arch = "wasm32"))]
                         MenuAction::QuitApp => {
@@ -922,7 +1006,6 @@ async fn main() {
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                             break;
                         }
-                        // Satisfaction and library actions are wired in a later lot.
                         _ => {}
                     }
                 }
@@ -988,6 +1071,15 @@ async fn main() {
                         color: rgba(theme.text_accent),
                     });
                 }
+                if is_key_pressed(KeyCode::S) {
+                    let outcome = save_board_to_library(
+                        &mut library,
+                        world.export_level_code(),
+                        i18n.t("menu.library.label.default_name"),
+                        save_library,
+                    );
+                    push_library_toast(&mut popups, i18n, theme, &outcome);
+                }
                 if is_key_pressed(KeyCode::I) {
                     match prompt_level_code(i18n.t("editor.paste_prompt")) {
                         Ok(Some(code)) => match world.import_level_code(&code) {
@@ -1022,11 +1114,13 @@ async fn main() {
                     };
                 }
                 if is_key_pressed(KeyCode::R) {
-                    restart_level(
+                    restart_current(
+                        &session,
                         &mut world,
                         &mut dev_state,
                         &level_pack.levels,
-                        session.source,
+                        &satisfaction_levels.levels,
+                        &library,
                     );
                 }
 
@@ -1066,12 +1160,14 @@ async fn main() {
                         },
                     );
                     if !handled
-                        && apply_pause_action(
+                        && apply_session_pause_action(
                             action,
+                            &session,
                             &mut world,
                             &mut dev_state,
                             &level_pack.levels,
-                            session.source,
+                            &satisfaction_levels.levels,
+                            &library,
                         ) == PauseOutcome::ToTitle
                     {
                         if menu.renderer_dirty() {
@@ -1119,28 +1215,38 @@ async fn main() {
                 if action_triggered {
                     match world.status {
                         SessionStatus::Playing => world.launch_or_fire(&mut events),
-                        SessionStatus::Victory if !world.is_campaign_board() => {
-                            // A custom board has no next sector: go back to the editor.
-                            screen = AppScreen::Editor;
-                            world.reset_paddle_and_ball();
-                            world.status = SessionStatus::Playing;
-                        }
                         SessionStatus::Victory => {
-                            next_sector(
+                            let outcome = advance_after_victory(
+                                &session,
                                 &mut world,
                                 &mut dev_state,
                                 &level_pack.levels,
-                                session.source,
+                                &satisfaction_levels.levels,
                             );
+                            match outcome {
+                                VictoryOutcome::NextLevel => {}
+                                VictoryOutcome::ToTitle(page) => {
+                                    open_menu_page(&mut menu, menu_model.current(), page);
+                                    screen = AppScreen::TitleMenu;
+                                }
+                                VictoryOutcome::ToEditor => {
+                                    // A custom board has no next sector: back to the editor.
+                                    screen = AppScreen::Editor;
+                                    world.reset_paddle_and_ball();
+                                    world.status = SessionStatus::Playing;
+                                }
+                            }
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                         }
                         SessionStatus::GameOver => {
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
-                            restart_level(
+                            restart_current(
+                                &session,
                                 &mut world,
                                 &mut dev_state,
                                 &level_pack.levels,
-                                session.source,
+                                &satisfaction_levels.levels,
+                                &library,
                             );
                         }
                         SessionStatus::Paused => {}
@@ -1545,10 +1651,20 @@ async fn main() {
 
         // Draw capsules above additive explosions/glows so icons stay 100% crisp and readable
         draw_capsules(&world, i18n, &ui_font, time);
-        draw_popups(&popups, &ui_font);
+        let (level_number, level_name) = level_label(
+            session.source,
+            world.current_level_idx,
+            &level_pack.levels,
+            &satisfaction_levels.levels,
+            &library,
+        );
+        if !menu_visible {
+            draw_popups(&popups, &ui_font);
+        }
         draw_hud(&HudContext {
             world: &world,
-            levels: &level_pack,
+            level_number,
+            level_name,
             theme,
             i18n,
             lang,
@@ -1568,6 +1684,8 @@ async fn main() {
                 arena_w,
                 arena_h,
             );
+            // Toasts stay readable over the menu panel.
+            draw_popups(&popups, &ui_font);
         }
 
         if dev_state.active {
@@ -2157,7 +2275,8 @@ fn draw_popups(popups: &[FloatingPopup], font: &Font) {
 fn draw_hud(ctx: &HudContext) {
     let HudContext {
         world,
-        levels,
+        level_number,
+        level_name,
         theme,
         i18n,
         lang,
@@ -2169,11 +2288,6 @@ fn draw_hud(ctx: &HudContext) {
     let pri = rgba(theme.text_primary);
     let acc = rgba(theme.text_accent);
     let border = rgba(theme.border_color);
-    let lvl_name = levels
-        .levels
-        .get(world.current_level_idx)
-        .map(|l| l.name.as_str())
-        .unwrap_or("");
 
     // Sleek Compact Top Dashboard Bar
     draw_rounded_rect(
@@ -2207,8 +2321,8 @@ fn draw_hud(ctx: &HudContext) {
         i18n.t("hud.combo"),
         world.combo.max(1),
         i18n.t("hud.level"),
-        world.current_level_idx + 1,
-        lvl_name
+        level_number,
+        level_name
     );
     txt(
         font,
@@ -2283,6 +2397,14 @@ fn draw_hud(ctx: &HudContext) {
             HUD_FOOTER_MAX_W,
         );
         txt(font, help, HUD_BANNER_X, HUD_FOOTER_Y, help_size, pri);
+        txt(
+            font,
+            i18n.t("editor.library.save_hint"),
+            HUD_BANNER_X,
+            HUD_EDITOR_SAVE_HINT_Y,
+            HUD_FOOTER_SIZE,
+            pri,
+        );
         return;
     }
 

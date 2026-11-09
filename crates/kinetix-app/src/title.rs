@@ -19,7 +19,8 @@
 use crate::tuning::*;
 use kinetix_app::library::{Library, MAX_LIBRARY_LEVELS};
 use kinetix_app::menu::{
-    LibraryEntry as MenuLibraryEntry, LibraryId, MenuInput, MenuModel, SectorRow, WorldRow,
+    Activation, LibraryEntry as MenuLibraryEntry, LibraryId, Menu, MenuInput, MenuModel, PageId,
+    SectorRow, WorldRow,
 };
 use kinetix_core::config::LevelDef;
 use kinetix_core::i18n::{I18nCatalog, Language};
@@ -193,6 +194,33 @@ pub(crate) fn build_menu_model(source: &MenuModelSource) -> MenuModel {
     }
 }
 
+/// Shows the Home page, then opens `target` the way a player would: by clicking the Home button
+/// that leads to it. The menu stays on Home when no enabled button leads there.
+pub(crate) fn open_menu_page(menu: &mut Menu, model: &MenuModel, target: PageId) {
+    menu.open_home();
+    let layout = menu.layout(model);
+    let Some(button) = layout
+        .widgets
+        .iter()
+        .find(|w| w.enabled && w.activation == Activation::Navigate(target))
+    else {
+        return;
+    };
+    let point = Some((
+        button.rect.x + button.rect.w * 0.5,
+        button.rect.y + button.rect.h * 0.5,
+    ));
+    for (pressed, released) in [(true, false), (false, true)] {
+        let click = MenuInput {
+            pointer: point,
+            pointer_pressed: pressed,
+            pointer_released: released,
+            ..MenuInput::default()
+        };
+        menu.update(&click, model);
+    }
+}
+
 /// What the cached menu model depends on: the model is rebuilt only when this changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MenuModelKey {
@@ -344,6 +372,36 @@ mod tests {
             boss: false,
             rows: Vec::new(),
         }
+    }
+
+    fn menu_model_with_content() -> MenuModel {
+        let mut model = MenuModel::empty();
+        model.satisfaction_levels = vec!["ONE".to_owned(), "TWO".to_owned()];
+        model.library = vec![MenuLibraryEntry {
+            id: 1,
+            name: "LEVEL 1".to_owned(),
+        }];
+        model.library_max = MAX_LIBRARY_LEVELS;
+        model
+    }
+
+    #[test]
+    fn open_menu_page_reaches_the_satisfaction_and_library_pages() {
+        let model = menu_model_with_content();
+        let mut menu = Menu::new();
+        open_menu_page(&mut menu, &model, PageId::Satisfaction);
+        assert_eq!(menu.page(), PageId::Satisfaction);
+        open_menu_page(&mut menu, &model, PageId::Library);
+        assert_eq!(menu.page(), PageId::Library);
+        assert!(menu.can_go_back(), "Back leads to Home");
+    }
+
+    #[test]
+    fn open_menu_page_stays_on_home_when_no_button_leads_there() {
+        let model = menu_model_with_content();
+        let mut menu = Menu::new();
+        open_menu_page(&mut menu, &model, PageId::Pause);
+        assert_eq!(menu.page(), PageId::Home);
     }
 
     #[test]

@@ -64,6 +64,8 @@ pub const POPUP_MULTIPLIER_HIDDEN_MAX: u32 = 1;
 /// Placeholders replaced by the first and last sector ids of a world in `menu.sector_range`.
 pub const FIRST_PLACEHOLDER: &str = "{first}";
 pub const LAST_PLACEHOLDER: &str = "{last}";
+/// Placeholder replaced by the new entry id in `menu.library.label.default_name`.
+pub const LIBRARY_NAME_PLACEHOLDER: &str = "{n}";
 
 // ---- Game feel ----
 /// Multiplier applied to the raw mouse delta while the native cursor grab is active.
@@ -190,6 +192,8 @@ pub const HUD_SUB_BAR_SEPARATOR: &str = "    ";
 pub const HUD_BANNER_X: f32 = 72.0;
 pub const HUD_BANNER_Y: f32 = 138.0;
 pub const HUD_BANNER_SIZE: u16 = 28;
+/// Editor hint about saving the board to the library, drawn under the banner.
+pub const HUD_EDITOR_SAVE_HINT_Y: f32 = HUD_BANNER_Y + 32.0;
 pub const HUD_SUDDEN_DEATH_Y: f32 = 136.0;
 pub const HUD_SUDDEN_DEATH_SIZE: u16 = 26;
 pub const HUD_FOOTER_Y: f32 = 1058.0;

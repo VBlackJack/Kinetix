@@ -18,11 +18,13 @@
 //! out of reach of developer mode and non-campaign sources.
 
 use crate::dev::{DevState, ProgressGuard};
-use crate::tuning::HIGH_SCORE_SAVE_INTERVAL_SEC;
-use kinetix_app::menu::MenuAction;
+use crate::tuning::{HIGH_SCORE_SAVE_INTERVAL_SEC, LIBRARY_NAME_PLACEHOLDER};
+use kinetix_app::library::{sanitize_name, Library, LibraryEntry, LibraryError, SaveError};
+use kinetix_app::menu::{MenuAction, PageId};
 use kinetix_app::persistence::{high_score_save_due, save_progress};
 use kinetix_app::play_source::{progress_frozen, PlaySource};
 use kinetix_core::config::LevelDef;
+use kinetix_core::level_code::{parse_level_code, LevelCodeError};
 use kinetix_core::physics::{GameWorld, SessionStatus};
 
 /// State of the current play session.
@@ -69,6 +71,222 @@ pub(crate) fn restart_level(
     world.load_pack_level(world.current_level_idx, levels, source.pack_rules());
 }
 
+/// Campaign sector list for a source that plays it; satisfaction levels for the satisfaction
+/// source. Library and editor boards have no level list.
+pub(crate) fn levels_for<'a>(
+    source: PlaySource,
+    campaign: &'a [LevelDef],
+    satisfaction: &'a [LevelDef],
+) -> &'a [LevelDef] {
+    match source {
+        PlaySource::Satisfaction => satisfaction,
+        PlaySource::Campaign | PlaySource::Library(_) | PlaySource::EditorTest => campaign,
+    }
+}
+
+/// Starts satisfaction level `idx` as a fresh run. It does not touch the developer taint (only a
+/// campaign start from the title does) and returns false, leaving everything as it was, when
+/// the index is out of range.
+pub(crate) fn start_satisfaction(
+    session: &mut Session,
+    world: &mut GameWorld,
+    satisfaction: &[LevelDef],
+    idx: usize,
+) -> bool {
+    if idx >= satisfaction.len() {
+        return false;
+    }
+    session.source = PlaySource::Satisfaction;
+    world.lives = world.config.gameplay.initial_lives;
+    world.score = 0;
+    world.load_pack_level(idx, satisfaction, PlaySource::Satisfaction.pack_rules());
+    true
+}
+
+/// Starts a saved library level as a fresh run on a custom board. On a code that no longer
+/// imports, the world and the session are left untouched.
+pub(crate) fn start_library_level(
+    session: &mut Session,
+    world: &mut GameWorld,
+    entry: &LibraryEntry,
+) -> Result<(), LevelCodeError> {
+    world.import_level_code(&entry.code)?;
+    session.source = PlaySource::Library(entry.id);
+    world.lives = world.config.gameplay.initial_lives;
+    world.score = 0;
+    Ok(())
+}
+
+/// Restarts the current board of the session: the same satisfaction level, the same library
+/// code, or the current sector. Score and lives reset; a taint is never cleared.
+pub(crate) fn restart_current(
+    session: &Session,
+    world: &mut GameWorld,
+    dev: &mut DevState,
+    campaign: &[LevelDef],
+    satisfaction: &[LevelDef],
+    library: &Library,
+) {
+    if let PlaySource::Library(id) = session.source {
+        if let Some(entry) = library.get(id) {
+            if world.import_level_code(&entry.code).is_ok() {
+                world.lives = world.config.gameplay.initial_lives;
+                world.score = 0;
+            }
+        }
+        return;
+    }
+    restart_level(
+        world,
+        dev,
+        levels_for(session.source, campaign, satisfaction),
+        session.source,
+    );
+}
+
+/// Where the game goes after a victory is acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VictoryOutcome {
+    /// The next board is loaded and play goes on.
+    NextLevel,
+    /// Back to the title screen, opened on this page.
+    ToTitle(PageId),
+    /// Back to the level editor.
+    ToEditor,
+}
+
+/// Applies a victory according to the source: the campaign moves to the next sector, the
+/// satisfaction pack to its next level (title when it was the last), a library level returns to
+/// the library page and an editor test to the editor. A campaign sector is never loaded while
+/// the source is satisfaction or library.
+pub(crate) fn advance_after_victory(
+    session: &Session,
+    world: &mut GameWorld,
+    dev: &mut DevState,
+    campaign: &[LevelDef],
+    satisfaction: &[LevelDef],
+) -> VictoryOutcome {
+    match session.source {
+        PlaySource::Campaign if world.is_campaign_board() => {
+            next_sector(world, dev, campaign, PlaySource::Campaign);
+            VictoryOutcome::NextLevel
+        }
+        PlaySource::Campaign | PlaySource::EditorTest => VictoryOutcome::ToEditor,
+        PlaySource::Satisfaction => {
+            let next = world.current_level_idx + 1;
+            if next < satisfaction.len() {
+                world.load_pack_level(next, satisfaction, PlaySource::Satisfaction.pack_rules());
+                VictoryOutcome::NextLevel
+            } else {
+                VictoryOutcome::ToTitle(PageId::Satisfaction)
+            }
+        }
+        PlaySource::Library(_) => VictoryOutcome::ToTitle(PageId::Library),
+    }
+}
+
+/// Number and name shown by the HUD for the board being played.
+pub(crate) fn level_label<'a>(
+    source: PlaySource,
+    current_idx: usize,
+    campaign: &'a [LevelDef],
+    satisfaction: &'a [LevelDef],
+    library: &'a Library,
+) -> (usize, &'a str) {
+    match source {
+        PlaySource::Library(id) => library
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .map_or((1, ""), |pos| (pos + 1, library.entries[pos].name.as_str())),
+        PlaySource::Satisfaction | PlaySource::Campaign | PlaySource::EditorTest => {
+            let levels = levels_for(source, campaign, satisfaction);
+            (
+                current_idx + 1,
+                levels.get(current_idx).map_or("", |l| l.name.as_str()),
+            )
+        }
+    }
+}
+
+/// What a library change did, for the toast that follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LibraryOutcome {
+    Saved,
+    Full,
+    InvalidBoard(LevelCodeError),
+    Deleted,
+    Missing,
+    /// The change was made in memory but the storage refused it.
+    SaveFailed,
+}
+
+impl LibraryOutcome {
+    /// Locale key of the toast shown for this outcome, if any.
+    pub(crate) fn toast_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Saved => Some("menu.library.toast.saved"),
+            Self::Full => Some("menu.library.toast.full"),
+            Self::InvalidBoard(err) => Some(err.i18n_key()),
+            Self::Deleted => Some("menu.library.toast.deleted"),
+            Self::Missing => None,
+            Self::SaveFailed => Some("storage.toast.save_failed"),
+        }
+    }
+
+    /// True for outcomes shown as a warning rather than a confirmation.
+    pub(crate) fn is_failure(&self) -> bool {
+        matches!(self, Self::Full | Self::InvalidBoard(_) | Self::SaveFailed)
+    }
+}
+
+/// Name given to a level saved from the editor: the locale template with its number filled in,
+/// reduced to printable ASCII plus the letters of the template itself (all of which are
+/// preloaded in the glyph atlas).
+pub(crate) fn default_library_name(template: &str, id: u32) -> String {
+    let name = template.replace(LIBRARY_NAME_PLACEHOLDER, &id.to_string());
+    sanitize_name(&name, |c| {
+        c == ' ' || c.is_ascii_graphic() || (c.is_alphabetic() && template.contains(c))
+    })
+}
+
+/// Saves the board `code` as a new library entry named from `name_template`, then writes the
+/// library through `persist`. A code that does not import is rejected before the library is
+/// touched.
+pub(crate) fn save_board_to_library(
+    library: &mut Library,
+    code: String,
+    name_template: &str,
+    persist: impl FnOnce(&Library) -> Result<(), SaveError>,
+) -> LibraryOutcome {
+    if let Err(err) = parse_level_code(&code) {
+        return LibraryOutcome::InvalidBoard(err);
+    }
+    let name = default_library_name(name_template, library.next_id);
+    match library.add(name, code) {
+        Err(LibraryError::Full) => LibraryOutcome::Full,
+        Ok(_) => match persist(library) {
+            Ok(()) => LibraryOutcome::Saved,
+            Err(_) => LibraryOutcome::SaveFailed,
+        },
+    }
+}
+
+/// Deletes library entry `id`, then writes the library through `persist`.
+pub(crate) fn delete_library_level(
+    library: &mut Library,
+    id: u32,
+    persist: impl FnOnce(&Library) -> Result<(), SaveError>,
+) -> LibraryOutcome {
+    if !library.delete(id) {
+        return LibraryOutcome::Missing;
+    }
+    match persist(library) {
+        Ok(()) => LibraryOutcome::Deleted,
+        Err(_) => LibraryOutcome::SaveFailed,
+    }
+}
+
 /// What a pause menu action changed outside the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PauseOutcome {
@@ -102,6 +320,26 @@ pub(crate) fn apply_pause_action(
         MenuAction::QuitToTitle => PauseOutcome::ToTitle,
         _ => PauseOutcome::None,
     }
+}
+
+/// Applies a pause menu action to the session of any source: Restart reloads the board of the
+/// source (never a campaign sector for satisfaction or library), the rest is
+/// `apply_pause_action`.
+pub(crate) fn apply_session_pause_action(
+    action: MenuAction,
+    session: &Session,
+    world: &mut GameWorld,
+    dev: &mut DevState,
+    campaign: &[LevelDef],
+    satisfaction: &[LevelDef],
+    library: &Library,
+) -> PauseOutcome {
+    if action == MenuAction::Restart {
+        restart_current(session, world, dev, campaign, satisfaction, library);
+        world.status = SessionStatus::Playing;
+        return PauseOutcome::Resumed;
+    }
+    apply_pause_action(action, world, dev, campaign, session.source)
 }
 
 /// Moves on to the sector after a win. The score carries over and a taint is never cleared.
@@ -421,5 +659,498 @@ mod tests {
             assert_eq!(outcome, PauseOutcome::None);
             assert_eq!(world.status, SessionStatus::Paused);
         }
+    }
+
+    fn satisfaction_levels() -> Vec<LevelDef> {
+        kinetix_app::satisfaction::satisfaction_pack().levels
+    }
+
+    fn library_with_current_board(world: &GameWorld) -> (Library, u32) {
+        let mut library = Library::default();
+        let id = library
+            .add("LEVEL 1".to_owned(), world.export_level_code())
+            .expect("room in the library");
+        (library, id)
+    }
+
+    #[test]
+    fn a_satisfaction_start_resets_the_run_and_keeps_the_taint_alone() {
+        let (mut world, _) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut session = Session::campaign();
+        world.lives = 0;
+        world.score = 900;
+        let mut dev = DevState::default();
+        dev.toggle();
+        dev.toggle();
+        assert!(dev.tainted);
+
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &satisfaction,
+            2
+        ));
+        assert_eq!(session.source, PlaySource::Satisfaction);
+        assert_eq!(world.current_level_idx, 2);
+        assert_eq!(world.lives, world.config.gameplay.initial_lives);
+        assert_eq!(world.score, 0);
+        assert!(!world.is_campaign_board());
+        assert!(dev.tainted, "only a campaign title start clears the taint");
+    }
+
+    #[test]
+    fn a_satisfaction_start_out_of_range_changes_nothing() {
+        let (mut world, _) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut session = Session::campaign();
+        world.score = 900;
+        assert!(!start_satisfaction(
+            &mut session,
+            &mut world,
+            &satisfaction,
+            satisfaction.len()
+        ));
+        assert_eq!(session.source, PlaySource::Campaign);
+        assert_eq!(world.score, 900);
+    }
+
+    #[test]
+    fn a_satisfaction_win_never_changes_the_saved_high_score_or_unlock() {
+        let (mut world, _) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut session = Session::campaign();
+        let saved_high_score = world.high_score;
+        let saved_unlocked = world.max_unlocked_level;
+        let mut guard = ProgressGuard::new(saved_high_score, saved_unlocked);
+        let dev = DevState::default();
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &satisfaction,
+            0
+        ));
+        world.score = 50_000;
+        world.high_score = 50_000;
+        win_current_level(&mut world);
+        assert_eq!(world.status, SessionStatus::Victory);
+
+        sync_progress(&mut guard, &dev, &mut world, session.source);
+        assert_eq!(world.high_score, saved_high_score);
+        assert_eq!(world.max_unlocked_level, saved_unlocked);
+        assert!(
+            !high_score_save_due(
+                world.high_score,
+                saved_high_score,
+                f64::MAX,
+                f64::NEG_INFINITY,
+                HIGH_SCORE_SAVE_INTERVAL_SEC
+            ),
+            "nothing new to save after a satisfaction win"
+        );
+    }
+
+    #[test]
+    fn a_satisfaction_victory_moves_through_the_pack_and_ends_on_its_page() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &satisfaction,
+            0
+        ));
+        for expected in 1..satisfaction.len() {
+            win_current_level(&mut world);
+            let outcome = advance_after_victory(
+                &session,
+                &mut world,
+                &mut dev,
+                &campaign.levels,
+                &satisfaction,
+            );
+            assert_eq!(outcome, VictoryOutcome::NextLevel);
+            assert_eq!(world.current_level_idx, expected);
+            assert!(!world.is_campaign_board(), "never a campaign sector");
+            assert_eq!(world.status, SessionStatus::Playing);
+        }
+        win_current_level(&mut world);
+        let outcome = advance_after_victory(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+        );
+        assert_eq!(outcome, VictoryOutcome::ToTitle(PageId::Satisfaction));
+    }
+
+    #[test]
+    fn restart_and_game_over_replay_the_same_satisfaction_level() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let library = Library::default();
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &satisfaction,
+            3
+        ));
+        let fresh_bricks = world.bricks.len();
+        world.bricks.truncate(1);
+        world.score = 400;
+        world.status = SessionStatus::GameOver;
+
+        restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(world.current_level_idx, 3);
+        assert_eq!(world.bricks.len(), fresh_bricks);
+        assert_eq!(world.score, 0);
+        assert!(!world.is_campaign_board());
+        assert_eq!(world.status, SessionStatus::Playing);
+    }
+
+    #[test]
+    fn the_pause_restart_follows_the_source() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let library = Library::default();
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &satisfaction,
+            1
+        ));
+        world.status = SessionStatus::Paused;
+        world.score = 300;
+        let outcome = apply_session_pause_action(
+            MenuAction::Restart,
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(outcome, PauseOutcome::Resumed);
+        assert_eq!(world.current_level_idx, 1);
+        assert!(!world.is_campaign_board());
+        assert_eq!(world.score, 0);
+        assert_eq!(world.status, SessionStatus::Playing);
+
+        // The other pause actions keep their behavior.
+        world.status = SessionStatus::Paused;
+        let outcome = apply_session_pause_action(
+            MenuAction::QuitToTitle,
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(outcome, PauseOutcome::ToTitle);
+    }
+
+    #[test]
+    fn a_library_level_plays_on_a_custom_board_and_a_win_returns_to_the_library() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
+        world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        let (library, id) = library_with_current_board(&world);
+        let entry = library.get(id).expect("entry").clone();
+        world.score = 700;
+
+        start_library_level(&mut session, &mut world, &entry).expect("valid code");
+        assert_eq!(session.source, PlaySource::Library(id));
+        assert!(!world.is_campaign_board());
+        assert_eq!(world.score, 0);
+        assert_eq!(world.lives, world.config.gameplay.initial_lives);
+
+        world.score = 50_000;
+        world.high_score = 50_000;
+        win_current_level(&mut world);
+        sync_progress(&mut guard, &dev, &mut world, session.source);
+        assert_eq!(world.high_score, 1, "a library win saves no high score");
+        assert_eq!(world.max_unlocked_level, 0, "a library win unlocks nothing");
+        let outcome = advance_after_victory(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+        );
+        assert_eq!(outcome, VictoryOutcome::ToTitle(PageId::Library));
+    }
+
+    #[test]
+    fn restarting_a_library_level_imports_the_same_code_again() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        world.load_pack_level(1, &satisfaction, PlaySource::Satisfaction.pack_rules());
+        let (library, id) = library_with_current_board(&world);
+        let entry = library.get(id).expect("entry").clone();
+        start_library_level(&mut session, &mut world, &entry).expect("valid code");
+        let fresh_bricks = world.bricks.len();
+        world.bricks.truncate(1);
+        world.score = 400;
+
+        restart_current(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!(world.bricks.len(), fresh_bricks);
+        assert_eq!(world.score, 0);
+        assert!(!world.is_campaign_board());
+    }
+
+    #[test]
+    fn a_library_entry_that_no_longer_imports_leaves_the_session_alone() {
+        let (mut world, _) = dev_test_world();
+        let mut session = Session::campaign();
+        let entry = LibraryEntry {
+            id: 9,
+            name: "BAD".to_owned(),
+            code: "KTX1:nonsense".to_owned(),
+        };
+        world.score = 123;
+        assert!(start_library_level(&mut session, &mut world, &entry).is_err());
+        assert_eq!(session.source, PlaySource::Campaign);
+        assert_eq!(world.score, 123);
+    }
+
+    #[test]
+    fn an_editor_test_and_a_campaign_with_a_custom_board_go_back_to_the_editor() {
+        let (mut world, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut dev = DevState::default();
+        let editor = Session {
+            source: PlaySource::EditorTest,
+        };
+        let outcome = advance_after_victory(
+            &editor,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+        );
+        assert_eq!(outcome, VictoryOutcome::ToEditor);
+
+        let session = Session::campaign();
+        world.clear_bricks();
+        let outcome = advance_after_victory(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+        );
+        assert_eq!(outcome, VictoryOutcome::ToEditor);
+
+        start_run_from_title(&mut world, &mut dev, &campaign.levels, 0, session.source);
+        let outcome = advance_after_victory(
+            &session,
+            &mut world,
+            &mut dev,
+            &campaign.levels,
+            &satisfaction,
+        );
+        assert_eq!(outcome, VictoryOutcome::NextLevel);
+        assert_eq!(world.current_level_idx, 1);
+        assert!(world.is_campaign_board());
+    }
+
+    #[test]
+    fn the_hud_label_names_the_board_of_the_source() {
+        let (_, campaign) = dev_test_world();
+        let satisfaction = satisfaction_levels();
+        let mut library = Library::default();
+        library
+            .add("FIRST".to_owned(), "KTX1:".to_owned())
+            .expect("room");
+        let second = library
+            .add("SECOND".to_owned(), "KTX1:".to_owned())
+            .expect("room");
+
+        let (number, name) = level_label(
+            PlaySource::Satisfaction,
+            2,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!((number, name), (3, satisfaction[2].name.as_str()));
+        let (number, name) = level_label(
+            PlaySource::Campaign,
+            0,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!((number, name), (1, campaign.levels[0].name.as_str()));
+        let (number, name) = level_label(
+            PlaySource::Library(second),
+            0,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!((number, name), (2, "SECOND"));
+        let (number, name) = level_label(
+            PlaySource::Library(999),
+            0,
+            &campaign.levels,
+            &satisfaction,
+            &library,
+        );
+        assert_eq!((number, name), (1, ""));
+    }
+
+    const NAME_TEMPLATE: &str = "LEVEL {n}";
+
+    #[test]
+    fn a_saved_board_is_named_from_the_template_and_written_once() {
+        let (world, _) = dev_test_world();
+        let mut library = Library::default();
+        let mut writes = 0;
+        let outcome = save_board_to_library(
+            &mut library,
+            world.export_level_code(),
+            NAME_TEMPLATE,
+            |_| {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(outcome, LibraryOutcome::Saved);
+        assert_eq!(writes, 1);
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].name, "LEVEL 1");
+        assert_eq!(outcome.toast_key(), Some("menu.library.toast.saved"));
+        assert!(!outcome.is_failure());
+
+        let outcome = save_board_to_library(
+            &mut library,
+            world.export_level_code(),
+            NAME_TEMPLATE,
+            |_| Ok(()),
+        );
+        assert_eq!(outcome, LibraryOutcome::Saved);
+        assert_eq!(library.entries[1].name, "LEVEL 2");
+    }
+
+    #[test]
+    fn an_empty_board_is_rejected_before_the_library_is_touched() {
+        let (mut world, _) = dev_test_world();
+        world.clear_bricks();
+        let mut library = Library::default();
+        let outcome = save_board_to_library(
+            &mut library,
+            world.export_level_code(),
+            NAME_TEMPLATE,
+            |_| panic!("nothing to write"),
+        );
+        assert!(matches!(outcome, LibraryOutcome::InvalidBoard(_)));
+        assert!(outcome.is_failure());
+        assert!(library.entries.is_empty());
+        assert_eq!(library.next_id, Library::default().next_id);
+    }
+
+    #[test]
+    fn a_full_library_refuses_a_new_level_without_writing() {
+        let (world, _) = dev_test_world();
+        let mut library = Library::default();
+        for _ in 0..kinetix_app::library::MAX_LIBRARY_LEVELS {
+            library
+                .add("X".to_owned(), world.export_level_code())
+                .expect("room");
+        }
+        let outcome = save_board_to_library(
+            &mut library,
+            world.export_level_code(),
+            NAME_TEMPLATE,
+            |_| panic!("nothing to write"),
+        );
+        assert_eq!(outcome, LibraryOutcome::Full);
+        assert_eq!(outcome.toast_key(), Some("menu.library.toast.full"));
+        assert_eq!(
+            library.entries.len(),
+            kinetix_app::library::MAX_LIBRARY_LEVELS
+        );
+    }
+
+    #[test]
+    fn a_refused_write_is_reported_as_a_failed_save() {
+        let (world, _) = dev_test_world();
+        let mut library = Library::default();
+        let outcome = save_board_to_library(
+            &mut library,
+            world.export_level_code(),
+            NAME_TEMPLATE,
+            |_| Err(SaveError::Failed),
+        );
+        assert_eq!(outcome, LibraryOutcome::SaveFailed);
+        assert_eq!(outcome.toast_key(), Some("storage.toast.save_failed"));
+        assert!(outcome.is_failure());
+
+        let id = library.entries[0].id;
+        let outcome = delete_library_level(&mut library, id, |_| Err(SaveError::Unavailable));
+        assert_eq!(outcome, LibraryOutcome::SaveFailed);
+    }
+
+    #[test]
+    fn deleting_a_level_saves_the_library_and_a_missing_id_does_nothing() {
+        let (world, _) = dev_test_world();
+        let mut library = Library::default();
+        let id = library
+            .add("X".to_owned(), world.export_level_code())
+            .expect("room");
+        let outcome = delete_library_level(&mut library, id + 1, |_| panic!("nothing to write"));
+        assert_eq!(outcome, LibraryOutcome::Missing);
+        assert_eq!(outcome.toast_key(), None);
+        assert_eq!(library.entries.len(), 1);
+
+        let mut writes = 0;
+        let outcome = delete_library_level(&mut library, id, |saved| {
+            writes += 1;
+            assert!(saved.entries.is_empty());
+            Ok(())
+        });
+        assert_eq!(outcome, LibraryOutcome::Deleted);
+        assert_eq!(writes, 1);
+        assert_eq!(outcome.toast_key(), Some("menu.library.toast.deleted"));
+    }
+
+    #[test]
+    fn default_names_keep_only_printable_characters() {
+        assert_eq!(default_library_name("LEVEL {n}", 12), "LEVEL 12");
+        assert_eq!(default_library_name("NIVEAU {n}", 3), "NIVEAU 3");
+        assert_eq!(
+            default_library_name("LEVEL\u{7} {n}\u{202e}", 4),
+            "LEVEL 4",
+            "control and direction characters are dropped"
+        );
+        assert_eq!(default_library_name("N\u{e9}o {n}", 5), "N\u{e9}o 5");
     }
 }
