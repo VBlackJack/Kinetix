@@ -30,7 +30,7 @@ use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
 use kinetix_core::physics::{
     BrickKind, GameEvent, GameWorld, PowerUpCapsule, SessionStatus, BUMPER_BRICK_HP,
-    BUMPER_COLOR_IDX, MOVING_BRICK_COLOR_IDX, MOVING_BRICK_HP, REGEN_BRICK_COLOR_IDX,
+    BUMPER_COLOR_IDX, MAX_CAPSULES, MOVING_BRICK_COLOR_IDX, MOVING_BRICK_HP, REGEN_BRICK_COLOR_IDX,
     REGEN_BRICK_HP,
 };
 use macroquad::prelude::*;
@@ -758,7 +758,8 @@ async fn main() {
         // Hidden developer mode (Ctrl+Shift+D): never persisted, never advertised.
         let chord_held = (is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl))
             && (is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift));
-        if chord_held && is_key_pressed(DEV_TOGGLE_KEY) {
+        let dev_toggled = chord_held && is_key_pressed(DEV_TOGGLE_KEY);
+        if dev_toggled {
             dev_state.toggle();
             let toast_key = if dev_state.active {
                 "dev.toast.on"
@@ -774,29 +775,37 @@ async fn main() {
             });
         }
         let mut dev_enter_consumed = false;
+        let mut dev_esc_consumed = false;
         if dev_state.active {
             let level_count = level_pack.levels.len();
             let mut jump_to: Option<usize> = None;
+            // A jump would discard the editor board, so number entry is limited to the title and the game.
+            let entry_screen = screen != AppScreen::Editor;
             if is_key_pressed(DEV_HELP_KEY) {
                 dev_state.help_visible = !dev_state.help_visible;
             }
-            for (key, digit) in DEV_DIGIT_KEYS {
-                if is_key_pressed(key) {
-                    push_sector_digit(&mut dev_state.buffer, digit);
+            if entry_screen {
+                for (key, digit) in DEV_DIGIT_KEYS {
+                    if is_key_pressed(key) {
+                        push_sector_digit(&mut dev_state.buffer, digit);
+                    }
                 }
+            } else {
+                dev_state.buffer.clear();
             }
             if is_key_pressed(KeyCode::Backspace) {
                 dev_state.buffer.pop();
             }
-            if is_key_pressed(KeyCode::Escape) {
+            if is_key_pressed(KeyCode::Escape) && !dev_state.buffer.is_empty() {
                 dev_state.buffer.clear();
+                dev_esc_consumed = true;
             }
             if is_key_pressed(KeyCode::Enter) && !dev_state.buffer.is_empty() {
                 dev_enter_consumed = true;
                 jump_to = resolve_sector(&dev_state.buffer, level_count);
                 dev_state.buffer.clear();
             }
-            if screen != AppScreen::TitleMenu {
+            if screen == AppScreen::InGame {
                 if is_key_pressed(DEV_PREV_LEVEL_KEY) {
                     jump_to = Some(step_level(world.current_level_idx, level_count, false));
                 }
@@ -828,9 +837,10 @@ async fn main() {
                         y: world.config.arena.paddle_y,
                     });
                 }
-                if is_key_pressed(DEV_DROP_KEY) && world.capsules.len() < DEV_MAX_DROPPED_CAPSULES {
+                if is_key_pressed(DEV_DROP_KEY) && world.capsules.len() < MAX_CAPSULES {
+                    let (min_cx, max_cx) = world.capsule_x_bounds();
                     world.capsules.push(PowerUpCapsule {
-                        x: world.paddle_x,
+                        x: world.paddle_x.clamp(min_cx, max_cx),
                         y: world.config.arena.paddle_y - DEV_DROP_OFFSET_Y,
                         radius: world.config.gameplay.powerup_radius,
                         kind: dev_state.selected_kind(),
@@ -1066,7 +1076,7 @@ async fn main() {
             AppScreen::InGame => {
                 // P toggles pause; Escape only pauses (the browser also uses it to release the lock).
                 let toggle_pause = is_key_pressed(KeyCode::P);
-                let pause_only = is_key_pressed(KeyCode::Escape);
+                let pause_only = is_key_pressed(KeyCode::Escape) && !dev_esc_consumed;
                 if toggle_pause || pause_only {
                     world.status = match world.status {
                         SessionStatus::Playing => SessionStatus::Paused,
@@ -1079,7 +1089,6 @@ async fn main() {
                     world.lives = world.config.gameplay.initial_lives;
                     world.score = 0;
                     world.load_level(cur, &level_pack.levels);
-                    dev_state.level_loaded_normally();
                 }
 
                 world.set_paddle_target(paddle_mx);
@@ -1089,13 +1098,13 @@ async fn main() {
                 {
                     world.set_paddle_target(world.paddle_x - kb_speed);
                 }
-                if is_key_down(KeyCode::Right) || is_key_down(KeyCode::D) {
+                if is_key_down(KeyCode::Right) || (is_key_down(KeyCode::D) && !dev_toggled) {
                     world.set_paddle_target(world.paddle_x + kb_speed);
                 }
 
                 let vortex_input = is_mouse_button_down(MouseButton::Right)
-                    || is_key_down(KeyCode::LeftShift)
-                    || is_key_down(KeyCode::RightShift);
+                    || (!dev_toggled
+                        && (is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift)));
                 world.set_vortex(vortex_input);
                 if world.vortex_active {
                     warp_grid.apply_impulse(
@@ -1120,7 +1129,6 @@ async fn main() {
                         SessionStatus::Victory => {
                             let next_lvl = (world.current_level_idx + 1) % level_pack.levels.len();
                             world.load_level(next_lvl, &level_pack.levels);
-                            dev_state.level_loaded_normally();
                             save_tracker.persist(&world, theme_idx, lang == Language::Fr, now_sec);
                         }
                         SessionStatus::GameOver => {
@@ -1128,7 +1136,6 @@ async fn main() {
                             world.lives = world.config.gameplay.initial_lives;
                             world.score = 0;
                             world.load_level(world.current_level_idx, &level_pack.levels);
-                            dev_state.level_loaded_normally();
                         }
                         SessionStatus::Paused => {}
                     }
@@ -3291,5 +3298,52 @@ mod tests {
         world.update(0.016, &mut events);
         sync_progress(&mut guard, &dev, &mut world);
         assert_eq!(world.max_unlocked_level, 1, "a genuine win still unlocks");
+    }
+
+    fn dev_test_world() -> (GameWorld, LevelPack) {
+        let config: GameConfig = serde_json::from_str(RAW_GAME_CONFIG).expect("config");
+        let pack: LevelPack = serde_json::from_str(RAW_LEVELS).expect("levels");
+        (GameWorld::new(config, &pack.levels), pack)
+    }
+
+    fn win_current_level(world: &mut GameWorld) {
+        world.bricks.clear();
+        world.boss = None;
+        world.update(0.016, &mut Vec::new());
+    }
+
+    #[test]
+    fn a_dev_built_score_does_not_reach_the_high_score_on_the_next_sector() {
+        let (mut world, pack) = dev_test_world();
+        world.high_score = 1;
+        let mut guard = ProgressGuard::new(1, 0);
+        let mut dev = DevState::default();
+        dev.toggle();
+        world.load_level(0, &pack.levels);
+        world.apply_powerup(kinetix_core::physics::PowerUpKind::ExtraLife);
+        win_current_level(&mut world);
+        sync_progress(&mut guard, &dev, &mut world);
+        // Next sector after the win: no title start, so the taint stays and the score carries over.
+        world.load_level(1, &pack.levels);
+        world.update(0.016, &mut Vec::new());
+        sync_progress(&mut guard, &dev, &mut world);
+        assert!(world.score > 1);
+        assert_eq!(world.high_score, 1);
+    }
+
+    #[test]
+    fn a_dev_jump_to_a_locked_sector_never_unlocks_the_next_one() {
+        let (mut world, pack) = dev_test_world();
+        let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
+        let mut dev = DevState::default();
+        dev.toggle();
+        world.load_level(5, &pack.levels);
+        dev.toggle();
+        // R / game over restart / next sector never clear the taint: only a title start does.
+        world.load_level(5, &pack.levels);
+        win_current_level(&mut world);
+        assert_eq!(world.max_unlocked_level, 6);
+        sync_progress(&mut guard, &dev, &mut world);
+        assert_eq!(world.max_unlocked_level, 0);
     }
 }

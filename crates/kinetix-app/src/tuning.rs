@@ -383,8 +383,6 @@ pub const DEV_SECTOR_DIGITS_MAX: usize = 4;
 pub const DEV_NAME_PLACEHOLDER: &str = "{name}";
 pub const DEV_VALUE_PLACEHOLDER: &str = "{value}";
 pub const DEV_MAX_PLACEHOLDER: &str = "{max}";
-/// Falling capsules the physics separation logic can handle at once (kept equal to its limit).
-pub const DEV_MAX_DROPPED_CAPSULES: usize = 2;
 /// Vertical distance above the paddle at which a dropped capsule appears.
 pub const DEV_DROP_OFFSET_Y: f32 = 360.0;
 /// Developer panel layout (arena units): position, width, text sizes and line height.
