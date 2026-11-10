@@ -875,6 +875,7 @@ fn boss_level(
         name,
         boss: true,
         rows: arena.rows.iter().map(|r| (*r).to_string()).collect(),
+        cell: None,
     })
 }
 
@@ -908,6 +909,7 @@ pub fn generate_sector(
         name,
         boss: false,
         rows,
+        cell: None,
     })
 }
 
@@ -1572,6 +1574,7 @@ fn layout_issue(rows: &[String], plan: &SectorPlan, window: (usize, usize)) -> O
         name: String::new(),
         boss: false,
         rows: rows.to_vec(),
+        cell: None,
     };
     let mismatch = mirror_mismatch_cells(&level);
     if plan.symmetric && mismatch != 0 {

@@ -1177,6 +1177,7 @@ mod tests {
             } else {
                 designed_rows(seed, designed_is_symmetric(seed))
             },
+            cell: None,
         }
     }
 
@@ -1218,6 +1219,7 @@ mod tests {
             name: name.to_string(),
             boss: false,
             rows: rows.into_iter().map(String::from).collect(),
+            cell: None,
         }
     }
 

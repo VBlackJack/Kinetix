@@ -24,8 +24,7 @@ pub const WINDOW_TITLE: &str = "KINETIX";
 pub const WINDOW_WIDTH: i32 = 1920;
 pub const WINDOW_HEIGHT: i32 = 1080;
 pub const WINDOW_SAMPLE_COUNT: i32 = 8;
-/// Frame time clamp, in seconds.
-pub const MAX_FRAME_DT: f32 = 0.033;
+pub use kinetix_core::physics::MAX_FRAME_DT;
 pub const MIN_RENDER_W: f32 = 640.0;
 pub const MIN_RENDER_H: f32 = 360.0;
 pub const MS_PER_SEC: f64 = 1000.0;

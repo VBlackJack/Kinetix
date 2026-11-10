@@ -170,6 +170,17 @@ pub struct LevelDef {
     #[serde(default)]
     pub boss: bool,
     pub rows: Vec<String>,
+    /// Optional brick cell geometry. `None` keeps the coarse default grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<CellSize>,
+}
+
+/// Row height and gap, in pixels, of a fine brick grid. The brick width still follows from the
+/// row length.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CellSize {
+    pub h: f32,
+    pub gap: f32,
 }
 
 fn default_world() -> usize {
