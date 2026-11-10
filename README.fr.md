@@ -9,7 +9,7 @@
 - [`crates/kinetix-core`](crates/kinetix-core) : Moteur physique déterministe en Rust pur, détection de collision par sous-étapes, synergies de bonus, configuration JSON et catalogue i18n (`en` / `fr`).
 - [`crates/kinetix-app`](crates/kinetix-app) : Client graphique multi-plateforme accéléré matériellement (`Macroquad` WebGL / Desktop / Android), thèmes visuels commutables en temps réel, systèmes de particules et d'ondes de choc.
 - [`crates/kinetix-levelforge`](crates/kinetix-levelforge) : Générateur de campagne sans interface, validateur structurel et simulateur de bot déterministe (profils `good` et `casual`).
-- [`assets/`](assets) : Configuration externalisée (`game_config.json`, `themes.json`, `levels.json`) et catalogues de traduction (`locales/en.json`, `locales/fr.json`).
+- [`assets/`](assets) : Configuration externalisée (`game_config.json`, `themes.json`, `levels.json`, `satisfaction.json`, `satisfaction_fine.json`) et catalogues de traduction (`locales/en.json`, `locales/fr.json`).
 
 ## Mondes de la campagne (800 secteurs)
 
@@ -39,6 +39,20 @@ Le jeu embarque 8 moteurs de rendu, parcourus avec `F1` :
 7. **Cryo Arctique** : Verre givré.
 8. **Soleil Synth** : Horizon outrun.
 
+## Menu et modes de jeu
+
+Le jeu s'ouvre sur un menu utilisable à la souris, au clavier ou au toucher :
+
+- **Campagne** : choisir un chapitre (monde), puis n'importe quel secteur débloqué. La progression et le meilleur score sont sauvegardés.
+- **Mode satisfaction** : des plateaux détente, sans mort subite et sans progression sauvegardée. Cinq plateaux à chambres d'acier sur la grille habituelle de 15 colonnes, puis trois plateaux à mini-briques (`RINGED PLANET`, `TIDE`, `SPIRAL`) : environ 1 500 petites briques qui dessinent une image dans un cadre d'acier à une seule entrée, pour que la balle y entre et vide le champ de l'intérieur.
+- **Éditeur** : peindre un plateau de 15 x 10, le tester, l'exporter en code de partage, ou appuyer sur `S` pour l'enregistrer dans **Mes niveaux** (jusqu'à 50 niveaux), d'où il peut être rejoué ou supprimé.
+- **Options** : langue, rendu, effets sonores et musique, tous mémorisés.
+- **Pause** (`P` ou `Échap`) : reprendre, recommencer, options ou retour au menu.
+
+### Niveaux à grille fine
+
+Une définition de niveau peut porter un objet `cell` facultatif, par exemple `"cell": { "h": 13, "gap": 2 }`, qui fixe la hauteur des rangées et l'écart entre les briques en pixels. Le nombre de colonnes vient toujours de la longueur des rangées. Sans `cell`, un niveau garde les rangées de 26 px et les écarts de 5 px d'origine : la campagne ne change pas. Les plateaux fins n'acceptent que des cases vides (`0`), des briques de couleur (`1`-`9`) et de l'acier (`#`), et sont vérifiés par `validate_fine_level` dans les tests. L'éditeur et les codes de partage restent sur la grille de 15 x 10.
+
 ## Prérequis
 
 - Rust stable.
@@ -65,7 +79,7 @@ cargo run --release -p kinetix-levelforge -- simulate
 
 ## Son, sauvegarde et migration de la campagne
 
-Le son n'est disponible que sur le web pour l'instant : les versions natives sont silencieuses. La progression (meilleur score, secteurs débloqués, thème, langue) est sauvegardée sur toutes les plateformes : dans le stockage du navigateur sur le web (encodage du secteur débloqué sur 16 bits), et dans un fichier `progress.json` sur les versions natives :
+Le son n'est disponible que sur le web pour l'instant : les versions natives sont silencieuses. La progression (meilleur score, secteurs débloqués, thème, langue, réglages du son) est sauvegardée sur toutes les plateformes : dans le stockage du navigateur sur le web (encodage du secteur débloqué sur 16 bits), et dans un fichier `progress.json` sur les versions natives :
 
 - Windows : `%APPDATA%\Kinetix\progress.json`
 - macOS : `$HOME/Library/Application Support/Kinetix/progress.json`
@@ -73,9 +87,12 @@ Le son n'est disponible que sur le web pour l'instant : les versions natives son
 
 Un fichier absent repart des valeurs par défaut. Un fichier illisible (corrompu, ou écrit par une version plus récente) est conservé sous le nom `progress.json.bak` avant la première sauvegarde de la session, et le jeu repart des valeurs par défaut. Si aucun dossier de données utilisateur n'est trouvé, la progression n'est pas sauvegardée. Supprimez le fichier pour réinitialiser votre progression.
 
+Les niveaux enregistrés depuis l'éditeur sont rangés à côté, dans `library.json` sur les versions natives (avec la même règle `.bak`), et dans une clé du stockage du navigateur sur le web.
+
 **Compatibilité des sauvegardes et recalibrage des boss historiques** : Les 15 secteurs d'origine (1-15) conservent exactement leurs grilles de briques et leurs drapeaux de boss au sein du **Monde 1 : Grille d'Ignition** (Secteurs 1-100). Les boss historiques des secteurs 5 (`IGNITION WARDEN`), 10 (`CHRONO ARCHON`) et 15 (`OMEGA EMPEROR`) sont recalibrés sur le palier du Monde 1 (`PV = 18`). Les sauvegardes existantes ayant débloqué un secteur entre 1 et 15 conservent ce même secteur débloqué dans le Monde 1 ; les Mondes 2 (Secteurs 101-200) et 3 (Secteurs 201-300) commençant désormais aux secteurs 101 et 201, les sauvegardes qui n'avaient atteint que les secteurs 6 à 15 verront les Mondes 2 et 3 verrouillés jusqu'à ce que les secteurs 101 et 201 soient atteints.
 
 ## Licences
 
 - Code : Apache License 2.0 ([`LICENSE`](LICENSE)) - Copyright 2026 Julien Bombled.
+- `vendor/macroquad` embarqué : macroquad 0.4.16 (MIT OR Apache-2.0) avec le correctif amont du débordement de son atlas de glyphes en WebAssembly, appliqué par `[patch.crates-io]` en attendant une version corrigée. Voir [`vendor/macroquad/PATCH.md`](vendor/macroquad/PATCH.md).
 - Police de l'interface : Barlow, sous licence SIL Open Font License 1.1 ([`assets/fonts/OFL.txt`](assets/fonts/OFL.txt)).
