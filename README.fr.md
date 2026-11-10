@@ -2,6 +2,8 @@
 
 > [Read in English](README.md)
 
+**Jouer dans le navigateur :** https://vblackjack.github.io/Kinetix/
+
 **KINETIX** est un casse-briques moderne haute vélocité écrit en Rust, avec une physique déterministe, une campagne de 800 secteurs répartis sur 8 mondes, des moteurs de rendu commutables à chaud et une architecture multi-plateforme (WebAssembly, Windows, Linux, Android).
 
 ## Architecture

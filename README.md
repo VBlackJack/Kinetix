@@ -2,6 +2,8 @@
 
 > [Lire en francais](README.fr.md)
 
+**Play in the browser:** https://vblackjack.github.io/Kinetix/
+
 **KINETIX** is a modern, high-velocity brick breaker written in Rust, with deterministic physics, an 800-sector campaign across 8 worlds, hot-swappable visual renderers, and multi-platform targets (WebAssembly, Windows, Linux, Android).
 
 ## Architecture
