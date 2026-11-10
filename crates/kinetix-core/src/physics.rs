@@ -14,13 +14,21 @@
  * limitations under the License.
  */
 
-use crate::config::{ArenaConfig, GameConfig, LevelDef};
+use crate::config::{ArenaConfig, CellSize, GameConfig, LevelDef};
 use crate::level_code::{EDITOR_COLS, EDITOR_ROWS};
 use serde::{Deserialize, Serialize};
 
-const BRICK_TOP_OFFSET: f32 = 140.0;
+pub(crate) const BRICK_TOP_OFFSET: f32 = 140.0;
 const BRICK_HEIGHT: f32 = 26.0;
 const BRICK_GAP: f32 = 5.0;
+/// Longest frame time, in seconds, the simulation is ever advanced by in one update.
+pub const MAX_FRAME_DT: f32 = 0.033;
+/// Maximum number of columns of a fine brick grid.
+pub const FINE_MAX_COLS: usize = 64;
+/// Smallest brick width or height, in pixels, accepted on a fine board.
+pub const FINE_MIN_BRICK_SIZE: f32 = 6.0;
+/// Free vertical space, in pixels, kept between the bottom of a fine grid and the paddle line.
+pub const FINE_PADDLE_CLEARANCE: f32 = 60.0;
 const TRAIL_MAX_LEN: usize = 22;
 const LASER_WIDTH: f32 = 4.0;
 const LASER_HEIGHT: f32 = 22.0;
@@ -124,27 +132,37 @@ pub(crate) struct BrickGrid {
     start_x: f32,
     play_w: f32,
     cols: usize,
+    row_h: f32,
+    gap: f32,
 }
 
 impl BrickGrid {
+    /// Coarse grid with the default row height and gap.
     pub(crate) fn new(arena: &ArenaConfig, cols: usize) -> Self {
+        Self::with_cell(arena, cols, BRICK_HEIGHT, BRICK_GAP)
+    }
+
+    /// Grid with an explicit row height and gap.
+    pub(crate) fn with_cell(arena: &ArenaConfig, cols: usize, row_h: f32, gap: f32) -> Self {
         let play_w = arena.width - (arena.wall_side + BRICK_GRID_SIDE_MARGIN) * 2.0;
         Self {
             start_x: arena.wall_side + BRICK_GRID_SIDE_MARGIN,
             play_w,
             cols: cols.max(1),
+            row_h,
+            gap,
         }
     }
 
     pub(crate) fn brick_w(&self) -> f32 {
-        (self.play_w - (self.cols as f32 - 1.0) * BRICK_GAP) / self.cols as f32
+        (self.play_w - (self.cols as f32 - 1.0) * self.gap) / self.cols as f32
     }
 
     /// Top-left corner of the cell at (`col`, `row`).
     pub(crate) fn cell_origin(&self, col: usize, row: usize) -> (f32, f32) {
         (
-            self.start_x + col as f32 * (self.brick_w() + BRICK_GAP),
-            BRICK_TOP_OFFSET + row as f32 * (BRICK_HEIGHT + BRICK_GAP),
+            self.start_x + col as f32 * (self.brick_w() + self.gap),
+            BRICK_TOP_OFFSET + row as f32 * (self.row_h + self.gap),
         )
     }
 
@@ -153,8 +171,8 @@ impl BrickGrid {
         if x < self.start_x || x > self.start_x + self.play_w || y < BRICK_TOP_OFFSET {
             return None;
         }
-        let col = ((x - self.start_x) / (self.brick_w() + BRICK_GAP)).floor() as usize;
-        let row = ((y - BRICK_TOP_OFFSET) / (BRICK_HEIGHT + BRICK_GAP)).floor() as usize;
+        let col = ((x - self.start_x) / (self.brick_w() + self.gap)).floor() as usize;
+        let row = ((y - BRICK_TOP_OFFSET) / (self.row_h + self.gap)).floor() as usize;
         if col >= self.cols || row >= max_rows {
             return None;
         }
@@ -171,6 +189,13 @@ struct RectContact {
     /// Displacement that moves the ball out of the rectangle.
     push_x: f32,
     push_y: f32,
+}
+
+/// Squared distance from the ball centre to the brick rectangle (zero when the centre is inside).
+fn centre_to_rect_dist_sq(ball: &Ball, brick: &Brick) -> f32 {
+    let dx = ball.x - ball.x.clamp(brick.x, brick.x + brick.w);
+    let dy = ball.y - ball.y.clamp(brick.y, brick.y + brick.h);
+    dx * dx + dy * dy
 }
 
 /// Tests a circle against a rectangle. The normal follows the minimum penetration axis, also when
@@ -556,6 +581,8 @@ pub struct GameWorld {
     pub(crate) campaign_board: bool,
     /// False only while a pack board loaded with `PackRules::sudden_death == false` is active.
     sudden_death_enabled: bool,
+    /// Cell geometry of the current board when it is a fine grid, `None` for coarse boards.
+    fine_cell: Option<CellSize>,
     level_count: usize,
     pub lives: u32,
     pub combo: u32,
@@ -593,6 +620,7 @@ impl GameWorld {
             max_unlocked_level: 0,
             campaign_board: false,
             sudden_death_enabled: true,
+            fine_cell: None,
             level_count: levels.len(),
             lives: config.gameplay.initial_lives,
             combo: 0,
@@ -643,9 +671,14 @@ impl GameWorld {
         }
         self.current_level_idx = idx % levels.len();
         let level = &levels[self.current_level_idx];
-        self.load_from_rows(&level.rows, level.boss, level.world);
+        self.load_rows_with_cell(&level.rows, level.boss, level.world, level.cell);
         self.campaign_board = rules.campaign;
         self.sudden_death_enabled = rules.sudden_death;
+    }
+
+    /// True while the current board uses a fine brick grid (a pack level with a `cell` size).
+    pub fn is_fine_board(&self) -> bool {
+        self.fine_cell.is_some()
     }
 
     /// True when the current board is an untouched campaign sector.
@@ -663,10 +696,24 @@ impl GameWorld {
         self.bricks.clear();
         self.campaign_board = false;
         self.sudden_death_enabled = true;
+        self.fine_cell = None;
     }
 
     pub fn load_from_rows(&mut self, rows: &[String], has_boss: bool, world_tier: usize) {
+        self.load_rows_with_cell(rows, has_boss, world_tier, None);
+    }
+
+    /// Loads rows with an optional fine cell geometry; `None` gives the coarse default grid.
+    fn load_rows_with_cell(
+        &mut self,
+        rows: &[String],
+        has_boss: bool,
+        world_tier: usize,
+        cell: Option<CellSize>,
+    ) {
         self.sudden_death_enabled = true;
+        self.fine_cell = cell;
+        let (row_h, gap) = cell.map_or((BRICK_HEIGHT, BRICK_GAP), |c| (c.h, c.gap));
         self.bricks.clear();
         self.capsules.clear();
         self.lasers.clear();
@@ -698,7 +745,7 @@ impl GameWorld {
         }
 
         for (r_idx, row) in rows.iter().enumerate() {
-            let grid = BrickGrid::new(&self.config.arena, row.chars().count());
+            let grid = BrickGrid::with_cell(&self.config.arena, row.chars().count(), row_h, gap);
             let brick_w = grid.brick_w();
             for (c_idx, ch) in row.chars().enumerate() {
                 if ch == '0' || ch == ' ' {
@@ -754,7 +801,7 @@ impl GameWorld {
                     ),
                 };
                 self.bricks
-                    .push(Brick::new(x, y, brick_w, BRICK_HEIGHT, vx, kind, 0.0));
+                    .push(Brick::new(x, y, brick_w, row_h, vx, kind, 0.0));
             }
         }
         self.reset_paddle_and_ball();
@@ -792,6 +839,7 @@ impl GameWorld {
     pub fn paint_brick_at(&mut self, world_x: f32, world_y: f32, kind: Option<BrickKind>) {
         self.campaign_board = false;
         self.sudden_death_enabled = true;
+        self.fine_cell = None;
         let grid = BrickGrid::new(&self.config.arena, EDITOR_COLS);
         let Some((c_idx, r_idx)) = grid.cell_at(world_x, world_y, EDITOR_ROWS) else {
             return;
@@ -1219,15 +1267,25 @@ impl GameWorld {
             }
 
             // Brick collision
+            let fine_board = self.fine_cell.is_some();
             let mut hit = None;
+            let mut hit_dist_sq = f32::INFINITY;
             for (idx, brick) in self.bricks.iter().enumerate() {
                 // A portal on cooldown must not mask a neighbouring brick.
                 if matches!(brick.kind, BrickKind::Portal) && ball.portal_cooldown > 0.0 {
                     continue;
                 }
                 if let Some(contact) = rect_contact(&ball, brick.x, brick.y, brick.w, brick.h) {
-                    hit = Some((idx, contact));
-                    break;
+                    if !fine_board {
+                        hit = Some((idx, contact));
+                        break;
+                    }
+                    // Fine boards resolve the deepest contact: the nearest brick to the centre.
+                    let dist_sq = centre_to_rect_dist_sq(&ball, brick);
+                    if dist_sq < hit_dist_sq {
+                        hit_dist_sq = dist_sq;
+                        hit = Some((idx, contact));
+                    }
                 }
             }
 
@@ -1278,7 +1336,7 @@ impl GameWorld {
                                 .ball
                                 .bumper_speed_boost
                                 .min((max_speed - ball.speed).max(0.0));
-                        } else {
+                        } else if !(fine_board && is_indestructible) {
                             ball.speed =
                                 (ball.speed + self.config.ball.speed_step_on_hit).min(max_speed);
                         }
@@ -1527,7 +1585,8 @@ impl GameWorld {
     /// exploding bricks add their own centre to the pending list. Targets are damaged in
     /// descending index order so that `swap_remove` never invalidates an index still to visit.
     fn resolve_explosions(&mut self, mut chain: Vec<(f32, f32)>, events: &mut Vec<GameEvent>) {
-        let radius = self.config.gameplay.explosion_radius;
+        let radius = self.config.gameplay.explosion_radius
+            * self.fine_cell.map_or(1.0, |cell| cell.h / BRICK_HEIGHT);
         while let Some((x, y)) = chain.pop() {
             events.push(GameEvent::Explosion { x, y, radius });
             let targets: Vec<usize> = self

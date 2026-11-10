@@ -15,6 +15,7 @@
  */
 
 pub mod config;
+pub mod fine_level;
 pub mod i18n;
 pub mod level_code;
 pub mod physics;

@@ -367,6 +367,7 @@ mod tests {
             name: String::new(),
             boss: false,
             rows: Vec::new(),
+            cell: None,
         }
     }
 

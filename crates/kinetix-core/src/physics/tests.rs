@@ -15,6 +15,7 @@
  */
 
 use super::*;
+use crate::config::CellSize;
 use crate::test_support::{levels, world};
 
 const EPS: f32 = 1e-3;
@@ -877,4 +878,291 @@ fn the_sudden_death_getter_follows_the_pack_rules_and_editor_edits() {
     w.load_pack_level(0, &lv, PackRules::non_campaign(false));
     w.clear_bricks();
     assert!(w.sudden_death_enabled(), "an edited board has sudden death");
+}
+
+// ---- Fine brick grids ----
+
+const FINE_TEST_COLS: usize = 45;
+const FINE_TEST_ROWS: usize = 20;
+const FINE_TEST_CELL_H: f32 = 13.0;
+const FINE_TEST_GAP: f32 = 2.0;
+const FINE_TEST_POCKET_ROWS: usize = 3;
+const FINE_TEST_ENTRANCE_COLS: usize = 3;
+const FINE_TEST_FRAMES: usize = 600;
+const FINE_TEST_FRAME_DT: f32 = 1.0 / 60.0;
+const FINE_TEST_BALL_VX: f32 = 0.3;
+const FINE_TEST_BALL_VY: f32 = -0.954;
+const FINE_TEST_BALL_SPEED: f32 = 800.0;
+const FINE_TEST_SMALL_BRICK: f32 = 10.0;
+const FINE_TEST_NEAR_FRACTION: f32 = 0.75;
+
+/// Width available to bricks, derived from the arena config like the brick grid does.
+fn fine_test_play_w() -> f32 {
+    BrickGrid::new(&world().config.arena, 1).play_w
+}
+
+fn fine_cell() -> CellSize {
+    CellSize {
+        h: FINE_TEST_CELL_H,
+        gap: FINE_TEST_GAP,
+    }
+}
+
+fn fine_def(rows: Vec<String>, cell: Option<CellSize>) -> LevelDef {
+    LevelDef {
+        id: 1,
+        world: 1,
+        name: "FINE".to_owned(),
+        boss: false,
+        rows,
+        cell,
+    }
+}
+
+/// Steel frame with a bottom entrance, bricks inside and an empty pocket above the entrance.
+fn framed_rows() -> Vec<String> {
+    let last = FINE_TEST_ROWS - 1;
+    let pocket_start = last - FINE_TEST_POCKET_ROWS;
+    let entrance_start = (FINE_TEST_COLS - FINE_TEST_ENTRANCE_COLS) / 2;
+    (0..FINE_TEST_ROWS)
+        .map(|r| {
+            (0..FINE_TEST_COLS)
+                .map(|c| {
+                    let edge_col = c == 0 || c == FINE_TEST_COLS - 1;
+                    let in_entrance =
+                        (entrance_start..entrance_start + FINE_TEST_ENTRANCE_COLS).contains(&c);
+                    if r == 0 || edge_col {
+                        '#'
+                    } else if r == last {
+                        if in_entrance {
+                            '0'
+                        } else {
+                            '#'
+                        }
+                    } else if r >= pocket_start {
+                        '0'
+                    } else {
+                        '1'
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Empty world flagged as a fine board, with one free ball.
+fn empty_fine_world(x: f32, y: f32, vx: f32, vy: f32) -> GameWorld {
+    let mut w = empty_world(x, y, vx, vy);
+    w.fine_cell = Some(fine_cell());
+    w
+}
+
+fn small_brick(x: f32, y: f32, w: f32, h: f32, kind: BrickKind) -> Brick {
+    Brick::new(x, y, w, h, 0.0, kind, 0.0)
+}
+
+#[test]
+fn a_level_without_cell_keeps_the_default_geometry() {
+    let lv = levels();
+    let mut w = world();
+    w.load_pack_level(0, &lv, PackRules::CAMPAIGN);
+    assert!(!w.is_fine_board());
+    let cols = lv[0].rows[0].chars().count();
+    let expected_w = (fine_test_play_w() - (cols as f32 - 1.0) * BRICK_GAP) / cols as f32;
+    let first = &w.bricks[0];
+    assert!((first.w - expected_w).abs() < EPS);
+    assert!((first.h - BRICK_HEIGHT).abs() < EPS);
+    assert!((first.y - BRICK_TOP_OFFSET).abs() < EPS);
+}
+
+#[test]
+fn a_level_with_cell_uses_the_fine_geometry() {
+    let mut w = world();
+    let def = fine_def(framed_rows(), Some(fine_cell()));
+    w.load_pack_level(0, &[def], PackRules::non_campaign(false));
+    assert!(w.is_fine_board());
+    let expected_w = (fine_test_play_w() - (FINE_TEST_COLS as f32 - 1.0) * FINE_TEST_GAP)
+        / FINE_TEST_COLS as f32;
+    let first = &w.bricks[0];
+    assert!((first.w - expected_w).abs() < EPS);
+    assert!((first.h - FINE_TEST_CELL_H).abs() < EPS);
+    assert!((first.y - BRICK_TOP_OFFSET).abs() < EPS);
+    let second = &w.bricks[1];
+    assert!((second.x - first.x - (expected_w + FINE_TEST_GAP)).abs() < EPS);
+    let row_one = w
+        .bricks
+        .iter()
+        .find(|b| b.y > BRICK_TOP_OFFSET + EPS)
+        .expect("a brick below the first row");
+    assert!((row_one.y - (BRICK_TOP_OFFSET + FINE_TEST_CELL_H + FINE_TEST_GAP)).abs() < EPS);
+}
+
+#[test]
+fn every_other_load_path_clears_the_fine_board_flag() {
+    let fine = fine_def(framed_rows(), Some(fine_cell()));
+    let rules = PackRules::non_campaign(false);
+    let mut w = world();
+
+    w.load_pack_level(0, std::slice::from_ref(&fine), rules);
+    assert!(w.is_fine_board());
+    w.load_from_rows(&["1".to_string()], false, 1);
+    assert!(!w.is_fine_board());
+
+    w.load_pack_level(0, std::slice::from_ref(&fine), rules);
+    w.load_level(0, &levels());
+    assert!(!w.is_fine_board());
+
+    w.load_pack_level(0, std::slice::from_ref(&fine), rules);
+    w.clear_bricks();
+    assert!(!w.is_fine_board());
+
+    w.load_pack_level(0, std::slice::from_ref(&fine), rules);
+    let mid_x = w.config.arena.width * 0.5;
+    w.paint_brick_at(mid_x, BRICK_TOP_OFFSET + 1.0, Some(standard(1, 1, 0)));
+    assert!(!w.is_fine_board());
+}
+
+/// Ball touching two stacked bricks, the farther one first in the list.
+fn two_brick_overlap(w: &mut GameWorld) {
+    for y in [508.0, 505.0] {
+        w.bricks.push(small_brick(
+            480.0,
+            y,
+            40.0,
+            FINE_TEST_SMALL_BRICK,
+            standard(2, 2, 0),
+        ));
+    }
+}
+
+#[test]
+fn fine_boards_resolve_the_deepest_contact() {
+    let mut w = empty_fine_world(500.0, 500.0, 0.0, 1.0);
+    two_brick_overlap(&mut w);
+    step(&mut w, 1);
+    assert_eq!(brick_hp(&w, 0), 2, "the farther brick is left alone");
+    assert_eq!(brick_hp(&w, 1), 1, "the nearer brick takes the hit");
+}
+
+#[test]
+fn coarse_boards_keep_first_contact_wins() {
+    let mut w = empty_world(500.0, 500.0, 0.0, 1.0);
+    two_brick_overlap(&mut w);
+    step(&mut w, 1);
+    assert_eq!(brick_hp(&w, 0), 1);
+    assert_eq!(brick_hp(&w, 1), 2);
+}
+
+/// Ball just below an indestructible brick, moving up into it.
+fn indestructible_hit_world(fine: bool) -> GameWorld {
+    let mut w = if fine {
+        empty_fine_world(500.0, 497.0, 0.0, -1.0)
+    } else {
+        empty_world(500.0, 497.0, 0.0, -1.0)
+    };
+    w.balls[0].speed = FINE_TEST_BALL_SPEED;
+    w.bricks.push(small_brick(
+        480.0,
+        480.0,
+        40.0,
+        FINE_TEST_CELL_H,
+        BrickKind::Indestructible,
+    ));
+    w
+}
+
+#[test]
+fn indestructible_hits_keep_the_speed_on_fine_boards_only() {
+    let mut fine = indestructible_hit_world(true);
+    step(&mut fine, 1);
+    assert!(fine.balls[0].vy > 0.0, "the ball bounced");
+    assert!((fine.balls[0].speed - FINE_TEST_BALL_SPEED).abs() < EPS);
+
+    let mut coarse = indestructible_hit_world(false);
+    step(&mut coarse, 1);
+    assert!(coarse.balls[0].vy > 0.0, "the ball bounced");
+    assert!(coarse.balls[0].speed > FINE_TEST_BALL_SPEED);
+}
+
+/// Explodes at (500, 500) next to a brick at 75% of the base radius; returns whether the brick
+/// survived and the radius carried by the explosion event.
+fn near_brick_survives_explosion(w: &mut GameWorld) -> (bool, f32) {
+    let (cx, cy) = (500.0, 500.0);
+    let r = w.config.gameplay.explosion_radius;
+    let half = FINE_TEST_SMALL_BRICK * 0.5;
+    w.bricks.push(small_brick(
+        cx + r * FINE_TEST_NEAR_FRACTION - half,
+        cy - half,
+        FINE_TEST_SMALL_BRICK,
+        FINE_TEST_SMALL_BRICK,
+        standard(1, 1, 0),
+    ));
+    let mut events = Vec::new();
+    w.trigger_explosion(cx, cy, &mut events);
+    let radius = events
+        .iter()
+        .find_map(|e| match e {
+            GameEvent::Explosion { radius, .. } => Some(*radius),
+            _ => None,
+        })
+        .expect("an explosion event");
+    (!w.bricks.is_empty(), radius)
+}
+
+#[test]
+fn the_explosion_radius_scales_with_the_row_height_on_fine_boards() {
+    let mut coarse = empty_world(960.0, 800.0, 0.0, -1.0);
+    let base = coarse.config.gameplay.explosion_radius;
+    let (survived, radius) = near_brick_survives_explosion(&mut coarse);
+    assert!(!survived, "a brick at 75% of the radius is caught");
+    assert!((radius - base).abs() < EPS);
+
+    let mut fine = empty_fine_world(960.0, 800.0, 0.0, -1.0);
+    let (survived, radius) = near_brick_survives_explosion(&mut fine);
+    assert!(survived, "the same brick is out of the scaled radius");
+    assert!((radius - base * FINE_TEST_CELL_H / BRICK_HEIGHT).abs() < EPS);
+}
+
+#[test]
+fn the_per_substep_travel_stays_below_the_ball_radius() {
+    let w = world();
+    let travel = w.config.ball.max_speed * MAX_FRAME_DT / w.config.ball.substeps as f32;
+    assert!(
+        travel < w.config.ball.default_radius,
+        "{travel} px per substep would let the ball tunnel through a brick edge"
+    );
+}
+
+#[test]
+fn a_ball_inside_a_framed_fine_board_destroys_bricks() {
+    let mut w = world();
+    let def = fine_def(framed_rows(), Some(fine_cell()));
+    w.load_pack_level(0, &[def], PackRules::non_campaign(false));
+    let destructible_before = w.bricks.iter().filter(|b| b.is_destructible()).count();
+    let pocket_row = FINE_TEST_ROWS - 1 - FINE_TEST_POCKET_ROWS / 2 - 1;
+    let pocket_y = BRICK_TOP_OFFSET
+        + pocket_row as f32 * (FINE_TEST_CELL_H + FINE_TEST_GAP)
+        + FINE_TEST_CELL_H * 0.5;
+    let mid_x = w.config.arena.width * 0.5;
+    let ball = &mut w.balls[0];
+    ball.stuck_offset = None;
+    ball.x = mid_x;
+    ball.y = pocket_y;
+    ball.vx = FINE_TEST_BALL_VX;
+    ball.vy = FINE_TEST_BALL_VY;
+    ball.speed = FINE_TEST_BALL_SPEED;
+
+    let mut events = Vec::new();
+    for _ in 0..FINE_TEST_FRAMES {
+        w.update(FINE_TEST_FRAME_DT, &mut events);
+    }
+    let destructible_after = w.bricks.iter().filter(|b| b.is_destructible()).count();
+    assert!(
+        destructible_after < destructible_before,
+        "no brick was destroyed in {FINE_TEST_FRAMES} frames"
+    );
+    assert!(w
+        .bricks
+        .iter()
+        .any(|b| matches!(b.kind, BrickKind::Indestructible)));
 }

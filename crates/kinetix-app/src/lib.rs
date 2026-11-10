@@ -16,6 +16,7 @@
 
 //! Pure, testable application logic shared with the `kinetix-app` binary.
 
+pub mod frame_budget;
 pub mod library;
 pub mod menu;
 pub mod persistence;
