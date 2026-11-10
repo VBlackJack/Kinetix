@@ -26,13 +26,14 @@ use audio::{
     set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
+use kinetix_app::frame_budget::take_budget;
 use kinetix_app::library::{
     library_is_loaded, load_library, reload_library_if_unloaded, save_library,
 };
 use kinetix_app::menu::{draw_menu, Menu, MenuAction, MENU_FONT_SIZES, SIZE_HOME_TITLE};
 use kinetix_app::persistence::{load_progress, load_settings, save_settings, Settings};
 use kinetix_app::play_source::PlaySource;
-use kinetix_app::satisfaction::{level_names, satisfaction_pack};
+use kinetix_app::satisfaction::{level_names, satisfaction_levels as combined_satisfaction_levels};
 use kinetix_core::config::{GameConfig, LevelDef, LevelPack, RenderStyle, ThemeDef, ThemeRegistry};
 use kinetix_core::i18n::{I18nCatalog, Language};
 use kinetix_core::level_code::LevelCodeError;
@@ -556,7 +557,7 @@ async fn main() {
     let catalog_en = I18nCatalog::from_json_str(RAW_EN).expect("Invalid en.json");
     let catalog_fr = I18nCatalog::from_json_str(RAW_FR).expect("Invalid fr.json");
     let ui_font = load_ttf_font_from_bytes(RAW_FONT).expect("Failed to load embedded UI font");
-    let satisfaction_levels = satisfaction_pack();
+    let satisfaction_levels = combined_satisfaction_levels();
     let satisfaction_names: Vec<String> = level_names(&satisfaction_levels)
         .into_iter()
         .map(str::to_owned)
@@ -1407,6 +1408,9 @@ async fn main() {
         }
 
         // Process visual & audio events
+        let mut brick_sfx_budget = MAX_BRICK_SFX_PER_FRAME;
+        let mut brick_warp_budget = MAX_BRICK_WARP_PER_FRAME;
+        let fine_board = world.is_fine_board();
         for ev in events.drain(..) {
             match ev {
                 GameEvent::BrickHit {
@@ -1417,13 +1421,18 @@ async fn main() {
                     points,
                     multiplier,
                 } => {
-                    sfx.play_brick(world.combo);
-                    warp_grid.apply_impulse(x, y, 165.0, if destroyed { 320.0 } else { 140.0 });
+                    if take_budget(&mut brick_sfx_budget) {
+                        sfx.play_brick(world.combo);
+                    }
+                    if take_budget(&mut brick_warp_budget) {
+                        warp_grid.apply_impulse(x, y, 165.0, if destroyed { 320.0 } else { 140.0 });
+                    }
                     let base_col = rgba(theme.brick_palette[color_idx % theme.brick_palette.len()]);
-                    let count = if destroyed {
-                        BRICK_PARTICLES_DESTROYED
-                    } else {
-                        BRICK_PARTICLES_HIT
+                    let count = match (destroyed, fine_board) {
+                        (true, false) => BRICK_PARTICLES_DESTROYED,
+                        (false, false) => BRICK_PARTICLES_HIT,
+                        (true, true) => FINE_BRICK_PARTICLES_DESTROYED,
+                        (false, true) => FINE_BRICK_PARTICLES_HIT,
                     };
                     let gravity = if theme.style == RenderStyle::IndustrialMetal {
                         GRAVITY_INDUSTRIAL
@@ -1991,11 +2000,22 @@ fn draw_bricks(world: &GameWorld, theme: &ThemeDef, font: &Font, time: f32) {
             alpha_mul,
         );
 
-        let pop = brick.hit_flash * 4.5;
+        let flat = brick.h < FLAT_BRICK_MAX_H;
+        let pop = if flat {
+            (brick.hit_flash * 4.5).min(FLAT_BRICK_POP_MAX)
+        } else {
+            brick.hit_flash * 4.5
+        };
         let rx = brick.x - pop * 0.5;
         let ry = brick.y - pop * 0.5;
         let rw = brick.w + pop;
         let rh = brick.h + pop;
+
+        if flat {
+            // Small bricks of a fine grid: one filled rectangle, no style decoration.
+            draw_rectangle(rx, ry, rw, rh, col);
+            continue;
+        }
 
         let rim = match theme.style {
             RenderStyle::NeonGlow | RenderStyle::WireframeHolo | RenderStyle::OutrunGold => {
@@ -2707,6 +2727,16 @@ fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn per_frame_effect_caps_leave_normal_play_untouched() {
+        // A normal frame destroys one or two bricks; the caps only bite on bursts.
+        const NORMAL_HITS_PER_FRAME: u32 = 2;
+        const { assert!(MAX_BRICK_SFX_PER_FRAME >= NORMAL_HITS_PER_FRAME) };
+        const { assert!(MAX_BRICK_WARP_PER_FRAME >= NORMAL_HITS_PER_FRAME) };
+        const { assert!(FINE_BRICK_PARTICLES_HIT < BRICK_PARTICLES_HIT) };
+        const { assert!(FINE_BRICK_PARTICLES_DESTROYED < BRICK_PARTICLES_DESTROYED) };
+    }
+
     use super::*;
 
     #[test]

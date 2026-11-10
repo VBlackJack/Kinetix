@@ -19,12 +19,28 @@
 use kinetix_core::config::LevelPack;
 
 const SATISFACTION_JSON: &str = include_str!("../../../assets/config/satisfaction.json");
+const SATISFACTION_FINE_JSON: &str = include_str!("../../../assets/config/satisfaction_fine.json");
 
 /// Parses the embedded satisfaction pack.
 ///
 /// The asset is compiled in and checked by tests, so a parse failure is a build defect.
 pub fn satisfaction_pack() -> LevelPack {
     serde_json::from_str(SATISFACTION_JSON).expect("embedded satisfaction.json must be valid")
+}
+
+/// Parses the embedded fine-grid satisfaction pack.
+///
+/// The asset is compiled in and checked by tests, so a parse failure is a build defect.
+pub fn fine_pack() -> LevelPack {
+    serde_json::from_str(SATISFACTION_FINE_JSON)
+        .expect("embedded satisfaction_fine.json must be valid")
+}
+
+/// Every satisfaction level in play order: the coarse pack, then the fine one.
+pub fn satisfaction_levels() -> LevelPack {
+    let mut pack = satisfaction_pack();
+    pack.levels.extend(fine_pack().levels);
+    pack
 }
 
 /// Level names in pack order, used to preload glyphs before the first frame.
@@ -37,10 +53,13 @@ mod tests {
     use super::*;
     use crate::play_source::PlaySource;
     use kinetix_core::config::LevelDef;
+    use kinetix_core::fine_level::validate_fine_level;
     use kinetix_core::level_code::{parse_level_code, EDITOR_COLS, LEVEL_CODE_PREFIX};
     use std::collections::HashSet;
 
     const EXPECTED_LEVEL_COUNT: usize = 5;
+    const EXPECTED_FINE_LEVEL_COUNT: usize = 3;
+    const FINE_COLUMNS: usize = 45;
     const ROW_SEPARATOR: &str = "/";
 
     fn code_of(level: &LevelDef) -> String {
@@ -90,6 +109,49 @@ mod tests {
         let names = level_names(&pack);
         assert_eq!(names.len(), EXPECTED_LEVEL_COUNT);
         for name in names {
+            assert!(!name.trim().is_empty());
+            assert!(name.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+        }
+    }
+
+    fn game_config() -> kinetix_core::config::GameConfig {
+        serde_json::from_str(include_str!("../../../assets/config/game_config.json"))
+            .expect("valid game_config.json")
+    }
+
+    #[test]
+    fn fine_asset_parses_and_every_level_validates() {
+        let pack = fine_pack();
+        assert_eq!(pack.levels.len(), EXPECTED_FINE_LEVEL_COUNT);
+        let config = game_config();
+        for level in &pack.levels {
+            assert!(level.cell.is_some(), "level {} has no cell", level.id);
+            assert_eq!(level.rows[0].chars().count(), FINE_COLUMNS);
+            assert_eq!(
+                validate_fine_level(level, &config),
+                Ok(()),
+                "level {}",
+                level.id
+            );
+        }
+    }
+
+    #[test]
+    fn combined_pack_has_unique_sequential_ids_and_printable_names() {
+        let pack = satisfaction_levels();
+        assert_eq!(
+            pack.levels.len(),
+            EXPECTED_LEVEL_COUNT + EXPECTED_FINE_LEVEL_COUNT
+        );
+        let ids: HashSet<usize> = pack.levels.iter().map(|l| l.id).collect();
+        assert_eq!(ids.len(), pack.levels.len());
+        for (i, level) in pack.levels.iter().enumerate() {
+            assert_eq!(level.id, i + 1);
+            assert_eq!(level.world, 1);
+            assert!(!level.boss);
+            assert_eq!(level.cell.is_some(), i >= EXPECTED_LEVEL_COUNT);
+        }
+        for name in level_names(&pack) {
             assert!(!name.trim().is_empty());
             assert!(name.chars().all(|c| c.is_ascii_graphic() || c == ' '));
         }

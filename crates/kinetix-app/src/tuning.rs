@@ -96,6 +96,16 @@ pub const BRICK_PARTICLE_ANGLE_JITTER: f32 = 0.25;
 pub const GRAVITY_INDUSTRIAL: f32 = 580.0;
 pub const GRAVITY_DEFAULT: f32 = 140.0;
 pub const SHARDS_PER_BRICK: usize = 6;
+/// Particles per hit on a fine grid, where bricks are small and hits come in bursts.
+pub const FINE_BRICK_PARTICLES_HIT: usize = 3;
+pub const FINE_BRICK_PARTICLES_DESTROYED: usize = 7;
+/// Brick sounds and warp-grid impulses played per frame; only a burst of hits reaches them.
+pub const MAX_BRICK_SFX_PER_FRAME: u32 = 4;
+pub const MAX_BRICK_WARP_PER_FRAME: u32 = 6;
+/// Bricks lower than this (arena units) are drawn as a single flat rectangle.
+pub const FLAT_BRICK_MAX_H: f32 = 20.0;
+/// Largest hit-flash growth of a flat brick, in arena units.
+pub const FLAT_BRICK_POP_MAX: f32 = 2.0;
 pub const SHARD_LIFE: f32 = 0.78;
 pub const SHARD_GRAVITY: f32 = 650.0;
 pub const SHARD_SPREAD_X: f32 = 26.0;

@@ -49,9 +49,13 @@ impl Session {
 
 /// Enters the level editor: the board edited from here on belongs to an editor test, whatever
 /// was being played before, so it can never reach the campaign progress. Fresh paddle and ball.
+/// A fine grid cannot be edited: entering from one starts from an empty coarse board.
 pub(crate) fn enter_editor(session: &mut Session, world: &mut GameWorld) {
     session.source = PlaySource::EditorTest;
     session.editor_snapshot = None;
+    if world.is_fine_board() {
+        world.clear_bricks();
+    }
     world.reset_paddle_and_ball();
     world.status = SessionStatus::Playing;
 }
@@ -556,6 +560,40 @@ mod tests {
         world.bricks.clear();
         world.boss = None;
         world.update(0.016, &mut Vec::new());
+    }
+
+    #[test]
+    fn entering_the_editor_from_a_fine_board_starts_from_an_empty_coarse_board() {
+        let (mut world, pack) = dev_test_world();
+        let fine = kinetix_app::satisfaction::fine_pack().levels;
+        let mut session = Session::campaign();
+        start_run_from_title(
+            &mut world,
+            &mut DevState::default(),
+            &fine,
+            0,
+            PlaySource::Satisfaction,
+        );
+        session.source = PlaySource::Satisfaction;
+        assert!(world.is_fine_board());
+        assert!(!world.bricks.is_empty());
+
+        enter_editor(&mut session, &mut world);
+        assert_eq!(session.source, PlaySource::EditorTest);
+        assert!(!world.is_fine_board());
+        assert!(world.bricks.is_empty());
+
+        // A coarse board keeps its bricks when the editor is entered.
+        start_run_from_title(
+            &mut world,
+            &mut DevState::default(),
+            &pack.levels,
+            0,
+            PlaySource::Campaign,
+        );
+        let count = world.bricks.len();
+        enter_editor(&mut session, &mut world);
+        assert_eq!(world.bricks.len(), count);
     }
 
     #[test]
