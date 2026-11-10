@@ -106,6 +106,8 @@ pub const MAX_BRICK_WARP_PER_FRAME: u32 = 6;
 pub const FLAT_BRICK_MAX_H: f32 = 20.0;
 /// Largest hit-flash growth of a flat brick, in arena units.
 pub const FLAT_BRICK_POP_MAX: f32 = 2.0;
+/// Colour multiplier for a damaged multi-hit mini-brick (hp below max_hp).
+pub const FLAT_BRICK_DAMAGED_SHADE: f32 = 0.6;
 pub const SHARD_LIFE: f32 = 0.78;
 pub const SHARD_GRAVITY: f32 = 650.0;
 pub const SHARD_SPREAD_X: f32 = 26.0;

@@ -2013,7 +2013,19 @@ fn draw_bricks(world: &GameWorld, theme: &ThemeDef, font: &Font, time: f32) {
 
         if flat {
             // Small bricks of a fine grid: one filled rectangle, no style decoration.
-            draw_rectangle(rx, ry, rw, rh, col);
+            let damaged =
+                matches!(brick.kind, BrickKind::Standard { hp, max_hp, .. } if hp < max_hp);
+            let flat_col = if damaged {
+                Color::new(
+                    col.r * FLAT_BRICK_DAMAGED_SHADE,
+                    col.g * FLAT_BRICK_DAMAGED_SHADE,
+                    col.b * FLAT_BRICK_DAMAGED_SHADE,
+                    col.a,
+                )
+            } else {
+                col
+            };
+            draw_rectangle(rx, ry, rw, rh, flat_col);
             continue;
         }
 
@@ -2727,17 +2739,43 @@ fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn per_frame_effect_caps_leave_normal_play_untouched() {
         // A normal frame destroys one or two bricks; the caps only bite on bursts.
         const NORMAL_HITS_PER_FRAME: u32 = 2;
+        const BURST_EXTRA_HITS: u32 = 10;
         const { assert!(MAX_BRICK_SFX_PER_FRAME >= NORMAL_HITS_PER_FRAME) };
         const { assert!(MAX_BRICK_WARP_PER_FRAME >= NORMAL_HITS_PER_FRAME) };
         const { assert!(FINE_BRICK_PARTICLES_HIT < BRICK_PARTICLES_HIT) };
         const { assert!(FINE_BRICK_PARTICLES_DESTROYED < BRICK_PARTICLES_DESTROYED) };
-    }
 
-    use super::*;
+        // Same per-hit sequence as the event loop, for a burst larger than both caps.
+        let burst = MAX_BRICK_SFX_PER_FRAME.max(MAX_BRICK_WARP_PER_FRAME) + BURST_EXTRA_HITS;
+        let mut sfx_budget = MAX_BRICK_SFX_PER_FRAME;
+        let mut warp_budget = MAX_BRICK_WARP_PER_FRAME;
+        let mut sounds = 0;
+        let mut impulses = 0;
+        for _ in 0..burst {
+            if take_budget(&mut sfx_budget) {
+                sounds += 1;
+            }
+            if take_budget(&mut warp_budget) {
+                impulses += 1;
+            }
+        }
+        assert_eq!(sounds, MAX_BRICK_SFX_PER_FRAME);
+        assert_eq!(impulses, MAX_BRICK_WARP_PER_FRAME);
+
+        // A single hit per frame always passes, frame after frame.
+        for _ in 0..burst {
+            let mut sfx_budget = MAX_BRICK_SFX_PER_FRAME;
+            let mut warp_budget = MAX_BRICK_WARP_PER_FRAME;
+            assert!(take_budget(&mut sfx_budget));
+            assert!(take_budget(&mut warp_budget));
+        }
+    }
 
     #[test]
     fn absolute_input_is_detected_by_oversized_deltas() {

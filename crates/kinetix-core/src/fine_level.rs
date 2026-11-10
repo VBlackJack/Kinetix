@@ -47,6 +47,9 @@ pub enum FineLevelError {
 }
 
 /// Checks that `level` is a playable fine grid for `config`.
+///
+/// Today this is enforced only by tests on the compiled-in asset. Any future
+/// loader of external level packs must call it before accepting a fine level.
 pub fn validate_fine_level(level: &LevelDef, config: &GameConfig) -> Result<(), FineLevelError> {
     let cell = level.cell.ok_or(FineLevelError::MissingCell)?;
     if !(cell.h.is_finite() && cell.gap.is_finite() && cell.h > 0.0 && cell.gap >= 0.0) {

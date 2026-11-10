@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn a_non_campaign_source_never_writes_progress_even_without_a_taint() {
         let (mut world, _) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
         let dev = DevState::default();
         let mut session = Session::campaign();
@@ -704,7 +704,7 @@ mod tests {
             &mut world,
             &mut dev,
             &pack.levels,
-            &satisfaction_levels(),
+            &coarse_satisfaction(),
             &Library::default(),
         );
         assert_eq!(outcome, PauseOutcome::Resumed);
@@ -726,7 +726,7 @@ mod tests {
             &mut world,
             &mut dev,
             &pack.levels,
-            &satisfaction_levels(),
+            &coarse_satisfaction(),
             &Library::default(),
         );
         assert!(dev.tainted);
@@ -765,8 +765,50 @@ mod tests {
         }
     }
 
-    fn satisfaction_levels() -> Vec<LevelDef> {
+    fn coarse_satisfaction() -> Vec<LevelDef> {
         kinetix_app::satisfaction::satisfaction_pack().levels
+    }
+
+    const LAST_COARSE_LEVEL_IDX: usize = 4;
+    const LAST_SATISFACTION_LEVEL_IDX: usize = 7;
+
+    #[test]
+    fn winning_the_last_coarse_level_loads_the_first_fine_board() {
+        let (mut world, campaign) = dev_test_world();
+        let all = kinetix_app::satisfaction::satisfaction_levels().levels;
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &all,
+            LAST_COARSE_LEVEL_IDX
+        ));
+        assert!(!world.is_fine_board());
+        win_current_level(&mut world);
+        let outcome = advance_after_victory(&session, &mut world, &mut dev, &campaign.levels, &all);
+        assert_eq!(outcome, VictoryOutcome::NextLevel);
+        assert_eq!(world.current_level_idx, LAST_COARSE_LEVEL_IDX + 1);
+        assert!(world.is_fine_board());
+    }
+
+    #[test]
+    fn winning_the_last_fine_level_returns_to_the_satisfaction_page() {
+        let (mut world, campaign) = dev_test_world();
+        let all = kinetix_app::satisfaction::satisfaction_levels().levels;
+        assert_eq!(all.len(), LAST_SATISFACTION_LEVEL_IDX + 1);
+        let mut session = Session::campaign();
+        let mut dev = DevState::default();
+        assert!(start_satisfaction(
+            &mut session,
+            &mut world,
+            &all,
+            LAST_SATISFACTION_LEVEL_IDX
+        ));
+        assert!(world.is_fine_board());
+        win_current_level(&mut world);
+        let outcome = advance_after_victory(&session, &mut world, &mut dev, &campaign.levels, &all);
+        assert_eq!(outcome, VictoryOutcome::ToTitle(PageId::Satisfaction));
     }
 
     fn library_with_current_board(world: &GameWorld) -> (Library, u32) {
@@ -780,7 +822,7 @@ mod tests {
     #[test]
     fn a_satisfaction_start_resets_the_run_and_keeps_the_taint_alone() {
         let (mut world, _) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut session = Session::campaign();
         world.lives = 0;
         world.score = 900;
@@ -806,7 +848,7 @@ mod tests {
     #[test]
     fn a_satisfaction_start_out_of_range_changes_nothing() {
         let (mut world, _) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut session = Session::campaign();
         world.score = 900;
         assert!(!start_satisfaction(
@@ -822,7 +864,7 @@ mod tests {
     #[test]
     fn a_satisfaction_win_never_changes_the_saved_high_score_or_unlock() {
         let (mut world, _) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut session = Session::campaign();
         let saved_high_score = world.high_score;
         let saved_unlocked = world.max_unlocked_level;
@@ -857,7 +899,7 @@ mod tests {
     #[test]
     fn a_satisfaction_victory_moves_through_the_pack_and_ends_on_its_page() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut session = Session::campaign();
         let mut dev = DevState::default();
         assert!(start_satisfaction(
@@ -894,7 +936,7 @@ mod tests {
     #[test]
     fn restart_and_game_over_replay_the_same_satisfaction_level() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let library = Library::default();
         let mut session = Session::campaign();
         let mut dev = DevState::default();
@@ -927,7 +969,7 @@ mod tests {
     #[test]
     fn the_pause_restart_follows_the_source() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let library = Library::default();
         let mut session = Session::campaign();
         let mut dev = DevState::default();
@@ -971,7 +1013,7 @@ mod tests {
     #[test]
     fn a_library_level_plays_on_a_custom_board_and_a_win_returns_to_the_library() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut session = Session::campaign();
         let mut dev = DevState::default();
         let mut guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
@@ -1005,7 +1047,7 @@ mod tests {
     #[test]
     fn restarting_a_library_level_imports_the_same_code_again() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut session = Session::campaign();
         let mut dev = DevState::default();
         world.load_pack_level(1, &satisfaction, PlaySource::Satisfaction.pack_rules());
@@ -1047,7 +1089,7 @@ mod tests {
     #[test]
     fn an_editor_test_and_a_campaign_with_a_custom_board_go_back_to_the_editor() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut dev = DevState::default();
         let editor = Session {
             source: PlaySource::EditorTest,
@@ -1089,7 +1131,7 @@ mod tests {
     #[test]
     fn the_hud_label_names_the_board_of_the_source() {
         let (_, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut library = Library::default();
         library
             .add("FIRST".to_owned(), "KTX1:".to_owned())
@@ -1340,7 +1382,7 @@ mod tests {
     #[test]
     fn restarting_an_editor_test_replays_its_snapshot_not_a_campaign_sector() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let library = Library::default();
         let mut dev = DevState::default();
         let mut session = Session::campaign();
@@ -1370,7 +1412,7 @@ mod tests {
     #[test]
     fn the_pause_restart_of_an_editor_test_replays_the_snapshot() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut dev = DevState::default();
         let mut session = Session::campaign();
         world.load_pack_level(1, &satisfaction, PlaySource::Satisfaction.pack_rules());
@@ -1395,7 +1437,7 @@ mod tests {
     #[test]
     fn restarting_a_deleted_library_level_returns_to_the_library_page() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut dev = DevState::default();
         world.load_pack_level(0, &satisfaction, PlaySource::Satisfaction.pack_rules());
         let (mut library, id) = library_with_current_board(&world);
@@ -1433,7 +1475,7 @@ mod tests {
     #[test]
     fn victory_continues_matches_what_advancing_does() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut dev = DevState::default();
         let sources = [
             PlaySource::Campaign,
@@ -1504,7 +1546,7 @@ mod tests {
     #[test]
     fn leaving_the_editor_through_tab_still_snapshots_the_tested_board() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let library = Library::default();
         let mut dev = DevState::default();
         let mut session = Session::campaign();
@@ -1545,7 +1587,7 @@ mod tests {
     #[test]
     fn a_new_visit_to_the_editor_drops_the_stale_snapshot() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let library = Library::default();
         let mut dev = DevState::default();
         let mut session = Session::campaign();
@@ -1578,7 +1620,7 @@ mod tests {
     #[test]
     fn an_editor_test_without_a_snapshot_returns_to_the_editor() {
         let (mut world, campaign) = dev_test_world();
-        let satisfaction = satisfaction_levels();
+        let satisfaction = coarse_satisfaction();
         let mut dev = DevState::default();
         let mut session = Session::campaign();
         enter_editor(&mut session, &mut world);

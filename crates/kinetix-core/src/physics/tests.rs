@@ -886,7 +886,6 @@ const FINE_TEST_COLS: usize = 45;
 const FINE_TEST_ROWS: usize = 20;
 const FINE_TEST_CELL_H: f32 = 13.0;
 const FINE_TEST_GAP: f32 = 2.0;
-const FINE_TEST_PLAY_W: f32 = 1504.0;
 const FINE_TEST_POCKET_ROWS: usize = 3;
 const FINE_TEST_ENTRANCE_COLS: usize = 3;
 const FINE_TEST_FRAMES: usize = 600;
@@ -896,6 +895,11 @@ const FINE_TEST_BALL_VY: f32 = -0.954;
 const FINE_TEST_BALL_SPEED: f32 = 800.0;
 const FINE_TEST_SMALL_BRICK: f32 = 10.0;
 const FINE_TEST_NEAR_FRACTION: f32 = 0.75;
+
+/// Width available to bricks, derived from the arena config like the brick grid does.
+fn fine_test_play_w() -> f32 {
+    BrickGrid::new(&world().config.arena, 1).play_w
+}
 
 fn fine_cell() -> CellSize {
     CellSize {
@@ -964,7 +968,7 @@ fn a_level_without_cell_keeps_the_default_geometry() {
     w.load_pack_level(0, &lv, PackRules::CAMPAIGN);
     assert!(!w.is_fine_board());
     let cols = lv[0].rows[0].chars().count();
-    let expected_w = (FINE_TEST_PLAY_W - (cols as f32 - 1.0) * BRICK_GAP) / cols as f32;
+    let expected_w = (fine_test_play_w() - (cols as f32 - 1.0) * BRICK_GAP) / cols as f32;
     let first = &w.bricks[0];
     assert!((first.w - expected_w).abs() < EPS);
     assert!((first.h - BRICK_HEIGHT).abs() < EPS);
@@ -977,8 +981,8 @@ fn a_level_with_cell_uses_the_fine_geometry() {
     let def = fine_def(framed_rows(), Some(fine_cell()));
     w.load_pack_level(0, &[def], PackRules::non_campaign(false));
     assert!(w.is_fine_board());
-    let expected_w =
-        (FINE_TEST_PLAY_W - (FINE_TEST_COLS as f32 - 1.0) * FINE_TEST_GAP) / FINE_TEST_COLS as f32;
+    let expected_w = (fine_test_play_w() - (FINE_TEST_COLS as f32 - 1.0) * FINE_TEST_GAP)
+        / FINE_TEST_COLS as f32;
     let first = &w.bricks[0];
     assert!((first.w - expected_w).abs() < EPS);
     assert!((first.h - FINE_TEST_CELL_H).abs() < EPS);
