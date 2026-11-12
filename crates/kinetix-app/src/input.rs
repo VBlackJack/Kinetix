@@ -207,28 +207,72 @@ pub struct TouchDeckLayout {
 }
 
 pub fn touch_deck_layout(sw: f32, sh: f32, arena_bottom_y: f32) -> TouchDeckLayout {
-    let bottom_space = (sh - arena_bottom_y).max(0.0);
-    let deck_h = if bottom_space >= TOUCH_DECK_MIN_H {
-        (bottom_space - TOUCH_UI_PAD * 2.0).min(TOUCH_DECK_MAX_H)
+    let bottom_space = (sh - arena_bottom_y - 4.0).max(0.0);
+    let inner_w = (sw - TOUCH_UI_PAD * 2.0).max(160.0);
+
+    if bottom_space >= TOUCH_TWO_ROW_MIN_H {
+        // Portrait / generous bottom margin: full-width swipe pad above a 3-button action row.
+        let btn_h = TOUCH_BTN_H.min(bottom_space * 0.38);
+        let btn_y = sh - btn_h - TOUCH_UI_PAD;
+        let usable_w = (inner_w - TOUCH_BTN_GAP * 2.0).max(120.0);
+        let launch_w = usable_w * 0.40;
+        let vortex_w = usable_w * 0.36;
+        let pause_w = (usable_w - launch_w - vortex_w).max(48.0);
+        let launch_btn = Rect::new(TOUCH_UI_PAD, btn_y, launch_w, btn_h);
+        let vortex_btn = Rect::new(
+            launch_btn.x + launch_w + TOUCH_BTN_GAP,
+            btn_y,
+            vortex_w,
+            btn_h,
+        );
+        let pause_btn = Rect::new(
+            vortex_btn.x + vortex_w + TOUCH_BTN_GAP,
+            btn_y,
+            pause_w,
+            btn_h,
+        );
+
+        let pad_avail = (btn_y - arena_bottom_y - 4.0 - TOUCH_BTN_GAP).max(48.0);
+        let pad_h = pad_avail.clamp(56.0, 112.0);
+        let deck_rect = Rect::new(TOUCH_UI_PAD, btn_y - TOUCH_BTN_GAP - pad_h, inner_w, pad_h);
+        TouchDeckLayout {
+            deck_rect,
+            launch_btn,
+            vortex_btn,
+            pause_btn,
+        }
     } else {
-        TOUCH_BTN_H + TOUCH_UI_PAD * 2.0
-    };
-    let deck_y = sh - deck_h - TOUCH_UI_PAD;
-    let total_w = (sw - TOUCH_UI_PAD * 2.0).max(120.0);
-    let btn_w = ((total_w - TOUCH_BTN_GAP * 2.0) * 0.24).clamp(64.0, 148.0);
-    let btn_h = (deck_h - TOUCH_UI_PAD * 2.0).clamp(38.0, 64.0);
-    let btn_y = deck_y + (deck_h - btn_h) * 0.5;
-    let right_edge = sw - TOUCH_UI_PAD;
-    let pause_btn = Rect::new(right_edge - btn_w * 0.72, btn_y, btn_w * 0.72, btn_h);
-    let vortex_btn = Rect::new(pause_btn.x - TOUCH_BTN_GAP - btn_w, btn_y, btn_w, btn_h);
-    let launch_btn = Rect::new(vortex_btn.x - TOUCH_BTN_GAP - btn_w, btn_y, btn_w, btn_h);
-    let pad_w = (launch_btn.x - TOUCH_UI_PAD - TOUCH_BTN_GAP).max(80.0);
-    let deck_rect = Rect::new(TOUCH_UI_PAD, deck_y, pad_w, deck_h);
-    TouchDeckLayout {
-        deck_rect,
-        launch_btn,
-        vortex_btn,
-        pause_btn,
+        // Landscape / compact bottom strip: keep every control strictly below `arena_bottom_y`.
+        let row_h = (bottom_space - 8.0).clamp(40.0, 64.0);
+        let row_y = (arena_bottom_y + 4.0)
+            .max(sh - row_h - 6.0)
+            .min((sh - row_h).max(0.0));
+        let usable_w = (inner_w - TOUCH_BTN_GAP * 3.0).max(140.0);
+        let pause_w = (usable_w * 0.12).clamp(46.0, 72.0);
+        let vortex_w = (usable_w * 0.20).clamp(64.0, 128.0);
+        let launch_w = (usable_w * 0.22).clamp(72.0, 140.0);
+        let pad_w = (usable_w - launch_w - vortex_w - pause_w).max(80.0);
+
+        let deck_rect = Rect::new(TOUCH_UI_PAD, row_y, pad_w, row_h);
+        let launch_btn = Rect::new(deck_rect.x + pad_w + TOUCH_BTN_GAP, row_y, launch_w, row_h);
+        let vortex_btn = Rect::new(
+            launch_btn.x + launch_w + TOUCH_BTN_GAP,
+            row_y,
+            vortex_w,
+            row_h,
+        );
+        let pause_btn = Rect::new(
+            vortex_btn.x + vortex_w + TOUCH_BTN_GAP,
+            row_y,
+            pause_w,
+            row_h,
+        );
+        TouchDeckLayout {
+            deck_rect,
+            launch_btn,
+            vortex_btn,
+            pause_btn,
+        }
     }
 }
 
@@ -400,5 +444,32 @@ mod tests {
         assert!((r2.paddle_delta_screen_x - 40.0 * TOUCH_DRAG_GAIN).abs() < 0.01);
         assert!(r2.launch_pressed);
         assert!(r2.vortex_held);
+    }
+
+    #[test]
+    fn touch_deck_never_overlaps_arena_in_portrait_or_landscape() {
+        for (sw, sh, reserve) in [
+            (390.0_f32, 844.0_f32, TOUCH_DECK_PORTRAIT_RESERVE_H),
+            (844.0_f32, 390.0_f32, TOUCH_DECK_LANDSCAPE_RESERVE_H),
+            (768.0_f32, 1024.0_f32, TOUCH_DECK_PORTRAIT_RESERVE_H),
+        ] {
+            let arena_bottom = sh - reserve;
+            let layout = touch_deck_layout(sw, sh, arena_bottom);
+            for rect in [
+                layout.deck_rect,
+                layout.launch_btn,
+                layout.vortex_btn,
+                layout.pause_btn,
+            ] {
+                assert!(
+                    rect.y >= arena_bottom,
+                    "control overlapped arena on {sw}x{sh}"
+                );
+                assert!(
+                    rect.y + rect.h <= sh,
+                    "control overflowed bottom on {sw}x{sh}"
+                );
+            }
+        }
     }
 }

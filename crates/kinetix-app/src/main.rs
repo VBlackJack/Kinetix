@@ -142,18 +142,74 @@ fn letterbox(sw: f32, sh: f32, arena_w: f32, arena_h: f32) -> (f32, f32, f32) {
     )
 }
 
+/// Computes arena scale and placement while reserving top/bottom bars on touch screens so controls never overlap gameplay.
+fn in_game_letterbox(
+    sw: f32,
+    sh: f32,
+    arena_w: f32,
+    arena_h: f32,
+    touch_mode: bool,
+) -> (f32, f32, f32) {
+    if !touch_mode {
+        return letterbox(sw, sh, arena_w, arena_h);
+    }
+    let portrait = sh > sw;
+    let reserve_top = if portrait { MOBILE_TOP_BAR_MIN_H } else { 0.0 };
+    let reserve_bottom = if portrait {
+        TOUCH_DECK_PORTRAIT_RESERVE_H
+    } else {
+        TOUCH_DECK_LANDSCAPE_RESERVE_H
+    };
+    let usable_h = (sh - reserve_top - reserve_bottom).max(120.0);
+    let scale = (sw / arena_w).min(usable_h / arena_h).max(f32::EPSILON);
+    let scaled_h = arena_h * scale;
+    let ox = (sw - arena_w * scale) * 0.5;
+    let oy = if portrait {
+        reserve_top + (usable_h - scaled_h).max(0.0) * 0.35
+    } else {
+        (usable_h - scaled_h).max(0.0) * 0.5
+    };
+    (scale, ox, oy)
+}
+
 /// Maps a window position (logical pixels) to arena coordinates.
 fn screen_to_arena(mx: f32, my: f32, scale: f32, ox: f32, oy: f32) -> (f32, f32) {
     ((mx - ox) / scale, (my - oy) / scale)
 }
 
-/// Window rectangle expressed in arena units: the arena extended symmetrically to the window aspect.
-fn backdrop_rect(sw: f32, sh: f32, arena_w: f32, arena_h: f32) -> Rect {
-    let (scale, ox, oy) = letterbox(sw, sh, arena_w, arena_h);
+/// Window rectangle expressed in arena units for an explicit scale and offset.
+fn backdrop_rect_for_layout(sw: f32, sh: f32, scale: f32, ox: f32, oy: f32) -> Rect {
     Rect::new(-ox / scale, -oy / scale, sw / scale, sh / scale)
 }
 
-/// Physical-pixel viewport rectangle of the arena for `Camera2D::viewport`.
+/// Window rectangle expressed in arena units: the arena extended symmetrically to the window aspect.
+#[cfg_attr(not(test), allow(dead_code))]
+fn backdrop_rect(sw: f32, sh: f32, arena_w: f32, arena_h: f32) -> Rect {
+    let (scale, ox, oy) = letterbox(sw, sh, arena_w, arena_h);
+    backdrop_rect_for_layout(sw, sh, scale, ox, oy)
+}
+
+/// Physical-pixel viewport rectangle of the arena for `Camera2D::viewport` (OpenGL bottom-up Y).
+fn arena_viewport_for_screen(
+    scale: f32,
+    ox: f32,
+    oy: f32,
+    arena_w: f32,
+    arena_h: f32,
+    sh: f32,
+    dpi: f32,
+) -> (i32, i32, i32, i32) {
+    let gl_y = (sh - (oy + arena_h * scale)).max(0.0);
+    (
+        (ox * dpi).round() as i32,
+        (gl_y * dpi).round() as i32,
+        (arena_w * scale * dpi).round() as i32,
+        (arena_h * scale * dpi).round() as i32,
+    )
+}
+
+/// Physical-pixel viewport rectangle of a centred arena for `Camera2D::viewport`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn arena_viewport(
     scale: f32,
     ox: f32,
@@ -822,19 +878,35 @@ async fn main() {
         let arena_w = world.config.arena.width;
         let arena_h = world.config.arena.height;
         let (sw, sh) = (screen_width(), screen_height());
-        let (view_scale, view_ox, view_oy) = letterbox(sw, sh, arena_w, arena_h);
         let (mx, my) = mouse_position();
-        let cursor_min_x = view_ox;
-        let cursor_max_x = view_ox + arena_w * view_scale;
+        let logical_touch_list = logical_touches();
+        let host_touch = is_touch_device();
+        let provisional_scale = (sw / arena_w).min(sh / arena_h).max(f32::EPSILON);
+        let provisional_ox = (sw - arena_w * provisional_scale) * 0.5;
+        let cursor_min_x = provisional_ox;
+        let cursor_max_x = provisional_ox + arena_w * provisional_scale;
         let native_grab_active =
             cfg!(not(target_arch = "wasm32")) && last_lock_wanted && !grab_state.grab_disabled;
         let (paddle_screen_x, pointer_moved) =
             grab_state.resolve_pointer_x(mx, sw, cursor_min_x, cursor_max_x, native_grab_active);
+        if !logical_touch_list.is_empty() {
+            touch_deck.touch_seen = true;
+        } else if !host_touch && (pointer_moved || is_mouse_button_pressed(MouseButton::Left)) {
+            touch_deck.touch_seen = false;
+            touch_override_active = false;
+        }
+        let touch_mode = host_touch || touch_deck.touch_seen;
+        let (view_scale, view_ox, view_oy) = in_game_letterbox(
+            sw,
+            sh,
+            arena_w,
+            arena_h,
+            touch_mode && screen == AppScreen::InGame,
+        );
+        let cursor_min_x = view_ox;
+        let cursor_max_x = view_ox + arena_w * view_scale;
         let (world_mx, world_my) = screen_to_arena(mx, my, view_scale, view_ox, view_oy);
         let (paddle_mx, _) = screen_to_arena(paddle_screen_x, my, view_scale, view_ox, view_oy);
-        let logical_touch_list = logical_touches();
-        let touch_mode =
-            is_touch_device() || touch_deck.touch_seen || !logical_touch_list.is_empty();
         let arena_bottom_y = view_oy + arena_h * view_scale;
         let touch_layout = touch_deck_layout(sw, sh, arena_bottom_y);
         let arena_rect = Rect::new(view_ox, view_oy, arena_w * view_scale, arena_h * view_scale);
@@ -1726,7 +1798,7 @@ async fn main() {
         };
 
         // Backdrop pass: nebula and stars fill the whole window, bars included.
-        let backdrop = backdrop_rect(screen_width(), screen_height(), arena_w, arena_h);
+        let backdrop = backdrop_rect_for_layout(sw, sh, view_scale, view_ox, view_oy);
         let shake_target = vec2(arena_w * 0.5 + shake_x, arena_h * 0.5 + shake_y);
         set_default_camera();
         clear_background(LETTERBOX_COLOR);
@@ -1746,23 +1818,31 @@ async fn main() {
 
         // Dim the bars (screen space) so the playfield stays readable.
         set_default_camera();
-        let (sw, sh) = (screen_width(), screen_height());
         let dim = Color::new(0.0, 0.0, 0.0, LETTERBOX_DIM_ALPHA);
-        draw_rectangle(0.0, 0.0, view_ox, sh, dim);
-        draw_rectangle(sw - view_ox, 0.0, view_ox, sh, dim);
-        draw_rectangle(view_ox, 0.0, sw - view_ox * 2.0, view_oy, dim);
-        draw_rectangle(view_ox, sh - view_oy, sw - view_ox * 2.0, view_oy, dim);
+        let arena_px_w = arena_w * view_scale;
+        let right_bar_x = view_ox + arena_px_w;
+        draw_rectangle(0.0, 0.0, view_ox.max(0.0), sh, dim);
+        draw_rectangle(right_bar_x, 0.0, (sw - right_bar_x).max(0.0), sh, dim);
+        draw_rectangle(view_ox, 0.0, arena_px_w, view_oy.max(0.0), dim);
+        draw_rectangle(
+            view_ox,
+            arena_bottom_y,
+            arena_px_w,
+            (sh - arena_bottom_y).max(0.0),
+            dim,
+        );
 
-        // Arena pass: gameplay rendered into the centred 16:9 viewport.
+        // Arena pass: gameplay rendered into the positioned 16:9 viewport.
         set_camera(&Camera2D {
             zoom: vec2(2.0 / arena_w, 2.0 / arena_h),
             target: shake_target,
-            viewport: Some(arena_viewport(
+            viewport: Some(arena_viewport_for_screen(
                 view_scale,
                 view_ox,
                 view_oy,
                 arena_w,
                 arena_h,
+                sh,
                 miniquad::window::dpi_scale(),
             )),
             ..Default::default()
@@ -3097,6 +3177,26 @@ mod tests {
             vy,
             ((1000.0f32 - 1000.0 * 1080.0 / 1920.0) * 0.5 * 2.0).round() as i32
         );
+    }
+
+    #[test]
+    fn in_game_letterbox_reserves_touch_margins_without_clipping_arena() {
+        for (sw, sh) in [(390.0_f32, 844.0_f32), (844.0_f32, 390.0_f32)] {
+            let (s, ox, oy) = in_game_letterbox(sw, sh, ARENA_W, ARENA_H, true);
+            let arena_bottom = oy + ARENA_H * s;
+            let min_reserve = if sh > sw {
+                TOUCH_DECK_PORTRAIT_RESERVE_H
+            } else {
+                TOUCH_DECK_LANDSCAPE_RESERVE_H
+            };
+            assert!(ox >= -EPS && ox + ARENA_W * s <= sw + EPS);
+            assert!(oy >= 0.0);
+            assert!(sh - arena_bottom >= min_reserve - 1.0);
+            let (_, gl_vy, _, gl_vh) =
+                arena_viewport_for_screen(s, ox, oy, ARENA_W, ARENA_H, sh, 2.0);
+            assert_eq!(gl_vy, ((sh - arena_bottom) * 2.0).round() as i32);
+            assert_eq!(gl_vh, (ARENA_H * s * 2.0).round() as i32);
+        }
     }
 
     #[test]

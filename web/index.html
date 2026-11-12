@@ -143,11 +143,12 @@
     const modalClose = document.getElementById("kinetix-modal-close");
     let modalMode = null;
     let pendingImportedCode = null;
-    let touchDeviceDetected =
-      (window.matchMedia &&
-        (window.matchMedia("(pointer: coarse)").matches ||
-          window.matchMedia("(hover: none)").matches)) ||
-      (navigator.maxTouchPoints > 0);
+    // Only default to touch on pure coarse-pointer devices (never on touchscreen laptops/desktops with a mouse).
+    let touchDeviceDetected = Boolean(
+      window.matchMedia &&
+        window.matchMedia("(pointer: coarse)").matches &&
+        !window.matchMedia("(any-pointer: fine)").matches
+    );
 
     function syncViewportSize() {
       const vv = window.visualViewport;
@@ -551,14 +552,31 @@
       }
     }
 
-    window.addEventListener("touchstart", () => {
-      if (!touchDeviceDetected) {
-        touchDeviceDetected = true;
-        syncViewportSize();
-      }
-      if (document.pointerLockElement === glCanvas) {
+    function setTouchMode(enabled) {
+      if (touchDeviceDetected === enabled) return;
+      touchDeviceDetected = enabled;
+      syncViewportSize();
+      if (enabled && document.pointerLockElement === glCanvas) {
         nativeExitPointerLock();
       }
+    }
+
+    window.addEventListener("pointerdown", (e) => {
+      if (e.pointerType === "touch") {
+        setTouchMode(true);
+      } else if (e.pointerType === "mouse") {
+        setTouchMode(false);
+      }
+    }, { capture: true, passive: true });
+
+    window.addEventListener("pointermove", (e) => {
+      if (e.pointerType === "mouse") {
+        setTouchMode(false);
+      }
+    }, { capture: true, passive: true });
+
+    window.addEventListener("touchstart", () => {
+      setTouchMode(true);
     }, { capture: true, passive: true });
 
     glCanvas.addEventListener("mousedown", (e) => {
