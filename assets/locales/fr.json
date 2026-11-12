@@ -214,5 +214,16 @@
     "toast": {
       "save_failed": "ÉCHEC DE LA SAUVEGARDE"
     }
+  },
+  "touch": {
+    "pad_hint": "GLISSER POUR DÉPLACER",
+    "launch": "LANCER",
+    "fire": "TIRER",
+    "vortex": "VORTEX",
+    "pause": "PAUSE",
+    "modal_copy": "COPIER LE CODE",
+    "modal_import": "IMPORTER",
+    "modal_cancel": "FERMER",
+    "modal_placeholder": "KTX1:..."
   }
 }

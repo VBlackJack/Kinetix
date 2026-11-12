@@ -16,16 +16,24 @@
 
 mod audio;
 mod dev;
+mod input;
 mod session;
 mod title;
 mod tuning;
 mod vfx;
 
 use audio::{
-    pointer_lock_active, prompt_level_code, set_document_lang, set_pointer_bounds,
-    set_pointer_lock, set_resume_mask, share_level_code, SoundBank,
+    is_touch_device, pointer_lock_active, poll_imported_level_code, request_import_level_code,
+    set_document_lang, set_pointer_bounds, set_resume_mask, share_level_code, sync_pointer_x,
+    SoundBank,
 };
 use dev::{push_sector_digit, resolve_sector, step_level, DevState, ProgressGuard};
+#[cfg(not(target_arch = "wasm32"))]
+use input::set_native_cursor_grab;
+use input::{
+    logical_touches, touch_deck_layout, NativeGrabState, TouchDeckLayout, TouchDeckState,
+    TouchFrameResult,
+};
 use kinetix_app::frame_budget::take_budget;
 use kinetix_app::library::{
     library_is_loaded, load_library, reload_library_if_unloaded, save_library,
@@ -218,30 +226,6 @@ fn format_score_popup(points: u64, multiplier: u32) -> String {
     }
 }
 
-/// Seeds the virtual cursor X when the grab starts. A session that is already running keeps the
-/// paddle where it is (the accumulated raw mouse position has drifted from the window); only a
-/// session starting from the menu seeds from the real cursor.
-fn seed_virtual_cursor_x(
-    session_live: bool,
-    paddle_screen_x: f32,
-    mouse_x: f32,
-    min_x: f32,
-    max_x: f32,
-) -> f32 {
-    let source = if session_live {
-        paddle_screen_x
-    } else {
-        mouse_x
-    };
-    source.clamp(min_x, max_x)
-}
-
-/// True when a single-frame raw delta is larger than the whole on-screen arena: the device
-/// reports absolute coordinates (remote desktop, VM integration, tablet) and the grab is unusable.
-fn absolute_input_detected(delta: f32, extent: f32) -> bool {
-    delta.abs() > extent
-}
-
 /// True when the window lost focus while the game is being played, so it must pause.
 #[cfg(not(target_arch = "wasm32"))]
 fn focus_loss_pauses(in_game: bool, playing: bool, focus_lost: bool) -> bool {
@@ -264,25 +248,12 @@ impl miniquad::EventHandler for FocusWatcher {
     }
 }
 
-/// Moves the virtual cursor X by a raw mouse delta, clamped to the on-screen arena extent.
-fn advance_virtual_cursor_x(current: f32, delta: f32, min_x: f32, max_x: f32) -> f32 {
-    (current + delta).clamp(min_x, max_x)
-}
-
-/// Confines the OS cursor to the window on native builds. The web build uses its own pointer
-/// lock (see `set_pointer_lock`); macroquad's grab would request a second one there.
-fn set_native_cursor_grab(grab: bool) {
-    #[cfg(not(target_arch = "wasm32"))]
-    set_cursor_grab(grab);
-    #[cfg(target_arch = "wasm32")]
-    let _ = grab;
-}
-
-/// Persists the sound and music switches (single path for the hotkeys and the menu).
-fn persist_audio_settings(sfx: &SoundBank) {
+/// Persists the sound, music and reduced-motion switches (single path for hotkeys and menu).
+fn persist_audio_settings(sfx: &SoundBank, reduce_motion: bool) {
     save_settings(Settings {
         sfx_on: !sfx.muted,
         music_on: sfx.music_enabled,
+        reduce_motion,
     });
 }
 
@@ -292,6 +263,7 @@ struct SettingsContext<'a> {
     theme_idx: &'a mut usize,
     theme_count: usize,
     sfx: &'a mut SoundBank,
+    reduce_motion: bool,
     save_tracker: &'a mut SaveTracker,
     world: &'a GameWorld,
     now_sec: f64,
@@ -324,11 +296,11 @@ fn apply_settings_action(action: MenuAction, ctx: &mut SettingsContext) -> bool 
         }
         MenuAction::ToggleSfx => {
             ctx.sfx.muted = !ctx.sfx.muted;
-            persist_audio_settings(ctx.sfx);
+            persist_audio_settings(ctx.sfx, ctx.reduce_motion);
         }
         MenuAction::ToggleMusic => {
             ctx.sfx.music_enabled = !ctx.sfx.music_enabled;
-            persist_audio_settings(ctx.sfx);
+            persist_audio_settings(ctx.sfx, ctx.reduce_motion);
         }
         _ => return false,
     }
@@ -616,12 +588,10 @@ async fn main() {
     let mut save_tracker = SaveTracker::new(saved_hs);
     let mut dev_state = DevState::default();
     let mut progress_guard = ProgressGuard::new(world.high_score, world.max_unlocked_level);
-    let mut last_mouse_x: f32 = 0.0;
-    let mut virtual_cursor_x: f32 = 0.0;
-    // True once a grab has run in the current game session (reset when leaving the game screen).
-    let mut grab_session_live = false;
-    // Set when the pointer reports absolute coordinates: the grab is dropped for the process.
-    let mut grab_disabled = false;
+    let mut reduce_motion = saved_settings.reduce_motion;
+    let mut grab_state = NativeGrabState::default();
+    let mut touch_deck = TouchDeckState::default();
+    let mut touch_override_active = false;
     #[cfg(not(target_arch = "wasm32"))]
     let focus_subscriber = macroquad::input::utils::register_input_subscriber();
     #[cfg(not(target_arch = "wasm32"))]
@@ -726,11 +696,20 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::M) {
             sfx.muted = !sfx.muted;
-            persist_audio_settings(&sfx);
+            persist_audio_settings(&sfx, reduce_motion);
         }
         if is_key_pressed(KeyCode::B) {
             sfx.music_enabled = !sfx.music_enabled;
-            persist_audio_settings(&sfx);
+            persist_audio_settings(&sfx, reduce_motion);
+        }
+        if is_key_pressed(KeyCode::F6) {
+            reduce_motion = !reduce_motion;
+            if reduce_motion {
+                screen_shake = 0.0;
+                chromatic_pulse = 0.0;
+                hit_stop_timer = 0.0;
+            }
+            persist_audio_settings(&sfx, reduce_motion);
         }
 
         // Hidden developer mode (Ctrl+Shift+D): never persisted, never advertised.
@@ -842,34 +821,23 @@ async fn main() {
 
         let arena_w = world.config.arena.width;
         let arena_h = world.config.arena.height;
-        let (view_scale, view_ox, view_oy) =
-            letterbox(screen_width(), screen_height(), arena_w, arena_h);
+        let (sw, sh) = (screen_width(), screen_height());
+        let (view_scale, view_ox, view_oy) = letterbox(sw, sh, arena_w, arena_h);
         let (mx, my) = mouse_position();
-        // With the native cursor grab, `mouse_position` accumulates raw deltas without bound: the
-        // paddle follows a virtual X clamped to the arena instead. The web build is untouched.
         let cursor_min_x = view_ox;
         let cursor_max_x = view_ox + arena_w * view_scale;
-        let mut native_grab_active =
-            cfg!(not(target_arch = "wasm32")) && last_lock_wanted && !grab_disabled;
-        if native_grab_active {
-            let delta = (mx - last_mouse_x) * NATIVE_RAW_MOUSE_SENSITIVITY;
-            if absolute_input_detected(delta, cursor_max_x - cursor_min_x) {
-                grab_disabled = true;
-                native_grab_active = false;
-                set_native_cursor_grab(false);
-            } else {
-                virtual_cursor_x =
-                    advance_virtual_cursor_x(virtual_cursor_x, delta, cursor_min_x, cursor_max_x);
-            }
-        }
-        last_mouse_x = mx;
-        let paddle_screen_x = if native_grab_active {
-            virtual_cursor_x
-        } else {
-            mx
-        };
+        let native_grab_active =
+            cfg!(not(target_arch = "wasm32")) && last_lock_wanted && !grab_state.grab_disabled;
+        let (paddle_screen_x, pointer_moved) =
+            grab_state.resolve_pointer_x(mx, sw, cursor_min_x, cursor_max_x, native_grab_active);
         let (world_mx, world_my) = screen_to_arena(mx, my, view_scale, view_ox, view_oy);
         let (paddle_mx, _) = screen_to_arena(paddle_screen_x, my, view_scale, view_ox, view_oy);
+        let logical_touch_list = logical_touches();
+        let touch_mode =
+            is_touch_device() || touch_deck.touch_seen || !logical_touch_list.is_empty();
+        let arena_bottom_y = view_oy + arena_h * view_scale;
+        let touch_layout = touch_deck_layout(sw, sh, arena_bottom_y);
+        let arena_rect = Rect::new(view_ox, view_oy, arena_w * view_scale, arena_h * view_scale);
 
         // The browser can release the lock on its own (Esc, Alt-Tab, focus loss): pause then.
         // Only an active -> inactive transition counts (lock_was_active is false during the async
@@ -907,7 +875,9 @@ async fn main() {
             }
         }
         if screen != AppScreen::InGame {
-            grab_session_live = false;
+            grab_state.grab_session_live = false;
+            grab_state.last_paddle_screen_x = None;
+            touch_override_active = false;
         }
 
         if screen != AppScreen::Editor {
@@ -975,6 +945,7 @@ async fn main() {
                         theme_idx: &mut theme_idx,
                         theme_count: theme_reg.themes.len(),
                         sfx: &mut sfx,
+                        reduce_motion,
                         save_tracker: &mut save_tracker,
                         world: &world,
                         now_sec,
@@ -1095,7 +1066,12 @@ async fn main() {
                 }
                 if is_key_pressed(KeyCode::X) {
                     let code = world.export_level_code();
-                    share_level_code(&code, i18n.t("editor.share_prompt"));
+                    share_level_code(
+                        &code,
+                        i18n.t("editor.share_prompt"),
+                        i18n.t("touch.modal_copy"),
+                        i18n.t("touch.modal_cancel"),
+                    );
                     popups.push(FloatingPopup {
                         x: POPUP_X,
                         y: POPUP_Y,
@@ -1116,8 +1092,16 @@ async fn main() {
                     push_library_toast(&mut popups, i18n, theme, &outcome);
                 }
                 if is_key_pressed(KeyCode::I) {
-                    match prompt_level_code(i18n.t("editor.paste_prompt")) {
-                        Ok(Some(code)) => match world.import_level_code(&code) {
+                    request_import_level_code(
+                        i18n.t("editor.paste_prompt"),
+                        i18n.t("touch.modal_placeholder"),
+                        i18n.t("touch.modal_import"),
+                        i18n.t("touch.modal_cancel"),
+                    );
+                }
+                if let Some(imported) = poll_imported_level_code() {
+                    match imported {
+                        Ok(code) => match world.import_level_code(&code) {
                             Ok(()) => popups.push(FloatingPopup {
                                 x: POPUP_X,
                                 y: POPUP_Y,
@@ -1127,7 +1111,6 @@ async fn main() {
                             }),
                             Err(err) => popups.push(error_popup(i18n, &err)),
                         },
-                        Ok(None) => {}
                         Err(err) => popups.push(error_popup(i18n, &err)),
                     }
                 }
@@ -1138,8 +1121,13 @@ async fn main() {
                 }
             }
             AppScreen::InGame => {
+                let touch_res = if world.status == SessionStatus::Playing && touch_mode {
+                    touch_deck.update(&logical_touch_list, &touch_layout, arena_rect)
+                } else {
+                    TouchFrameResult::default()
+                };
                 // P toggles pause; Escape only pauses (the browser also uses it to release the lock).
-                let toggle_pause = is_key_pressed(KeyCode::P);
+                let toggle_pause = is_key_pressed(KeyCode::P) || touch_res.pause_pressed;
                 let pause_only = is_key_pressed(KeyCode::Escape) && !dev_esc_consumed;
                 if toggle_pause || pause_only {
                     world.status = match world.status {
@@ -1201,6 +1189,7 @@ async fn main() {
                             theme_idx: &mut theme_idx,
                             theme_count: theme_reg.themes.len(),
                             sfx: &mut sfx,
+                            reduce_motion,
                             save_tracker: &mut save_tracker,
                             world: &world,
                             now_sec,
@@ -1248,22 +1237,43 @@ async fn main() {
                     pause_menu_open = false;
                 }
 
-                world.set_paddle_target(paddle_mx);
-
+                let kb_left = is_key_down(KeyCode::Left)
+                    || is_key_down(KeyCode::A)
+                    || is_key_down(KeyCode::Q);
+                let kb_right =
+                    is_key_down(KeyCode::Right) || (is_key_down(KeyCode::D) && !dev_toggled);
+                let kb_moving = (kb_left ^ kb_right) && world.status == SessionStatus::Playing;
                 let kb_speed = KEYBOARD_PADDLE_SPEED * dt;
-                if is_key_down(KeyCode::Left) || is_key_down(KeyCode::A) || is_key_down(KeyCode::Q)
-                {
-                    world.set_paddle_target(world.paddle_x - kb_speed);
+                if kb_moving {
+                    touch_override_active = true;
+                    let dir = if kb_right { 1.0 } else { -1.0 };
+                    world.set_paddle_target(world.paddle_x + dir * kb_speed);
+                } else if touch_res.touch_paddle_moved {
+                    touch_override_active = true;
+                    let current_screen_x = view_ox + world.paddle_x * view_scale;
+                    let next_screen_x = (current_screen_x + touch_res.paddle_delta_screen_x)
+                        .clamp(cursor_min_x, cursor_max_x);
+                    let (next_arena_x, _) =
+                        screen_to_arena(next_screen_x, my, view_scale, view_ox, view_oy);
+                    world.set_paddle_target(next_arena_x);
+                } else if touch_mode && touch_deck.drag_touch_id.is_some() {
+                    touch_override_active = true;
+                } else if !touch_mode && (pointer_moved || !touch_override_active) {
+                    touch_override_active = false;
+                    world.set_paddle_target(paddle_mx);
                 }
-                if is_key_down(KeyCode::Right) || (is_key_down(KeyCode::D) && !dev_toggled) {
-                    world.set_paddle_target(world.paddle_x + kb_speed);
+                if kb_moving || touch_res.touch_paddle_moved {
+                    let synced_screen_x = view_ox + world.paddle_x * view_scale;
+                    grab_state.sync_from_paddle(synced_screen_x, cursor_min_x, cursor_max_x, mx);
+                    sync_pointer_x(synced_screen_x);
                 }
 
                 let vortex_input = is_mouse_button_down(MouseButton::Right)
+                    || touch_res.vortex_held
                     || (!dev_toggled
                         && (is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift)));
                 world.set_vortex(vortex_input);
-                if world.vortex_active {
+                if world.vortex_active && !reduce_motion {
                     warp_grid.apply_impulse(
                         world.paddle_x,
                         world.config.arena.paddle_y,
@@ -1272,8 +1282,15 @@ async fn main() {
                     );
                 }
 
+                let touch_screen_tap = touch_mode
+                    && world.status != SessionStatus::Playing
+                    && logical_touch_list
+                        .iter()
+                        .any(|t| t.phase == TouchPhase::Started);
                 let action_triggered = !pause_menu_shown
-                    && (is_mouse_button_pressed(MouseButton::Left)
+                    && (touch_res.launch_pressed
+                        || touch_screen_tap
+                        || (!touch_mode && is_mouse_button_pressed(MouseButton::Left))
                         || is_key_pressed(KeyCode::Space));
                 if action_triggered {
                     match world.status {
@@ -1356,30 +1373,22 @@ async fn main() {
         // A new high score is persisted without waiting for pause / game over, throttled.
         save_tracker.persist_if_due(&world, theme_idx, lang == Language::Fr, now_sec);
 
-        // Lock the pointer exactly while the player is actually playing; evaluated after input and
-        // world update so a start / resume takes effect in the same frame.
-        let lock_wanted = screen == AppScreen::InGame && world.status == SessionStatus::Playing;
-        if lock_wanted != last_lock_wanted {
-            set_pointer_lock(lock_wanted);
-            show_mouse(!lock_wanted);
-            set_native_cursor_grab(lock_wanted && !grab_disabled);
-            if lock_wanted {
-                let paddle_screen = view_ox + world.paddle_x * view_scale;
-                virtual_cursor_x = seed_virtual_cursor_x(
-                    grab_session_live,
-                    paddle_screen,
-                    mx,
-                    cursor_min_x,
-                    cursor_max_x,
-                );
-                grab_session_live = true;
-            }
-            last_lock_wanted = lock_wanted;
-        }
+        // Lock the pointer exactly while the player is actually playing with a mouse; evaluated
+        // after input and world update so a start / resume takes effect in the same frame.
+        let lock_wanted =
+            screen == AppScreen::InGame && world.status == SessionStatus::Playing && !touch_mode;
+        grab_state.update_lock_state(
+            lock_wanted,
+            &mut last_lock_wanted,
+            view_ox + world.paddle_x * view_scale,
+            mx,
+            cursor_min_x,
+            cursor_max_x,
+        );
         lock_was_active = lock_wanted && pointer_lock_active();
 
         // Tell the page which gestures will make the lock wanted next, so it can request the
-        // lock synchronously inside the input handler (required by Firefox).
+        // lock synchronously inside the gesture (required by Firefox).
         let menu_visible = menu_is_visible(screen, world.status);
         let menu_play = if menu_visible {
             let model = menu_model.current();
@@ -1390,20 +1399,26 @@ async fn main() {
         } else {
             MenuPlay::default()
         };
-        let resume_mask = resume_mask_for(
-            screen,
-            world.status,
-            menu_play,
-            victory_continues(session.source, &world, satisfaction_levels.levels.len()),
-        );
+        let resume_mask = if touch_mode {
+            0
+        } else {
+            resume_mask_for(
+                screen,
+                world.status,
+                menu_play,
+                victory_continues(session.source, &world, satisfaction_levels.levels.len()),
+            )
+        };
         if last_resume_mask != Some(resume_mask) {
             set_resume_mask(resume_mask);
             last_resume_mask = Some(resume_mask);
         }
 
-        for ball in &world.balls {
-            if ball.stuck_offset.is_none() {
-                warp_grid.apply_impulse(ball.x, ball.y, 95.0, 120.0 * dt);
+        if !reduce_motion {
+            for ball in &world.balls {
+                if ball.stuck_offset.is_none() {
+                    warp_grid.apply_impulse(ball.x, ball.y, 95.0, 120.0 * dt);
+                }
             }
         }
 
@@ -1411,6 +1426,11 @@ async fn main() {
         let mut brick_sfx_budget = MAX_BRICK_SFX_PER_FRAME;
         let mut brick_warp_budget = MAX_BRICK_WARP_PER_FRAME;
         let fine_board = world.is_fine_board();
+        let particle_stride = if reduce_motion {
+            REDUCED_MOTION_PARTICLE_STEP
+        } else {
+            1
+        };
         for ev in events.drain(..) {
             match ev {
                 GameEvent::BrickHit {
@@ -1424,7 +1444,7 @@ async fn main() {
                     if take_budget(&mut brick_sfx_budget) {
                         sfx.play_brick(world.combo);
                     }
-                    if take_budget(&mut brick_warp_budget) {
+                    if !reduce_motion && take_budget(&mut brick_warp_budget) {
                         warp_grid.apply_impulse(x, y, 165.0, if destroyed { 320.0 } else { 140.0 });
                     }
                     let base_col = rgba(theme.brick_palette[color_idx % theme.brick_palette.len()]);
@@ -1439,7 +1459,7 @@ async fn main() {
                     } else {
                         GRAVITY_DEFAULT
                     };
-                    for i in 0..count {
+                    for i in (0..count).step_by(particle_stride) {
                         let angle = (i as f32 / count as f32) * std::f32::consts::TAU
                             + rand::gen_range(
                                 -BRICK_PARTICLE_ANGLE_JITTER,
@@ -1459,9 +1479,11 @@ async fn main() {
                         });
                     }
                     if destroyed {
-                        screen_shake =
-                            (screen_shake + SHAKE_BRICK_DESTROYED).min(SCREEN_SHAKE_MINOR_MAX);
-                        for _ in 0..SHARDS_PER_BRICK {
+                        if !reduce_motion {
+                            screen_shake =
+                                (screen_shake + SHAKE_BRICK_DESTROYED).min(SCREEN_SHAKE_MINOR_MAX);
+                        }
+                        for _ in (0..SHARDS_PER_BRICK).step_by(particle_stride) {
                             shards.push(DebrisShard {
                                 x: x + rand::gen_range(-SHARD_SPREAD_X, SHARD_SPREAD_X),
                                 y: y + rand::gen_range(-SHARD_SPREAD_Y, SHARD_SPREAD_Y),
@@ -1486,10 +1508,12 @@ async fn main() {
                 }
                 GameEvent::Explosion { x, y, radius } => {
                     sfx.play_explosion();
-                    warp_grid.apply_impulse(x, y, radius * 2.2, 920.0);
-                    screen_shake = (screen_shake + SHAKE_EXPLOSION).min(SCREEN_SHAKE_MAX);
-                    chromatic_pulse = CHROMATIC_EXPLOSION;
-                    hit_stop_timer = HIT_STOP_SEC;
+                    if !reduce_motion {
+                        warp_grid.apply_impulse(x, y, radius * 2.2, 920.0);
+                        screen_shake = (screen_shake + SHAKE_EXPLOSION).min(SCREEN_SHAKE_MAX);
+                        chromatic_pulse = CHROMATIC_EXPLOSION;
+                        hit_stop_timer = HIT_STOP_SEC;
+                    }
                     shockwaves.push(Shockwave {
                         x,
                         y,
@@ -1499,7 +1523,7 @@ async fn main() {
                         max_life: EXPLOSION_WAVE_LIFE,
                         color: rgba(theme.fireball_glow),
                     });
-                    for _ in 0..EXPLOSION_PARTICLES {
+                    for _ in (0..EXPLOSION_PARTICLES).step_by(particle_stride) {
                         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
                         let spd = rand_in(EXPLOSION_PARTICLE_SPEED);
                         particles.push(Particle {
@@ -1517,9 +1541,11 @@ async fn main() {
                 }
                 GameEvent::LightningBolt { from, to } => {
                     sfx.play_lightning();
-                    warp_grid.apply_impulse(to.0, to.1, 180.0, 520.0);
-                    screen_shake = (screen_shake + SHAKE_LIGHTNING).min(SCREEN_SHAKE_MINOR_MAX);
-                    chromatic_pulse = CHROMATIC_LIGHTNING;
+                    if !reduce_motion {
+                        warp_grid.apply_impulse(to.0, to.1, 180.0, 520.0);
+                        screen_shake = (screen_shake + SHAKE_LIGHTNING).min(SCREEN_SHAKE_MINOR_MAX);
+                        chromatic_pulse = CHROMATIC_LIGHTNING;
+                    }
                     arcs.push(LightningArc {
                         from,
                         to,
@@ -1528,8 +1554,10 @@ async fn main() {
                 }
                 GameEvent::PortalWarp { from, to } => {
                     sfx.play_portal();
-                    warp_grid.apply_impulse(from.0, from.1, 170.0, -420.0);
-                    warp_grid.apply_impulse(to.0, to.1, 190.0, 520.0);
+                    if !reduce_motion {
+                        warp_grid.apply_impulse(from.0, from.1, 170.0, -420.0);
+                        warp_grid.apply_impulse(to.0, to.1, 190.0, 520.0);
+                    }
                     shockwaves.push(Shockwave {
                         x: from.0,
                         y: from.1,
@@ -1558,8 +1586,10 @@ async fn main() {
                 }
                 GameEvent::PaddleHit { x, y } => {
                     sfx.play_paddle();
-                    warp_grid.apply_impulse(x, y, 130.0, 260.0);
-                    for _ in 0..PADDLE_PARTICLES {
+                    if !reduce_motion {
+                        warp_grid.apply_impulse(x, y, 130.0, 260.0);
+                    }
+                    for _ in (0..PADDLE_PARTICLES).step_by(particle_stride) {
                         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
                         let spd = rand_in(PADDLE_PARTICLE_SPEED);
                         particles.push(Particle {
@@ -1577,8 +1607,10 @@ async fn main() {
                 }
                 GameEvent::WallHit { x, y } => {
                     sfx.play_wall();
-                    warp_grid.apply_impulse(x, y, 100.0, 180.0);
-                    for _ in 0..WALL_PARTICLES {
+                    if !reduce_motion {
+                        warp_grid.apply_impulse(x, y, 100.0, 180.0);
+                    }
+                    for _ in (0..WALL_PARTICLES).step_by(particle_stride) {
                         let angle = rand::gen_range(0.0, std::f32::consts::TAU);
                         let spd = rand_in(WALL_PARTICLE_SPEED);
                         particles.push(Particle {
@@ -1596,7 +1628,9 @@ async fn main() {
                 }
                 GameEvent::PowerUpCollected { kind, x, y } => {
                     sfx.play_powerup();
-                    warp_grid.apply_impulse(x, y, 150.0, 360.0);
+                    if !reduce_motion {
+                        warp_grid.apply_impulse(x, y, 150.0, 360.0);
+                    }
                     let pop_col = rgba(if kind.is_malus() {
                         MALUS_COLOR
                     } else {
@@ -1786,6 +1820,21 @@ async fn main() {
 
         if dev_state.active {
             draw_dev_panel(&dev_state, i18n, theme, &ui_font, level_pack.levels.len());
+        }
+
+        if touch_mode && screen == AppScreen::InGame && world.status == SessionStatus::Playing {
+            set_default_camera();
+            draw_touch_overlay(&TouchOverlayContext {
+                layout: &touch_layout,
+                world: &world,
+                deck_state: &touch_deck,
+                theme,
+                i18n,
+                font: &ui_font,
+                sw,
+                view_oy,
+                level_number,
+            });
         }
 
         next_frame().await
@@ -2737,9 +2786,158 @@ fn draw_overlay_box(font: &Font, title: &str, subtitle: &str, title_col: Color, 
     );
 }
 
+struct TouchOverlayContext<'a> {
+    layout: &'a TouchDeckLayout,
+    world: &'a GameWorld,
+    deck_state: &'a TouchDeckState,
+    theme: &'a ThemeDef,
+    i18n: &'a I18nCatalog,
+    font: &'a Font,
+    sw: f32,
+    view_oy: f32,
+    level_number: usize,
+}
+
+fn draw_touch_button(
+    rect: Rect,
+    label: &str,
+    font: &Font,
+    border: Color,
+    fill: Color,
+    text_col: Color,
+) {
+    draw_rounded_rect(rect.x, rect.y, rect.w, rect.h, TOUCH_BTN_RADIUS, border);
+    draw_rounded_rect(
+        rect.x + 2.0,
+        rect.y + 2.0,
+        rect.w - 4.0,
+        rect.h - 4.0,
+        TOUCH_BTN_RADIUS - 2.0,
+        fill,
+    );
+    let size = fit_font_size(
+        |s| measure_text(label, Some(font), s, 1.0).width,
+        MOBILE_FONT_SIZE,
+        BADGE_FONT_SIZE_MIN,
+        (rect.w - 12.0).max(24.0),
+    );
+    let dims = measure_text(label, Some(font), size, 1.0);
+    txt(
+        font,
+        label,
+        rect.x + (rect.w - dims.width) * 0.5,
+        rect.y + (rect.h + dims.height) * 0.5,
+        size,
+        text_col,
+    );
+}
+
+fn draw_touch_overlay(ctx: &TouchOverlayContext) {
+    let pri = rgba(ctx.theme.text_primary);
+    let acc = rgba(ctx.theme.text_accent);
+    let border = rgba(ctx.theme.border_color);
+    let bg = Color::new(0.04, 0.05, 0.11, 0.78);
+    let active_bg = Color::new(acc.r, acc.g, acc.b, 0.25);
+
+    if ctx.view_oy >= MOBILE_TOP_BAR_MIN_H {
+        let bar_h = (ctx.view_oy - 8.0).clamp(32.0, 44.0);
+        draw_rounded_rect(
+            TOUCH_UI_PAD,
+            4.0,
+            ctx.sw - TOUCH_UI_PAD * 2.0,
+            bar_h,
+            8.0,
+            bg,
+        );
+        let vortex_pct = ((ctx.world.vortex_energy / ctx.world.config.gameplay.vortex_max_energy)
+            .clamp(0.0, 1.0)
+            * 100.0)
+            .round() as u32;
+        let summary = format!(
+            "{}: {} | {}: {} | {} {} | {}: {}%",
+            ctx.i18n.t("hud.score"),
+            ctx.world.score,
+            ctx.i18n.t("hud.lives"),
+            ctx.world.lives,
+            ctx.i18n.t("hud.level"),
+            ctx.level_number,
+            ctx.i18n.t("hud.vortex"),
+            vortex_pct
+        );
+        let size = fit_font_size(
+            |s| measure_text(&summary, Some(ctx.font), s, 1.0).width,
+            MOBILE_FONT_SIZE,
+            BADGE_FONT_SIZE_MIN,
+            (ctx.sw - TOUCH_UI_PAD * 4.0).max(80.0),
+        );
+        let dims = measure_text(&summary, Some(ctx.font), size, 1.0);
+        txt(
+            ctx.font,
+            &summary,
+            (ctx.sw - dims.width) * 0.5,
+            4.0 + (bar_h + dims.height) * 0.5,
+            size,
+            pri,
+        );
+    }
+
+    let pad_border = if ctx.deck_state.drag_touch_id.is_some() {
+        acc
+    } else {
+        Color::new(border.r, border.g, border.b, 0.55)
+    };
+    draw_touch_button(
+        ctx.layout.deck_rect,
+        ctx.i18n.t("touch.pad_hint"),
+        ctx.font,
+        pad_border,
+        if ctx.deck_state.drag_touch_id.is_some() {
+            active_bg
+        } else {
+            bg
+        },
+        pri,
+    );
+
+    let launch_key = if ctx.world.balls.iter().any(|b| b.stuck_offset.is_some()) {
+        "touch.launch"
+    } else {
+        "touch.fire"
+    };
+    draw_touch_button(
+        ctx.layout.launch_btn,
+        ctx.i18n.t(launch_key),
+        ctx.font,
+        acc,
+        bg,
+        acc,
+    );
+    draw_touch_button(
+        ctx.layout.vortex_btn,
+        ctx.i18n.t("touch.vortex"),
+        ctx.font,
+        if ctx.world.vortex_active { acc } else { border },
+        if ctx.world.vortex_active {
+            active_bg
+        } else {
+            bg
+        },
+        pri,
+    );
+    draw_touch_button(
+        ctx.layout.pause_btn,
+        ctx.i18n.t("touch.pause"),
+        ctx.font,
+        border,
+        bg,
+        pri,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{absolute_input_detected, advance_virtual_cursor_x, seed_virtual_cursor_x};
 
     #[test]
     fn per_frame_effect_caps_leave_normal_play_untouched() {

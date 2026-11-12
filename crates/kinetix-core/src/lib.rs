@@ -379,4 +379,71 @@ mod tests {
             assert!(face.glyph_index(c).is_some(), "font lacks {c}");
         }
     }
+
+    fn collect_text_files_recursive(
+        dir: &std::path::Path,
+        out: &mut Vec<std::path::PathBuf>,
+        visited_subdirs: &mut usize,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                *visited_subdirs += 1;
+                collect_text_files_recursive(&path, out, visited_subdirs);
+            } else if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("md" | "json")
+            ) {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn documentation_and_locales_have_no_banned_typography() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = vec![
+            root.join("README.md"),
+            root.join("README.fr.md"),
+            root.join("CHANGELOG.md"),
+        ];
+        let mut visited_subdirs = 0usize;
+        collect_text_files_recursive(&root.join("assets"), &mut files, &mut visited_subdirs);
+        collect_text_files_recursive(&root.join("docs"), &mut files, &mut visited_subdirs);
+        assert!(
+            visited_subdirs >= 2,
+            "expected subdirectories under assets/"
+        );
+
+        let banned = [
+            ('\u{2014}', "em-dash"),
+            ('\u{2013}', "en-dash"),
+            ('\u{2018}', "left single curly quote"),
+            ('\u{2019}', "right single curly quote"),
+            ('\u{201C}', "left double curly quote"),
+            ('\u{201D}', "right double curly quote"),
+            ('\u{2026}', "unicode ellipsis"),
+        ];
+        let mut violations = Vec::new();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (line_idx, line) in text.lines().enumerate() {
+                for (ch, label) in banned {
+                    if line.contains(ch) {
+                        violations.push(format!("{}:{}: {}", path.display(), line_idx + 1, label));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "banned typography found:\n{}",
+            violations.join("\n")
+        );
+    }
 }

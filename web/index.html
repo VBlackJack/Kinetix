@@ -17,7 +17,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>KINETIX</title>
   <style>
     html, body {
@@ -27,24 +27,212 @@
       height: 100%;
       overflow: hidden;
       background: #060512;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
     }
     canvas {
       margin: 0;
       padding: 0;
-      width: 100vw;
+      width: 100%;
       height: 100vh;
+      height: 100dvh;
       display: block;
       background: #060512;
       position: absolute;
+      inset: 0;
       z-index: 0;
+      touch-action: none;
+    }
+    #kinetix-fs-btn {
+      position: fixed;
+      top: max(8px, env(safe-area-inset-top));
+      right: max(8px, env(safe-area-inset-right));
+      z-index: 20;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      min-width: 36px;
+      height: 32px;
+      padding: 0 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(0, 238, 255, 0.45);
+      background: rgba(8, 10, 22, 0.72);
+      color: #00eeff;
+      font: 600 13px/1 system-ui, -apple-system, sans-serif;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    #kinetix-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      background: rgba(4, 5, 14, 0.82);
+    }
+    .kinetix-dialog {
+      width: min(520px, 100%);
+      border-radius: 12px;
+      border: 1px solid rgba(0, 238, 255, 0.55);
+      background: #0c0e1e;
+      color: #eef6ff;
+      padding: 18px;
+      box-sizing: border-box;
+      font: 500 15px/1.4 system-ui, -apple-system, sans-serif;
+    }
+    .kinetix-dialog-msg {
+      margin: 0 0 12px 0;
+    }
+    .kinetix-dialog-input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(0, 238, 255, 0.4);
+      background: #050712;
+      color: #eef6ff;
+      font: 500 14px/1.3 monospace;
+      margin-bottom: 14px;
+    }
+    .kinetix-dialog-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+    .kinetix-dialog-btn {
+      padding: 8px 16px;
+      border-radius: 8px;
+      border: 1px solid rgba(0, 238, 255, 0.55);
+      background: #131a36;
+      color: #eef6ff;
+      font: 600 14px/1.2 system-ui, -apple-system, sans-serif;
+      cursor: pointer;
+    }
+    .kinetix-dialog-btn.primary {
+      background: #00b8cc;
+      color: #040510;
+      border-color: #00eeff;
     }
   </style>
 </head>
 <body>
   <canvas id="glcanvas" tabindex="1"></canvas>
+  <button id="kinetix-fs-btn" type="button" aria-label="Fullscreen">[ ]</button>
+  <div id="kinetix-modal" role="dialog" aria-modal="true">
+    <div class="kinetix-dialog">
+      <p id="kinetix-modal-msg" class="kinetix-dialog-msg"></p>
+      <input id="kinetix-modal-input" class="kinetix-dialog-input" type="text" autocomplete="off" spellcheck="false">
+      <div class="kinetix-dialog-actions">
+        <button id="kinetix-modal-close" class="kinetix-dialog-btn" type="button"></button>
+        <button id="kinetix-modal-ok" class="kinetix-dialog-btn primary" type="button"></button>
+      </div>
+    </div>
+  </div>
   <script src="gl.js?v=__KINETIX_BUILD__"></script>
   <script>
     const glCanvas = document.getElementById("glcanvas");
+    const fsBtn = document.getElementById("kinetix-fs-btn");
+    const modalEl = document.getElementById("kinetix-modal");
+    const modalMsg = document.getElementById("kinetix-modal-msg");
+    const modalInput = document.getElementById("kinetix-modal-input");
+    const modalOk = document.getElementById("kinetix-modal-ok");
+    const modalClose = document.getElementById("kinetix-modal-close");
+    let modalMode = null;
+    let pendingImportedCode = null;
+    let touchDeviceDetected =
+      (window.matchMedia &&
+        (window.matchMedia("(pointer: coarse)").matches ||
+          window.matchMedia("(hover: none)").matches)) ||
+      (navigator.maxTouchPoints > 0);
+
+    function syncViewportSize() {
+      const vv = window.visualViewport;
+      const w = Math.max(1, Math.round(vv ? vv.width : window.innerWidth));
+      const h = Math.max(1, Math.round(vv ? vv.height : window.innerHeight));
+      glCanvas.style.width = w + "px";
+      glCanvas.style.height = h + "px";
+      if (fsBtn) {
+        const fsSupported = !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+        const inFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+        fsBtn.style.display = touchDeviceDetected && fsSupported && !inFs ? "inline-flex" : "none";
+      }
+    }
+    syncViewportSize();
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", () => {
+        syncViewportSize();
+        window.dispatchEvent(new Event("resize"));
+      });
+    }
+    window.addEventListener("orientationchange", () => {
+      setTimeout(() => {
+        syncViewportSize();
+        window.dispatchEvent(new Event("resize"));
+      }, 120);
+    });
+    document.addEventListener("fullscreenchange", syncViewportSize);
+    document.addEventListener("webkitfullscreenchange", syncViewportSize);
+    if (fsBtn) {
+      fsBtn.addEventListener("click", () => {
+        const root = document.documentElement;
+        const req = root.requestFullscreen || root.webkitRequestFullscreen;
+        if (req) {
+          Promise.resolve(req.call(root)).catch(() => {});
+        }
+      });
+    }
+
+    function openModal(mode, message, value, placeholder, okLabel, closeLabel) {
+      modalMode = mode;
+      modalMsg.textContent = message;
+      modalInput.value = value || "";
+      modalInput.placeholder = placeholder || "";
+      modalInput.readOnly = mode === "share";
+      modalOk.textContent = okLabel;
+      modalClose.textContent = closeLabel;
+      modalEl.style.display = "flex";
+      if (document.pointerLockElement === glCanvas) nativeExitPointerLock();
+      setTimeout(() => {
+        modalInput.focus();
+        if (mode === "share") modalInput.select();
+      }, 20);
+    }
+
+    function closeModal() {
+      modalEl.style.display = "none";
+      modalMode = null;
+      glCanvas.focus();
+    }
+
+    modalClose.addEventListener("click", closeModal);
+    modalEl.addEventListener("click", (e) => {
+      if (e.target === modalEl) closeModal();
+    });
+    modalOk.addEventListener("click", () => {
+      if (modalMode === "share") {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(modalInput.value).catch(() => {});
+        }
+        closeModal();
+      } else if (modalMode === "import") {
+        const trimmed = modalInput.value.trim();
+        if (trimmed.length > 0) pendingImportedCode = trimmed;
+        closeModal();
+      }
+    });
+    modalInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeModal();
+      } else if (e.key === "Enter" && modalMode === "import") {
+        e.preventDefault();
+        modalOk.click();
+      }
+    });
     let lockWanted = false;
     // A lock requested inside a gesture because of the resume mask is kept for this long while the
     // game has not yet set lockWanted (it does so one frame later).
@@ -177,7 +365,7 @@
             const t = (parseInt(localStorage.getItem("kinetix_theme") || "0", 10) || 0) & 0xFF;
             const storedLang = localStorage.getItem("kinetix_lang");
             const l = storedLang === null
-              ? (/^fr/i.test(navigator.language || "") ? 1 : 0)
+              ? (/^fr\b/i.test(navigator.language || "") ? 1 : 0)
               : ((parseInt(storedLang, 10) || 0) & 0x1);
             return u | (t << 16) | (l << 24);
           } catch (_) {
@@ -188,19 +376,21 @@
           try {
             localStorage.setItem("kinetix_sfx", String(packed & 1));
             localStorage.setItem("kinetix_music", String((packed >> 1) & 1));
+            localStorage.setItem("kinetix_reduce_motion", String((packed >> 2) & 1));
           } catch (_) {}
         };
         importObject.env.kinetix_load_settings = function () {
-          // Both settings default to on when absent or storage is unavailable.
+          // Audio defaults to on; reduced motion defaults to the OS/browser media query.
+          const mediaReduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 1 : 0;
           try {
-            // A missing or non-numeric stored value keeps the default (on).
-            const flag = (key) => {
+            // A missing or non-numeric stored value keeps the default.
+            const flag = (key, defVal) => {
               const n = parseInt(localStorage.getItem(key), 10);
-              return Number.isNaN(n) ? 1 : (n ? 1 : 0);
+              return Number.isNaN(n) ? defVal : (n ? 1 : 0);
             };
-            return flag("kinetix_sfx") | (flag("kinetix_music") << 1);
+            return flag("kinetix_sfx", 1) | (flag("kinetix_music", 1) << 1) | (flag("kinetix_reduce_motion", mediaReduced) << 2);
           } catch (_) {
-            return 3;
+            return 3 | (mediaReduced << 2);
           }
         };
         // Generic string storage: key and value cross the boundary as UTF-8 byte ranges.
@@ -234,22 +424,41 @@
             return 0;
           }
         };
-        importObject.env.kinetix_share_level = function (codePtr, codeLen, msgPtr, msgLen) {
+        importObject.env.kinetix_share_level = function (
+          codePtr, codeLen, msgPtr, msgLen, copyPtr, copyLen, closePtr, closeLen
+        ) {
           try {
             const code = readUtf8(codePtr, codeLen);
             const message = readUtf8(msgPtr, msgLen);
+            const copyLabel = readUtf8(copyPtr, copyLen);
+            const closeLabel = readUtf8(closePtr, closeLen);
             if (navigator.clipboard && navigator.clipboard.writeText) {
               navigator.clipboard.writeText(code).catch(() => {});
             }
-            window.prompt(message, code);
+            openModal("share", message, code, "", copyLabel, closeLabel);
           } catch (_) {}
         };
-        importObject.env.kinetix_prompt_level = function (msgPtr, msgLen, bufPtr, maxLen) {
+        importObject.env.kinetix_request_import_level = function (
+          msgPtr, msgLen, phPtr, phLen, importPtr, importLen, closePtr, closeLen
+        ) {
           try {
-            const message = readUtf8(msgPtr, msgLen);
-            const input = window.prompt(message, "");
-            if (!input) return 0;
-            const encoded = new TextEncoder().encode(input.trim());
+            pendingImportedCode = null;
+            openModal(
+              "import",
+              readUtf8(msgPtr, msgLen),
+              "",
+              readUtf8(phPtr, phLen),
+              readUtf8(importPtr, importLen),
+              readUtf8(closePtr, closeLen)
+            );
+          } catch (_) {}
+        };
+        importObject.env.kinetix_poll_imported_level = function (bufPtr, maxLen) {
+          try {
+            if (!pendingImportedCode) return 0;
+            const code = pendingImportedCode;
+            pendingImportedCode = null;
+            const encoded = new TextEncoder().encode(code);
             if (encoded.length === 0) return 0;
             if (encoded.length > maxLen) return maxLen + 1;
             new Uint8Array(wasm_memory.buffer, bufPtr, encoded.length).set(encoded);
@@ -268,11 +477,19 @@
           boundsLeft = Number.isFinite(left) ? left : null;
           boundsRight = Number.isFinite(right) ? right : null;
         };
+        importObject.env.kinetix_sync_pointer_x = function (cssX) {
+          if (!Number.isFinite(cssX)) return;
+          const rect = glCanvas.getBoundingClientRect();
+          virtualMouseX = clampVirtualX(rect.left + cssX);
+        };
         importObject.env.kinetix_set_resume_mask = function (mask) {
           resumeMask = mask >>> 0;
         };
+        importObject.env.kinetix_is_touch_device = function () {
+          return touchDeviceDetected ? 1 : 0;
+        };
         importObject.env.kinetix_set_pointer_lock = function (enabled) {
-          lockWanted = enabled !== 0;
+          lockWanted = enabled !== 0 && !touchDeviceDetected;
           if (lockWanted) {
             requestLock();
           } else {
@@ -306,7 +523,7 @@
     );
 
     function requestLock() {
-      if (!glCanvas.requestPointerLock) return;
+      if (touchDeviceDetected || modalMode !== null || !glCanvas.requestPointerLock) return;
       try {
         const result = glCanvas.requestPointerLock();
         if (result && typeof result.catch === "function") result.catch(() => {});
@@ -317,6 +534,7 @@
     // input handler), while the game asks one frame later. So also request the lock when the input
     // matches a resume bit; a wrong guess is undone by the pointerlockchange handler.
     function requestLockInGesture(resumeBit) {
+      if (touchDeviceDetected || modalMode !== null) return;
       if (document.pointerLockElement === glCanvas) return;
       if (lockWanted) {
         requestLock();
@@ -333,6 +551,16 @@
       }
     }
 
+    window.addEventListener("touchstart", () => {
+      if (!touchDeviceDetected) {
+        touchDeviceDetected = true;
+        syncViewportSize();
+      }
+      if (document.pointerLockElement === glCanvas) {
+        nativeExitPointerLock();
+      }
+    }, { capture: true, passive: true });
+
     glCanvas.addEventListener("mousedown", (e) => {
       ensureAudio();
       requestLockInGesture(e.button === 0 ? RESUME_BIT_CLICK : 0);
@@ -344,6 +572,7 @@
     }, { passive: true });
 
     window.addEventListener("keydown", (e) => {
+      if (modalMode !== null) return;
       requestLockInGesture(RESUME_KEY_BITS[e.code] || 0);
     }, true);
 
@@ -353,6 +582,7 @@
     // Horizontal extent of the arena on screen (CSS px relative to the canvas), set by the game.
     let boundsLeft = null;
     let boundsRight = null;
+    let justLocked = false;
 
     function clampVirtualX(x) {
       const rect = glCanvas.getBoundingClientRect();
@@ -369,12 +599,15 @@
     // so the paddle does not jump. A lost lock needs no handling: the next mousedown or keydown re-requests it.
     document.addEventListener("pointerlockchange", () => {
       if (document.pointerLockElement === glCanvas) {
-        if (!lockIsWanted()) {
+        if (!lockIsWanted() || touchDeviceDetected) {
           // The game withdrew the lock before the browser granted it.
           document.exitPointerLock();
           return;
         }
+        justLocked = true;
         virtualMouseX = clampVirtualX(virtualMouseX);
+      } else {
+        justLocked = false;
       }
     });
 
@@ -385,6 +618,15 @@
       if (e._kinetixSynthetic) return;
       if (document.pointerLockElement === glCanvas) {
         e.stopImmediatePropagation();
+        if (justLocked) {
+          justLocked = false;
+          return;
+        }
+        const rect = glCanvas.getBoundingClientRect();
+        const maxStep = Math.max(120, rect.width * 0.75);
+        if (!Number.isFinite(e.movementX) || Math.abs(e.movementX) > maxStep) {
+          return;
+        }
         virtualMouseX = clampVirtualX(virtualMouseX + e.movementX);
         const synth = new MouseEvent("mousemove", {
           clientX: virtualMouseX,

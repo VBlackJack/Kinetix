@@ -214,5 +214,16 @@
     "toast": {
       "save_failed": "SAVE FAILED"
     }
+  },
+  "touch": {
+    "pad_hint": "SLIDE TO MOVE PADDLE",
+    "launch": "LAUNCH",
+    "fire": "FIRE",
+    "vortex": "VORTEX",
+    "pause": "PAUSE",
+    "modal_copy": "COPY CODE",
+    "modal_import": "IMPORT",
+    "modal_cancel": "CLOSE",
+    "modal_placeholder": "KTX1:..."
   }
 }
