@@ -343,3 +343,24 @@ pub const DEV_HELP_KEYS: [&str; 7] = [
     "dev.help.panel",
     "dev.help.toggle",
 ];
+
+// ---- Pointer, Touch & Accessibility ----
+/// Minimum pointer movement (logical pixels) required to override keyboard paddle control.
+pub const POINTER_MOVE_EPSILON: f32 = 0.05;
+/// Minimum bottom letterbox height for an expanded portrait touch deck.
+pub const TOUCH_DECK_MIN_H: f32 = 110.0;
+/// Maximum touch deck height in portrait mode.
+pub const TOUCH_DECK_MAX_H: f32 = 220.0;
+/// Outer margin of the touch deck and action buttons in logical pixels.
+pub const TOUCH_UI_PAD: f32 = 12.0;
+/// Fallback height for the touch action bar when screen space is tight.
+pub const TOUCH_BTN_H: f32 = 48.0;
+pub const TOUCH_BTN_RADIUS: f32 = 12.0;
+pub const TOUCH_BTN_GAP: f32 = 10.0;
+/// Gain applied to horizontal touch-deck drags so a swipe comfortably spans the arena.
+pub const TOUCH_DRAG_GAIN: f32 = 1.35;
+/// Minimum top letterbox height required before showing a compact portrait status bar.
+pub const MOBILE_TOP_BAR_MIN_H: f32 = 44.0;
+pub const MOBILE_FONT_SIZE: u16 = 16;
+/// Particle emission thinning stride when reduced motion is enabled.
+pub const REDUCED_MOTION_PARTICLE_STEP: usize = 3;

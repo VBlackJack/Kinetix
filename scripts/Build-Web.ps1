@@ -95,6 +95,34 @@ function Get-WasmImport {
     }
 }
 
+function Test-HtmlInlineJsSyntax {
+    # Parses inline <script> blocks from web/index.html using Node when available.
+    param([Parameter(Mandatory)][string]$HtmlPath)
+
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node) {
+        Write-Host "JS syntax guard: node not found in PATH, skipping inline check" -ForegroundColor Yellow
+        return
+    }
+    $html = [System.IO.File]::ReadAllText($HtmlPath)
+    $scripts = [regex]::Matches($html, '(?s)<script\b(?![^>]*\bsrc=)[^>]*>(.*?)</script>')
+    $idx = 0
+    foreach ($m in $scripts) {
+        $idx++
+        $tmp = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), ".js")
+        try {
+            [System.IO.File]::WriteAllText($tmp, $m.Groups[1].Value, [System.Text.UTF8Encoding]::new($false))
+            & $node.Source --check $tmp
+            if ($LASTEXITCODE -ne 0) {
+                throw "JS syntax check failed on inline <script> #$idx in $HtmlPath (exit $LASTEXITCODE)"
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Host "JS syntax guard: $idx inline script(s) parsed cleanly"
+}
+
 function Test-KinetixImportGuard {
     # Fails when the wasm imports a kinetix_* function that index.html does not define.
     param([string]$WasmPath, [string]$HtmlPath)
@@ -139,8 +167,9 @@ if ($SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 }
 
-Write-Host "[2/3] Checking wasm imports against web/index.html..." -ForegroundColor Cyan
+Write-Host "[2/3] Checking wasm imports and JS syntax in web/index.html..." -ForegroundColor Cyan
 Test-KinetixImportGuard -WasmPath $WasmPath -HtmlPath "web\index.html"
+Test-HtmlInlineJsSyntax -HtmlPath "web\index.html"
 
 $DistDir = Join-Path $PWD "dist"
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null

@@ -771,8 +771,8 @@ fn validate_levels(levels: &[LevelDef], scope: &Scope) -> Vec<ValidationError> {
                     format!("boss level must have at least {BOSS_CLEAR_ROWS} rows"),
                 );
             } else {
-                for r_idx in 0..BOSS_CLEAR_ROWS {
-                    if level.rows[r_idx].chars().any(|c| c != '0') {
+                for (r_idx, row) in level.rows.iter().take(BOSS_CLEAR_ROWS).enumerate() {
+                    if row.chars().any(|c| c != '0') {
                         push_error(
                             &mut errors,
                             lid,

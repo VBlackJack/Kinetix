@@ -38,11 +38,12 @@ extern "C" {
     fn kinetix_load_settings() -> u32;
 }
 
-/// Player audio preferences, persisted on both platforms. Both default to on.
+/// Player audio & accessibility preferences, persisted on both platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     pub sfx_on: bool,
     pub music_on: bool,
+    pub reduce_motion: bool,
 }
 
 impl Default for Settings {
@@ -50,15 +51,18 @@ impl Default for Settings {
         Self {
             sfx_on: true,
             music_on: true,
+            reduce_motion: false,
         }
     }
 }
 
 /// Bit flags of the settings word exchanged with the web storage bindings.
 #[cfg(any(target_arch = "wasm32", test))]
-const WEB_SETTINGS_SFX_BIT: u32 = 0b01;
+const WEB_SETTINGS_SFX_BIT: u32 = 0b001;
 #[cfg(any(target_arch = "wasm32", test))]
-const WEB_SETTINGS_MUSIC_BIT: u32 = 0b10;
+const WEB_SETTINGS_MUSIC_BIT: u32 = 0b010;
+#[cfg(any(target_arch = "wasm32", test))]
+const WEB_SETTINGS_MOTION_BIT: u32 = 0b100;
 
 /// Packs the settings into the web settings word (pure, testable).
 #[cfg(any(target_arch = "wasm32", test))]
@@ -71,6 +75,10 @@ pub fn pack_web_settings(settings: Settings) -> u32 {
         WEB_SETTINGS_MUSIC_BIT
     } else {
         0
+    }) | (if settings.reduce_motion {
+        WEB_SETTINGS_MOTION_BIT
+    } else {
+        0
     })
 }
 
@@ -80,6 +88,7 @@ pub fn unpack_web_settings(packed: u32) -> Settings {
     Settings {
         sfx_on: packed & WEB_SETTINGS_SFX_BIT != 0,
         music_on: packed & WEB_SETTINGS_MUSIC_BIT != 0,
+        reduce_motion: packed & WEB_SETTINGS_MOTION_BIT != 0,
     }
 }
 
@@ -229,6 +238,8 @@ pub mod native {
         pub sfx_on: bool,
         /// Music enabled (additive field: absent in older files, defaults to on).
         pub music_on: bool,
+        /// Reduced motion accessibility toggle (additive field: defaults to off).
+        pub reduce_motion: bool,
     }
 
     impl Default for Progress {
@@ -241,16 +252,18 @@ pub mod native {
                 lang_fr: false,
                 sfx_on: true,
                 music_on: true,
+                reduce_motion: false,
             }
         }
     }
 
-    /// Audio settings stored in the progress file at `path` (defaults when unreadable).
+    /// Audio and accessibility settings stored in the progress file at `path` (defaults when unreadable).
     pub fn current_settings(path: &Path) -> super::Settings {
         match read_progress(path) {
             ReadOutcome::Valid(progress) => super::Settings {
                 sfx_on: progress.sfx_on,
                 music_on: progress.music_on,
+                reduce_motion: progress.reduce_motion,
             },
             _ => super::Settings::default(),
         }
@@ -486,6 +499,7 @@ pub mod native {
             ReadOutcome::Valid(current) => super::Settings {
                 sfx_on: current.sfx_on,
                 music_on: current.music_on,
+                reduce_motion: current.reduce_motion,
             },
             ReadOutcome::Missing | ReadOutcome::Unreadable => super::Settings::default(),
             ReadOutcome::IoFailed => return Err(read_failed()),
@@ -498,11 +512,12 @@ pub mod native {
             lang_fr: game.lang_fr,
             sfx_on: settings.sfx_on,
             music_on: settings.music_on,
+            reduce_motion: settings.reduce_motion,
         };
         save_with(path, &progress, state)
     }
 
-    /// Saves the audio settings keeping the game progress of the file. A missing or corrupt file
+    /// Saves the audio and accessibility settings keeping the game progress of the file. A missing or corrupt file
     /// starts from default progress; when the file cannot be read at all nothing is written.
     pub fn save_settings_with(
         path: &Path,
@@ -516,6 +531,7 @@ pub mod native {
         };
         progress.sfx_on = settings.sfx_on;
         progress.music_on = settings.music_on;
+        progress.reduce_motion = settings.reduce_motion;
         save_with(path, &progress, state)
     }
 
@@ -574,6 +590,7 @@ pub mod native {
                 lang_fr: true,
                 sfx_on: false,
                 music_on: true,
+                reduce_motion: false,
             }
         }
 
@@ -882,12 +899,13 @@ pub mod native {
             let settings = crate::persistence::Settings {
                 sfx_on: true,
                 music_on: false,
+                reduce_motion: true,
             };
             save_settings_with(&path, settings, &mut state).unwrap();
             let ReadOutcome::Valid(saved) = read_progress(&path) else {
                 panic!("expected a valid file");
             };
-            assert!(saved.sfx_on && !saved.music_on);
+            assert!(saved.sfx_on && !saved.music_on && saved.reduce_motion);
             assert_eq!((saved.high_score, saved.unlocked), (123_456, 7));
             assert_eq!((saved.theme, saved.lang_fr), (2, true));
         }
@@ -903,6 +921,7 @@ pub mod native {
                     let settings = crate::persistence::Settings {
                         sfx_on: false,
                         music_on: true,
+                        reduce_motion: false,
                     };
                     save_settings_with(&path, settings, &mut state).unwrap();
                 } else {
@@ -940,16 +959,23 @@ mod throttle_tests {
     fn web_settings_word_round_trips_every_combination() {
         for sfx_on in [false, true] {
             for music_on in [false, true] {
-                let settings = Settings { sfx_on, music_on };
-                assert_eq!(unpack_web_settings(pack_web_settings(settings)), settings);
+                for reduce_motion in [false, true] {
+                    let settings = Settings {
+                        sfx_on,
+                        music_on,
+                        reduce_motion,
+                    };
+                    assert_eq!(unpack_web_settings(pack_web_settings(settings)), settings);
+                }
             }
         }
-        assert_eq!(pack_web_settings(Settings::default()), 0b11);
+        assert_eq!(pack_web_settings(Settings::default()), 0b011);
         assert_eq!(
             unpack_web_settings(0),
             Settings {
                 sfx_on: false,
-                music_on: false
+                music_on: false,
+                reduce_motion: false,
             }
         );
     }
